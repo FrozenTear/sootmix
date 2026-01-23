@@ -166,9 +166,9 @@ fn find_node_by_name(name: &str) -> Result<u32, VirtualSinkError> {
             if let Some(ref mut stdin) = jq.stdin {
                 let _ = stdin.write_all(json_str.as_bytes());
             }
-            let output = jq.wait_with_output().map_err(|e| {
-                VirtualSinkError::PwDumpFailed(format!("jq failed: {}", e))
-            })?;
+            let output = jq
+                .wait_with_output()
+                .map_err(|e| VirtualSinkError::PwDumpFailed(format!("jq failed: {}", e)))?;
 
             let id_str = String::from_utf8_lossy(&output.stdout);
             let id_str = id_str.trim();

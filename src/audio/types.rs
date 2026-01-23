@@ -166,9 +166,15 @@ impl AudioChannel {
     /// Parse from port name or channel position string.
     pub fn from_str(s: &str) -> Self {
         let s_lower = s.to_lowercase();
-        if s_lower.contains("fl") || s_lower.contains("front_left") || s_lower.contains("playback_fl") {
+        if s_lower.contains("fl")
+            || s_lower.contains("front_left")
+            || s_lower.contains("playback_fl")
+        {
             Self::FrontLeft
-        } else if s_lower.contains("fr") || s_lower.contains("front_right") || s_lower.contains("playback_fr") {
+        } else if s_lower.contains("fr")
+            || s_lower.contains("front_right")
+            || s_lower.contains("playback_fr")
+        {
             Self::FrontRight
         } else if s_lower.contains("fc") || s_lower.contains("front_center") {
             Self::FrontCenter

@@ -22,10 +22,17 @@ pub enum VolumeError {
 pub fn set_volume(node_id: u32, volume: f32) -> Result<(), VolumeError> {
     let volume_clamped = volume.max(0.0).min(1.5); // Allow up to 150%
 
-    debug!("Setting volume on node {} to {:.2}", node_id, volume_clamped);
+    debug!(
+        "Setting volume on node {} to {:.2}",
+        node_id, volume_clamped
+    );
 
     let output = Command::new("wpctl")
-        .args(["set-volume", &node_id.to_string(), &format!("{:.2}", volume_clamped)])
+        .args([
+            "set-volume",
+            &node_id.to_string(),
+            &format!("{:.2}", volume_clamped),
+        ])
         .output()
         .map_err(|e| VolumeError::WpctlFailed(e.to_string()))?;
 
