@@ -1,0 +1,22 @@
+[package]
+name = "sootmix-plugin-api"
+version = "0.1.0"
+edition = "2021"
+authors = ["SootMix Contributors"]
+description = "Plugin API for SootMix audio effects"
+license = "MPL-2.0"
+repository = "https://github.com/FrozenTear/sootmix"
+keywords = ["audio", "plugin", "dsp", "effect"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+# Stable ABI for native plugins
+abi_stable = "0.11"
+
+# Serialization for plugin state
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+# Enable this when building plugins (not the host)
+plugin = []

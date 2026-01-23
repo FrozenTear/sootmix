@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/sootmix-plugin-api"]
+resolver = "2"
+
 [package]
 name = "sootmix"
 version = "0.1.0"
@@ -10,6 +14,10 @@ keywords = ["audio", "pipewire", "mixer", "linux"]
 categories = ["multimedia::audio"]
 
 [dependencies]
+# Plugin system
+sootmix-plugin-api = { path = "crates/sootmix-plugin-api" }
+abi_stable = "0.11"
+libloading = "0.8"
 # GUI
 iced = { version = "0.14", features = ["tokio", "advanced"] }
 

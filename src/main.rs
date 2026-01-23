@@ -10,6 +10,8 @@ mod app;
 mod audio;
 mod config;
 mod message;
+mod plugins;
+mod realtime;
 mod state;
 mod ui;
 
