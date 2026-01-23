@@ -42,11 +42,11 @@ pub fn create_link(output_port: u32, input_port: u32) -> Result<(), RoutingError
 }
 
 /// Create a link between two ports by name using pw-link.
-pub fn create_link_by_name(output_port_name: &str, input_port_name: &str) -> Result<(), RoutingError> {
-    info!(
-        "Creating link: {} -> {}",
-        output_port_name, input_port_name
-    );
+pub fn create_link_by_name(
+    output_port_name: &str,
+    input_port_name: &str,
+) -> Result<(), RoutingError> {
+    info!("Creating link: {} -> {}", output_port_name, input_port_name);
 
     let output = Command::new("pw-link")
         .arg("-L")
@@ -84,7 +84,10 @@ pub fn destroy_link(link_id: u32) -> Result<(), RoutingError> {
 }
 
 /// Destroy a link by port names.
-pub fn destroy_link_by_name(output_port_name: &str, input_port_name: &str) -> Result<(), RoutingError> {
+pub fn destroy_link_by_name(
+    output_port_name: &str,
+    input_port_name: &str,
+) -> Result<(), RoutingError> {
     info!(
         "Destroying link: {} -> {}",
         output_port_name, input_port_name
@@ -120,10 +123,7 @@ pub fn list_links() -> Result<Vec<String>, RoutingError> {
 ///
 /// This finds all output ports of the app node and links them to
 /// corresponding input ports of the sink.
-pub fn route_app_to_sink(
-    app_node_name: &str,
-    sink_node_name: &str,
-) -> Result<(), RoutingError> {
+pub fn route_app_to_sink(app_node_name: &str, sink_node_name: &str) -> Result<(), RoutingError> {
     // Link FL to FL, FR to FR
     let channels = ["FL", "FR"];
 
