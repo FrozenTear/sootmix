@@ -135,57 +135,35 @@ fn find_node_by_name(name: &str) -> Result<u32, VirtualSinkError> {
 
     let json_str = String::from_utf8_lossy(&output.stdout);
 
-    // Parse JSON (simple approach without full serde_json dependency)
-    // Look for pattern: "id" : <number> followed by "node.name" : "<name>"
-    // This is a simplified parser; in production you'd use serde_json
+    // Parse JSON with serde_json
+    let objects: Vec<serde_json::Value> = serde_json::from_str(&json_str)
+        .map_err(|_| VirtualSinkError::InvalidJson)?;
 
-    // For now, use a regex-like search
-    for line in json_str.lines() {
-        if line.contains(&format!("\"node.name\" : \"{}\"", name))
-            || line.contains(&format!("\"node.name\": \"{}\"", name))
-        {
-            // Found the node, now backtrack to find its ID
-            // This is hacky but avoids adding serde_json dep
+    for obj in objects {
+        // Check if it's a Node type
+        let obj_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if obj_type != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        // Get node.name from info.props
+        let node_name = obj
+            .get("info")
+            .and_then(|i| i.get("props"))
+            .and_then(|p| p.get("node.name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+
+        if node_name == name {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
+                debug!("Found node '{}' with ID {}", name, id);
+                return Ok(id as u32);
+            }
         }
     }
 
-    // Alternative: use jq if available
-    let jq_output = Command::new("jq")
-        .arg("-r")
-        .arg(format!(
-            r#".[] | select(.type == "PipeWire:Interface:Node" and .info.props."node.name" == "{}") | .id"#,
-            name
-        ))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn();
-
-    match jq_output {
-        Ok(mut jq) => {
-            use std::io::Write;
-            if let Some(ref mut stdin) = jq.stdin {
-                let _ = stdin.write_all(json_str.as_bytes());
-            }
-            let output = jq
-                .wait_with_output()
-                .map_err(|e| VirtualSinkError::PwDumpFailed(format!("jq failed: {}", e)))?;
-
-            let id_str = String::from_utf8_lossy(&output.stdout);
-            let id_str = id_str.trim();
-
-            if !id_str.is_empty() {
-                if let Ok(id) = id_str.lines().next().unwrap_or("").parse::<u32>() {
-                    return Ok(id);
-                }
-            }
-        }
-        Err(_) => {
-            // jq not available, try wpctl
-            debug!("jq not available, trying wpctl");
-        }
-    }
-
-    // Fallback: use wpctl status and grep
+    // Fallback: use wpctl status
+    debug!("Node not found in pw-dump, trying wpctl status");
     let wpctl_output = Command::new("wpctl")
         .arg("status")
         .output()
@@ -201,6 +179,7 @@ fn find_node_by_name(name: &str) -> Result<u32, VirtualSinkError> {
             let trimmed = line.trim();
             if let Some(dot_pos) = trimmed.find('.') {
                 if let Ok(id) = trimmed[..dot_pos].trim().parse::<u32>() {
+                    debug!("Found node '{}' via wpctl with ID {}", name, id);
                     return Ok(id);
                 }
             }
