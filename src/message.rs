@@ -26,10 +26,22 @@ pub enum Message {
     ChannelDeleted(Uuid),
     /// Channel renamed (channel_id, new_name).
     ChannelRenamed(Uuid, String),
+    /// Start editing a channel name.
+    StartEditingChannelName(Uuid),
+    /// Update channel name edit text.
+    ChannelNameEditChanged(String),
+    /// Cancel channel name editing.
+    CancelEditingChannelName,
     /// App assigned to channel (channel_id, app_identifier).
     AppAssigned(Uuid, String),
     /// App unassigned from channel (channel_id, app_identifier).
     AppUnassigned(Uuid, String),
+    /// Start dragging an app for assignment (node_id, app_identifier).
+    StartDraggingApp(u32, String),
+    /// Cancel the current drag operation.
+    CancelDrag,
+    /// Drop the dragged app onto a channel.
+    DropAppOnChannel(Uuid),
 
     /// Master volume changed.
     MasterVolumeChanged(f32),

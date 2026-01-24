@@ -51,6 +51,9 @@ pub const SLIDER_FILL: Color = Color::from_rgb(0.40, 0.75, 0.40);
 /// Slider fill when clipping (red).
 pub const SLIDER_CLIP: Color = Color::from_rgb(0.90, 0.30, 0.30);
 
+/// Border color for UI elements.
+pub const BORDER_COLOR: Color = Color::from_rgb(0.30, 0.30, 0.32);
+
 // ============================================================================
 // Theme Palette
 // ============================================================================

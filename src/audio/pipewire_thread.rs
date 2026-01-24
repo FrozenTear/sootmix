@@ -8,14 +8,20 @@
 //! All PipeWire operations run on a dedicated thread since PipeWire objects
 //! are not Send/Sync.
 
-use crate::audio::types::{MediaClass, PortDirection, PwLink, PwNode, PwPort, AudioChannel};
+use crate::audio::control::{build_channel_volumes_pod, build_mute_pod, build_volume_mute_pod};
+use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
+use pipewire::link::Link;
+use pipewire::node::{Node, NodeListener};
+use pipewire::properties::properties;
+use pipewire::spa::param::ParamType;
+use pipewire::spa::pod::Pod;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// Commands sent from the UI thread to the PipeWire thread.
@@ -96,6 +102,20 @@ pub enum PwError {
     ThreadError(String),
 }
 
+/// A bound node proxy with its listener.
+struct BoundNode {
+    /// The node proxy for controlling the node.
+    proxy: Node,
+    /// Listener to keep the proxy alive and receive events.
+    _listener: NodeListener,
+}
+
+/// A created link proxy that we own.
+struct CreatedLink {
+    /// The link proxy.
+    proxy: Link,
+}
+
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -106,6 +126,10 @@ struct PwThreadState {
     links: HashMap<u32, PwLink>,
     /// Map of channel UUID to virtual sink node ID.
     virtual_sinks: HashMap<Uuid, u32>,
+    /// Bound node proxies for volume/mute control.
+    bound_nodes: HashMap<u32, BoundNode>,
+    /// Links we created (port pair -> link proxy).
+    created_links: HashMap<(u32, u32), CreatedLink>,
     /// Event sender for notifying UI.
     event_tx: Rc<mpsc::Sender<PwEvent>>,
 }
@@ -117,8 +141,75 @@ impl PwThreadState {
             ports: HashMap::new(),
             links: HashMap::new(),
             virtual_sinks: HashMap::new(),
+            bound_nodes: HashMap::new(),
+            created_links: HashMap::new(),
             event_tx,
         }
+    }
+
+    /// Get node ID for a port.
+    fn get_node_for_port(&self, port_id: u32) -> Option<u32> {
+        self.ports.get(&port_id).map(|p| p.node_id)
+    }
+
+    /// Set volume on a bound node using native API.
+    ///
+    /// Uses channelVolumes (stereo FL/FR) which is what WirePlumber/wpctl uses.
+    fn set_node_volume(&self, node_id: u32, volume: f32) -> Result<(), String> {
+        let bound = self
+            .bound_nodes
+            .get(&node_id)
+            .ok_or_else(|| format!("Node {} not bound", node_id))?;
+
+        // Use stereo channel volumes (FL, FR) - this is what wpctl uses
+        let pod_data = build_channel_volumes_pod(&[volume, volume]).map_err(|e| e.to_string())?;
+
+        let pod = Pod::from_bytes(&pod_data)
+            .ok_or_else(|| "Failed to create Pod from bytes".to_string())?;
+
+        bound.proxy.set_param(ParamType::Props, 0, pod);
+
+        trace!("Native volume set on node {}: {:.3} (stereo)", node_id, volume);
+        Ok(())
+    }
+
+    /// Set mute on a bound node using native API.
+    fn set_node_mute(&self, node_id: u32, muted: bool) -> Result<(), String> {
+        let bound = self
+            .bound_nodes
+            .get(&node_id)
+            .ok_or_else(|| format!("Node {} not bound", node_id))?;
+
+        let pod_data = build_mute_pod(muted).map_err(|e| e.to_string())?;
+        let pod = Pod::from_bytes(&pod_data)
+            .ok_or_else(|| "Failed to create Pod from bytes".to_string())?;
+
+        bound.proxy.set_param(ParamType::Props, 0, pod);
+
+        trace!("Native mute set on node {}: {}", node_id, muted);
+        Ok(())
+    }
+
+    /// Set both volume and mute atomically on a bound node.
+    fn set_node_volume_mute(&self, node_id: u32, volume: f32, muted: bool) -> Result<(), String> {
+        let bound = self
+            .bound_nodes
+            .get(&node_id)
+            .ok_or_else(|| format!("Node {} not bound", node_id))?;
+
+        let pod_data = build_volume_mute_pod(volume, muted).map_err(|e| e.to_string())?;
+        let pod = Pod::from_bytes(&pod_data)
+            .ok_or_else(|| "Failed to create Pod from bytes".to_string())?;
+
+        bound.proxy.set_param(ParamType::Props, 0, pod);
+
+        trace!(
+            "Native volume+mute set on node {}: vol={:.3}, mute={}",
+            node_id,
+            volume,
+            muted
+        );
+        Ok(())
     }
 }
 
@@ -212,8 +303,9 @@ fn run_pipewire_loop(
     // Attach command receiver to main loop
     let main_loop_weak = main_loop.downgrade();
     let state_cmd = state.clone();
+    let core_cmd = core.clone();
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), move |cmd| {
-        handle_command(cmd, &state_cmd, &main_loop_weak);
+        handle_command(cmd, &state_cmd, &main_loop_weak, &core_cmd);
     });
 
     // Set up registry listener for discovering nodes, ports, links
@@ -233,6 +325,7 @@ fn handle_command(
     cmd: PwCommand,
     state: &Rc<RefCell<PwThreadState>>,
     main_loop_weak: &pipewire::main_loop::MainLoopWeak,
+    core: &pipewire::core::CoreRc,
 ) {
     match cmd {
         PwCommand::Shutdown => {
@@ -248,6 +341,7 @@ fn handle_command(
             match crate::audio::virtual_sink::create_virtual_sink(&name, &name) {
                 Ok(node_id) => {
                     state.borrow_mut().virtual_sinks.insert(channel_id, node_id);
+                    // Note: Node will be auto-bound when it appears in registry listener
                     let _ = event_tx.send(PwEvent::VirtualSinkCreated {
                         channel_id,
                         node_id,
@@ -265,6 +359,10 @@ fn handle_command(
         PwCommand::DestroyVirtualSink { node_id } => {
             debug!("Destroying virtual sink: {}", node_id);
             let event_tx = state.borrow().event_tx.clone();
+
+            // Remove the bound node proxy
+            state.borrow_mut().bound_nodes.remove(&node_id);
+
             if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
                 warn!("Failed to destroy virtual sink {}: {}", node_id, e);
             }
@@ -279,13 +377,76 @@ fn handle_command(
             output_port,
             input_port,
         } => {
-            debug!("Creating link: {} -> {}", output_port, input_port);
-            // TODO: Implement native link creation
-            warn!("Native link creation not yet implemented");
+            debug!("Creating link: port {} -> port {}", output_port, input_port);
+
+            // Get node IDs for the ports
+            let (out_node, in_node) = {
+                let s = state.borrow();
+                (s.get_node_for_port(output_port), s.get_node_for_port(input_port))
+            };
+
+            let out_node = match out_node {
+                Some(n) => n,
+                None => {
+                    warn!("Output port {} not found, using CLI fallback", output_port);
+                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                        let event_tx = state.borrow().event_tx.clone();
+                        let _ = event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                    }
+                    return;
+                }
+            };
+
+            let in_node = match in_node {
+                Some(n) => n,
+                None => {
+                    warn!("Input port {} not found, using CLI fallback", input_port);
+                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                        let event_tx = state.borrow().event_tx.clone();
+                        let _ = event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                    }
+                    return;
+                }
+            };
+
+            // Create link using native API
+            let link_result = core.create_object::<Link>(
+                "link-factory",
+                &properties! {
+                    "link.output.port" => output_port.to_string(),
+                    "link.input.port" => input_port.to_string(),
+                    "link.output.node" => out_node.to_string(),
+                    "link.input.node" => in_node.to_string(),
+                    "object.linger" => "true"
+                },
+            );
+
+            match link_result {
+                Ok(link) => {
+                    info!("Native link created: {} -> {}", output_port, input_port);
+                    state.borrow_mut().created_links.insert(
+                        (output_port, input_port),
+                        CreatedLink { proxy: link },
+                    );
+                }
+                Err(e) => {
+                    warn!("Native link creation failed: {:?}, using CLI fallback", e);
+                    if let Err(e2) = crate::audio::routing::create_link(output_port, input_port) {
+                        let event_tx = state.borrow().event_tx.clone();
+                        let _ = event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e2)));
+                    }
+                }
+            }
         }
 
         PwCommand::DestroyLink { link_id } => {
             debug!("Destroying link: {}", link_id);
+
+            // Try to find and destroy via our created links
+            // Note: link_id might be from registry, not our port pair
+            // For now, we'll use CLI fallback for link_id-based destruction
+            // TODO: Track link_id -> port pair mapping
+
             if let Err(e) = crate::audio::routing::destroy_link(link_id) {
                 let event_tx = state.borrow().event_tx.clone();
                 let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
@@ -294,18 +455,39 @@ fn handle_command(
 
         PwCommand::SetVolume { node_id, volume } => {
             debug!("Setting volume on node {}: {:.3}", node_id, volume);
-            // TODO: Implement native volume control via node proxy
-            // For now, use CLI fallback
-            if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
-                warn!("Failed to set volume: {}", e);
+
+            // Try native API first if node is bound
+            let result = state.borrow().set_node_volume(node_id, volume);
+            match result {
+                Ok(()) => {
+                    trace!("Native volume control succeeded for node {}", node_id);
+                }
+                Err(e) => {
+                    // Node not bound or native failed, use CLI fallback
+                    debug!("Native volume failed ({}), using CLI fallback", e);
+                    if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                        warn!("CLI volume control also failed: {}", e2);
+                    }
+                }
             }
         }
 
         PwCommand::SetMute { node_id, muted } => {
             debug!("Setting mute on node {}: {}", node_id, muted);
-            // TODO: Implement native mute control via node proxy
-            if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
-                warn!("Failed to set mute: {}", e);
+
+            // Try native API first if node is bound
+            let result = state.borrow().set_node_mute(node_id, muted);
+            match result {
+                Ok(()) => {
+                    trace!("Native mute control succeeded for node {}", node_id);
+                }
+                Err(e) => {
+                    // Node not bound or native failed, use CLI fallback
+                    debug!("Native mute failed ({}), using CLI fallback", e);
+                    if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
+                        warn!("CLI mute control also failed: {}", e2);
+                    }
+                }
             }
         }
 
@@ -318,12 +500,23 @@ fn handle_command(
                 "Setting volume+mute on node {}: vol={:.3}, mute={}",
                 node_id, volume, muted
             );
-            // TODO: Implement native combined control
-            if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
-                warn!("Failed to set volume: {}", e);
-            }
-            if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
-                warn!("Failed to set mute: {}", e);
+
+            // Try native API first if node is bound
+            let result = state.borrow().set_node_volume_mute(node_id, volume, muted);
+            match result {
+                Ok(()) => {
+                    trace!("Native volume+mute control succeeded for node {}", node_id);
+                }
+                Err(e) => {
+                    // Node not bound or native failed, use CLI fallback
+                    debug!("Native volume+mute failed ({}), using CLI fallback", e);
+                    if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                        warn!("CLI volume control failed: {}", e2);
+                    }
+                    if let Err(e3) = crate::audio::volume::set_mute(node_id, muted) {
+                        warn!("CLI mute control failed: {}", e3);
+                    }
+                }
             }
         }
 
@@ -344,7 +537,51 @@ fn handle_command(
     }
 }
 
+/// Bind a node proxy for native control from a GlobalObject.
+/// This is called from the registry listener when we detect nodes we want to control.
+fn bind_node_from_global(
+    global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    state: &Rc<RefCell<PwThreadState>>,
+    registry: &pipewire::registry::RegistryRc,
+) -> Result<(), String> {
+    let node_id = global.id;
+
+    // Check if already bound
+    if state.borrow().bound_nodes.contains_key(&node_id) {
+        return Ok(());
+    }
+
+    debug!("Binding node proxy for node {}", node_id);
+
+    // Bind the node
+    let node: Node = registry
+        .bind(global)
+        .map_err(|e| format!("Failed to bind node {}: {:?}", node_id, e))?;
+
+    // Set up listener for param changes
+    let listener = node
+        .add_listener_local()
+        .param(move |_seq, _id, _index, _next, _pod| {
+            // Could parse the pod here to get volume/mute feedback
+            trace!("Received param update for bound node");
+        })
+        .register();
+
+    // Store the bound node
+    state.borrow_mut().bound_nodes.insert(
+        node_id,
+        BoundNode {
+            proxy: node,
+            _listener: listener,
+        },
+    );
+
+    info!("Successfully bound node {} for native control", node_id);
+    Ok(())
+}
+
 /// Set up the registry listener to watch for nodes, ports, and links.
+/// Also binds sootmix virtual sink nodes for native control.
 fn setup_registry_listener(
     registry: &pipewire::registry::RegistryRc,
     state: Rc<RefCell<PwThreadState>>,
@@ -354,6 +591,9 @@ fn setup_registry_listener(
     let state_remove = state;
     let event_tx_add = event_tx.clone();
     let event_tx_remove = event_tx;
+
+    // Clone registry for use in the closure
+    let registry_clone = registry.clone();
 
     registry
         .add_listener_local()
@@ -395,6 +635,14 @@ fn setup_registry_listener(
                         "Node added: id={}, name={}, class={:?}",
                         node.id, node.name, node.media_class
                     );
+
+                    // Auto-bind sootmix virtual sink nodes for native control
+                    if node.name.starts_with("sootmix.") {
+                        debug!("Detected sootmix node, binding for native control: {}", node.name);
+                        if let Err(e) = bind_node_from_global(global, &state_add, &registry_clone) {
+                            warn!("Failed to bind sootmix node {}: {}", node.id, e);
+                        }
+                    }
 
                     state_add.borrow_mut().nodes.insert(global.id, node.clone());
                     let _ = event_tx_add.send(PwEvent::NodeAdded(node));
@@ -454,6 +702,9 @@ fn setup_registry_listener(
         })
         .global_remove(move |id| {
             let mut state = state_remove.borrow_mut();
+
+            // Remove bound node proxy if it exists
+            state.bound_nodes.remove(&id);
 
             if state.nodes.remove(&id).is_some() {
                 debug!("Node removed: {}", id);

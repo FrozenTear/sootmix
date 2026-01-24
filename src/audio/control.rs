@@ -16,6 +16,7 @@ use tracing::{debug, trace};
 
 /// SPA type and parameter constants.
 /// These match the values from spa/param/param.h and spa/param/props.h
+/// Reference: https://docs.pipewire.org/page_spa_pod.html
 pub mod spa_const {
     /// SPA_TYPE_OBJECT_Props
     pub const SPA_TYPE_OBJECT_PROPS: u32 = 262146; // 0x40002
@@ -24,13 +25,15 @@ pub mod spa_const {
     pub const SPA_PARAM_PROPS: u32 = 2;
 
     /// Property keys from spa/param/props.h
-    pub const SPA_PROP_volume: u32 = 65540; // 0x10004
-    pub const SPA_PROP_mute: u32 = 65541; // 0x10005
-    pub const SPA_PROP_channelVolumes: u32 = 65542; // 0x10006
-    pub const SPA_PROP_channelMap: u32 = 65543; // 0x10007
+    /// IMPORTANT: These values were verified against libspa-sys bindings
+    pub const SPA_PROP_VOLUME: u32 = 65539; // 0x10003
+    pub const SPA_PROP_MUTE: u32 = 65540; // 0x10004
+    pub const SPA_PROP_CHANNEL_VOLUMES: u32 = 65544; // 0x10008 - PRIMARY for volume control
+    pub const SPA_PROP_CHANNEL_MAP: u32 = 65545; // 0x10009
+    pub const SPA_PROP_SOFT_VOLUMES: u32 = 65552; // 0x10010
 
     /// For filter-chain control ports (named params)
-    pub const SPA_PROP_params: u32 = 65544; // 0x10008
+    pub const SPA_PROP_PARAMS: u32 = 524289; // 0x80001
 }
 
 #[derive(Debug, Error)]
@@ -52,7 +55,7 @@ pub type ControlResult<T> = Result<T, ControlError>;
 ///
 /// Volume is in linear scale: 0.0 = silent, 1.0 = 100%, values > 1.0 = boost.
 pub fn build_volume_pod(volume: f32) -> ControlResult<Vec<u8>> {
-    let volume_clamped = volume.clamp(0.0, 1.5);
+    let volume_clamped = volume.clamp(0.0, 4.0);
 
     trace!("Building volume pod: {:.3}", volume_clamped);
 
@@ -61,7 +64,7 @@ pub fn build_volume_pod(volume: f32) -> ControlResult<Vec<u8>> {
         type_: libspa::utils::SpaTypes::ObjectParamProps.as_raw(),
         id: spa_const::SPA_PARAM_PROPS,
         properties: vec![Property {
-            key: spa_const::SPA_PROP_volume,
+            key: spa_const::SPA_PROP_VOLUME,
             flags: libspa::pod::PropertyFlags::empty(),
             value: Value::Float(volume_clamped),
         }],
@@ -71,16 +74,19 @@ pub fn build_volume_pod(volume: f32) -> ControlResult<Vec<u8>> {
 }
 
 /// Build a Props pod for setting stereo channel volumes.
+///
+/// Volume is linear: 0.0 = silent, 1.0 = 0dB, 4.0 = +12dB
 pub fn build_channel_volumes_pod(volumes: &[f32]) -> ControlResult<Vec<u8>> {
-    let volumes_clamped: Vec<f32> = volumes.iter().map(|v| v.clamp(0.0, 1.5)).collect();
+    // Allow up to 4.0 (~+12dB boost), matching common mixer range
+    let volumes_clamped: Vec<f32> = volumes.iter().map(|v| v.clamp(0.0, 4.0)).collect();
 
-    trace!("Building channel volumes pod: {:?}", volumes_clamped);
+    debug!("Building channel volumes pod: {:?}", volumes_clamped);
 
     let object = Object {
         type_: libspa::utils::SpaTypes::ObjectParamProps.as_raw(),
         id: spa_const::SPA_PARAM_PROPS,
         properties: vec![Property {
-            key: spa_const::SPA_PROP_channelVolumes,
+            key: spa_const::SPA_PROP_CHANNEL_VOLUMES,
             flags: libspa::pod::PropertyFlags::empty(),
             value: Value::ValueArray(ValueArray::Float(volumes_clamped)),
         }],
@@ -97,7 +103,7 @@ pub fn build_mute_pod(muted: bool) -> ControlResult<Vec<u8>> {
         type_: libspa::utils::SpaTypes::ObjectParamProps.as_raw(),
         id: spa_const::SPA_PARAM_PROPS,
         properties: vec![Property {
-            key: spa_const::SPA_PROP_mute,
+            key: spa_const::SPA_PROP_MUTE,
             flags: libspa::pod::PropertyFlags::empty(),
             value: Value::Bool(muted),
         }],
@@ -107,8 +113,10 @@ pub fn build_mute_pod(muted: bool) -> ControlResult<Vec<u8>> {
 }
 
 /// Build a Props pod for setting both volume and mute.
+///
+/// Uses channelVolumes (stereo FL/FR) which is what WirePlumber/wpctl uses.
 pub fn build_volume_mute_pod(volume: f32, muted: bool) -> ControlResult<Vec<u8>> {
-    let volume_clamped = volume.clamp(0.0, 1.5);
+    let volume_clamped = volume.clamp(0.0, 4.0);
 
     trace!(
         "Building volume+mute pod: vol={:.3}, mute={}",
@@ -121,12 +129,12 @@ pub fn build_volume_mute_pod(volume: f32, muted: bool) -> ControlResult<Vec<u8>>
         id: spa_const::SPA_PARAM_PROPS,
         properties: vec![
             Property {
-                key: spa_const::SPA_PROP_volume,
+                key: spa_const::SPA_PROP_CHANNEL_VOLUMES,
                 flags: libspa::pod::PropertyFlags::empty(),
-                value: Value::Float(volume_clamped),
+                value: Value::ValueArray(ValueArray::Float(vec![volume_clamped, volume_clamped])),
             },
             Property {
-                key: spa_const::SPA_PROP_mute,
+                key: spa_const::SPA_PROP_MUTE,
                 flags: libspa::pod::PropertyFlags::empty(),
                 value: Value::Bool(muted),
             },
@@ -155,7 +163,7 @@ pub fn build_filter_control_pod(controls: &[(&str, f32)]) -> ControlResult<Vec<u
         // Each control is a property with the control name as a string key
         // This matches what pw-cli sends: { params = [ "Freq" 1000.0, "Gain" -3.0 ] }
         properties.push(Property {
-            key: spa_const::SPA_PROP_params,
+            key: spa_const::SPA_PROP_PARAMS,
             flags: libspa::pod::PropertyFlags::empty(),
             value: Value::String(format!("{}:{}", name, value)),
         });
@@ -203,7 +211,7 @@ fn serialize_object(object: Object) -> ControlResult<Vec<u8>> {
         .map_err(|e| ControlError::SerializationFailed(format!("{:?}", e)))?;
 
     buffer.truncate(written as usize);
-    debug!("Serialized pod: {} bytes", buffer.len());
+    debug!("Serialized pod: {} bytes, hex: {:02x?}", buffer.len(), &buffer[..buffer.len().min(64)]);
 
     Ok(buffer)
 }

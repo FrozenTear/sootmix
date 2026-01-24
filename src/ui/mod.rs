@@ -4,6 +4,7 @@
 
 //! UI components for SootMix.
 
+pub mod apps_panel;
 pub mod channel_strip;
 pub mod theme;
 

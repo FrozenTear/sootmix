@@ -7,23 +7,60 @@
 use crate::message::Message;
 use crate::state::MixerChannel;
 use crate::ui::theme::{self, *};
-use iced::widget::{button, column, container, row, slider, text, vertical_slider, Space};
+use iced::widget::{button, column, container, row, slider, text, text_input, vertical_slider, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
 
 /// Create a channel strip widget for a mixer channel.
-pub fn channel_strip(channel: &MixerChannel) -> Element<'_, Message> {
+/// `editing` is Some((channel_id, current_text)) if this channel's name is being edited.
+pub fn channel_strip<'a>(
+    channel: &'a MixerChannel,
+    dragging: Option<&'a (u32, String)>,
+    editing: Option<&'a (Uuid, String)>,
+) -> Element<'a, Message> {
     let id = channel.id;
     let volume_db = channel.volume_db;
     let muted = channel.muted;
     let eq_enabled = channel.eq_enabled;
     let name = channel.name.clone();
     let assigned_apps = channel.assigned_apps.clone();
+    let is_drop_target = dragging.is_some();
 
-    // Channel name
-    let name_text = text(name)
-        .size(14)
-        .color(TEXT);
+    // Check if this channel is being edited
+    let is_editing = editing.map(|(eid, _)| *eid == id).unwrap_or(false);
+
+    // Channel name - either text input (editing) or clickable text
+    let name_element: Element<Message> = if is_editing {
+        let edit_value = editing.map(|(_, v)| v.clone()).unwrap_or_default();
+        text_input("Channel name", &edit_value)
+            .on_input(Message::ChannelNameEditChanged)
+            .on_submit(Message::ChannelRenamed(id, edit_value.clone()))
+            .size(13)
+            .width(Length::Fill)
+            .style(|_theme: &Theme, _status| text_input::Style {
+                background: Background::Color(SURFACE_LIGHT),
+                border: Border::default().rounded(BORDER_RADIUS_SMALL).color(PRIMARY).width(1.0),
+                icon: TEXT,
+                placeholder: TEXT_DIM,
+                value: TEXT,
+                selection: PRIMARY,
+            })
+            .into()
+    } else {
+        button(text(name.clone()).size(14).color(TEXT))
+            .padding([2, 4])
+            .style(|_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(Background::Color(if is_hovered { SURFACE_LIGHT } else { Color::TRANSPARENT })),
+                    text_color: TEXT,
+                    border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::StartEditingChannelName(id))
+            .into()
+    };
 
     // EQ button
     let eq_button = button(text("EQ").size(11))
@@ -96,22 +133,50 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'_, Message> {
         })
         .on_press(Message::ChannelMuteToggled(id));
 
-    // Assigned apps list
-    let apps_list: Element<Message> = if assigned_apps.is_empty() {
+    // Assigned apps list or drop indicator
+    let apps_list: Element<Message> = if is_drop_target {
+        // Show assignment indicator when in assign mode
+        column![
+            text("+ Assign")
+                .size(12)
+                .color(ACCENT),
+        ]
+        .align_x(Alignment::Center)
+        .into()
+    } else if assigned_apps.is_empty() {
         text("No apps")
             .size(10)
             .color(TEXT_DIM)
             .into()
     } else {
-        let apps_text = assigned_apps
+        // Create clickable buttons for each assigned app
+        let app_buttons: Vec<Element<Message>> = assigned_apps
             .iter()
             .take(3)
-            .map(|a| format!("• {}", truncate_string(a, 10)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        text(apps_text)
-            .size(10)
-            .color(TEXT_DIM)
+            .map(|app_id| {
+                let app_id_clone = app_id.clone();
+                button(
+                    text(format!("× {}", truncate_string(app_id, 8)))
+                        .size(9)
+                )
+                .padding([2, 4])
+                .style(|_theme: &Theme, status| {
+                    let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: Some(Background::Color(if is_hovered { MUTED_COLOR } else { SURFACE_LIGHT })),
+                        text_color: if is_hovered { TEXT } else { TEXT_DIM },
+                        border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                        ..button::Style::default()
+                    }
+                })
+                .on_press(Message::AppUnassigned(id, app_id_clone))
+                .into()
+            })
+            .collect();
+
+        column(app_buttons)
+            .spacing(2)
+            .align_x(Alignment::Center)
             .into()
     };
 
@@ -132,7 +197,7 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'_, Message> {
     let content = column![
         // Header row with name and delete
         row![
-            name_text,
+            name_element,
             Space::new().width(Fill),
             delete_button,
         ]
@@ -159,16 +224,48 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'_, Message> {
     .spacing(SPACING_SMALL);
 
     // Wrap in a styled container
-    container(content)
+    let strip_container = container(content)
         .width(CHANNEL_STRIP_WIDTH)
-        .style(|theme: &Theme| {
+        .style(move |_theme: &Theme| {
             container::Style {
                 background: Some(Background::Color(SURFACE)),
-                border: standard_border(),
+                border: Border::default()
+                    .rounded(BORDER_RADIUS)
+                    .color(if is_drop_target { PRIMARY } else { SURFACE_LIGHT })
+                    .width(if is_drop_target { 2.0 } else { 1.0 }),
                 ..container::Style::default()
             }
-        })
-        .into()
+        });
+
+    // When dragging an app, wrap in a button to accept drops
+    if is_drop_target {
+        button(strip_container)
+            .padding(0)
+            .style(|_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(Color::TRANSPARENT)),
+                    border: Border::default()
+                        .rounded(BORDER_RADIUS)
+                        .color(if is_hovered { ACCENT } else { PRIMARY })
+                        .width(if is_hovered { 3.0 } else { 2.0 }),
+                    shadow: if is_hovered {
+                        iced::Shadow {
+                            color: Color { a: 0.3, ..ACCENT },
+                            offset: iced::Vector::new(0.0, 0.0),
+                            blur_radius: 8.0,
+                        }
+                    } else {
+                        iced::Shadow::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::DropAppOnChannel(id))
+            .into()
+    } else {
+        strip_container.into()
+    }
 }
 
 /// Create a master channel strip widget.

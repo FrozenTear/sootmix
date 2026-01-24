@@ -3,3 +3,6 @@
 *.swo
 .DS_Store
 
+# Internal documentation (research notes)
+/docs/
+

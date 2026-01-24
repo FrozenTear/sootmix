@@ -4,7 +4,7 @@
 
 //! Application state management.
 
-use crate::audio::types::{MediaClass, OutputDevice, PwLink, PwNode, PwPort};
+use crate::audio::types::{AudioChannel, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -153,6 +153,82 @@ impl PwGraphState {
             .values()
             .find(|l| l.output_node == output_node && l.input_node == input_node)
     }
+
+    /// Find all links FROM a node (outgoing links).
+    /// Used to disconnect an app from its current sinks before re-routing.
+    pub fn links_from_node(&self, node_id: u32) -> Vec<&PwLink> {
+        self.links
+            .values()
+            .filter(|l| l.output_node == node_id)
+            .collect()
+    }
+
+    /// Get output ports for a node (ports that send audio out).
+    pub fn output_ports_for_node(&self, node_id: u32) -> Vec<&PwPort> {
+        self.ports
+            .values()
+            .filter(|p| p.node_id == node_id && p.direction == PortDirection::Output)
+            .collect()
+    }
+
+    /// Get input ports for a node (ports that receive audio).
+    pub fn input_ports_for_node(&self, node_id: u32) -> Vec<&PwPort> {
+        self.ports
+            .values()
+            .filter(|p| p.node_id == node_id && p.direction == PortDirection::Input)
+            .collect()
+    }
+
+    /// Find matching port pairs for linking two nodes (matches by audio channel).
+    /// Returns pairs of (output_port_id, input_port_id).
+    pub fn find_port_pairs(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
+        let output_ports = self.output_ports_for_node(output_node);
+        let input_ports = self.input_ports_for_node(input_node);
+
+        let mut pairs = Vec::new();
+
+        for out_port in &output_ports {
+            // Try to find matching input port by channel
+            for in_port in &input_ports {
+                let out_channel = &out_port.channel;
+                let in_channel = &in_port.channel;
+
+                // Match by channel, or if both are mono/unknown, just pair them
+                let is_match = match (out_channel, in_channel) {
+                    (AudioChannel::FrontLeft, AudioChannel::FrontLeft) => true,
+                    (AudioChannel::FrontRight, AudioChannel::FrontRight) => true,
+                    (AudioChannel::FrontCenter, AudioChannel::FrontCenter) => true,
+                    (AudioChannel::Mono, AudioChannel::Mono) => true,
+                    (AudioChannel::RearLeft, AudioChannel::RearLeft) => true,
+                    (AudioChannel::RearRight, AudioChannel::RearRight) => true,
+                    (AudioChannel::LowFrequency, AudioChannel::LowFrequency) => true,
+                    // For unknown channels, match by port name patterns
+                    _ => {
+                        // Try to match FL/FR patterns in port names
+                        let out_name = out_port.name.to_lowercase();
+                        let in_name = in_port.name.to_lowercase();
+                        (out_name.contains("fl") && in_name.contains("fl"))
+                            || (out_name.contains("fr") && in_name.contains("fr"))
+                            || (out_name.contains("_0") && in_name.contains("_0"))
+                            || (out_name.contains("_1") && in_name.contains("_1"))
+                    }
+                };
+
+                if is_match {
+                    pairs.push((out_port.id, in_port.id));
+                }
+            }
+        }
+
+        // If no matches found but both have ports, just pair them in order
+        if pairs.is_empty() && !output_ports.is_empty() && !input_ports.is_empty() {
+            for (out_port, in_port) in output_ports.iter().zip(input_ports.iter()) {
+                pairs.push((out_port.id, in_port.id));
+            }
+        }
+
+        pairs
+    }
 }
 
 /// Main application state.
@@ -182,6 +258,12 @@ pub struct AppState {
     pub settings_open: bool,
     /// Last error message.
     pub last_error: Option<String>,
+    /// App being dragged for assignment (node_id, app_name).
+    pub dragging_app: Option<(u32, String)>,
+    /// Channel being renamed (channel_id, current_edit_value).
+    pub editing_channel: Option<(Uuid, String)>,
+    /// Apps waiting to be re-routed after a sink rename (channel_id, app_node_ids).
+    pub pending_reroute: Option<(Uuid, Vec<u32>)>,
 }
 
 impl Default for AppState {
@@ -205,6 +287,9 @@ impl AppState {
             eq_panel_channel: None,
             settings_open: false,
             last_error: None,
+            dragging_app: None,
+            editing_channel: None,
+            pending_reroute: None,
         }
     }
 
@@ -231,9 +316,24 @@ impl AppState {
             .pw_graph
             .playback_streams()
             .iter()
+            .filter(|node| {
+                // Filter out internal nodes
+                let name = &node.name;
+                !name.starts_with("sootmix.")
+                    && !name.starts_with("LB-")
+                    && !name.contains("loopback")
+                    && !name.starts_with("filter-chain")
+            })
             .map(|node| AppInfo {
                 node_id: node.id,
-                name: node.app_name.clone().unwrap_or_else(|| node.name.clone()),
+                // Use app_name if available, otherwise description, then name
+                name: node.app_name.clone()
+                    .or_else(|| if !node.description.is_empty() {
+                        Some(node.description.clone())
+                    } else {
+                        None
+                    })
+                    .unwrap_or_else(|| node.name.clone()),
                 binary: node.binary_name.clone(),
                 icon: None,
             })
