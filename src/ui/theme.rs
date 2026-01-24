@@ -62,6 +62,7 @@ pub const THEME_PALETTE: Palette = Palette {
     primary: PRIMARY,
     success: SUCCESS,
     danger: MUTED_COLOR,
+    warning: WARNING,
 };
 
 /// Get the SootMix custom theme.

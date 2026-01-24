@@ -8,19 +8,14 @@
 //! All PipeWire operations run on a dedicated thread since PipeWire objects
 //! are not Send/Sync.
 
-use crate::audio::control::{self, spa_const};
-use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
-use libspa::param::ParamType;
-use libspa::pod::Pod;
-use pipewire::node::Node;
-use pipewire::proxy::{Listener, ProxyT};
+use crate::audio::types::{MediaClass, PortDirection, PwLink, PwNode, PwPort, AudioChannel};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use thiserror::Error;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Commands sent from the UI thread to the PipeWire thread.
@@ -101,16 +96,6 @@ pub enum PwError {
     ThreadError(String),
 }
 
-/// A bound node with its proxy and listener.
-struct BoundNode {
-    /// The node proxy for calling set_param, etc.
-    proxy: Node,
-    /// Listener for param events (must be kept alive).
-    _listener: Listener,
-    /// Cached node info.
-    info: PwNode,
-}
-
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -119,8 +104,6 @@ struct PwThreadState {
     ports: HashMap<u32, PwPort>,
     /// Links indexed by link ID.
     links: HashMap<u32, PwLink>,
-    /// Bound node proxies for control operations.
-    bound_nodes: HashMap<u32, BoundNode>,
     /// Map of channel UUID to virtual sink node ID.
     virtual_sinks: HashMap<Uuid, u32>,
     /// Event sender for notifying UI.
@@ -133,109 +116,9 @@ impl PwThreadState {
             nodes: HashMap::new(),
             ports: HashMap::new(),
             links: HashMap::new(),
-            bound_nodes: HashMap::new(),
             virtual_sinks: HashMap::new(),
             event_tx,
         }
-    }
-
-    /// Set volume on a bound node using native API.
-    fn set_volume(&self, node_id: u32, volume: f32) -> Result<(), control::ControlError> {
-        let bound = self
-            .bound_nodes
-            .get(&node_id)
-            .ok_or(control::ControlError::NodeNotBound(node_id))?;
-
-        let pod_data = control::build_volume_pod(volume)?;
-
-        // Safety: The pod data is valid for the duration of this call
-        unsafe {
-            let pod = Pod::from_bytes(&pod_data)
-                .ok_or_else(|| control::ControlError::SerializationFailed("Invalid pod".into()))?;
-
-            bound.proxy.set_param(ParamType::Props, 0, pod);
-        }
-
-        debug!("Set volume on node {} to {:.3}", node_id, volume);
-        Ok(())
-    }
-
-    /// Set mute state on a bound node using native API.
-    fn set_mute(&self, node_id: u32, muted: bool) -> Result<(), control::ControlError> {
-        let bound = self
-            .bound_nodes
-            .get(&node_id)
-            .ok_or(control::ControlError::NodeNotBound(node_id))?;
-
-        let pod_data = control::build_mute_pod(muted)?;
-
-        unsafe {
-            let pod = Pod::from_bytes(&pod_data)
-                .ok_or_else(|| control::ControlError::SerializationFailed("Invalid pod".into()))?;
-
-            bound.proxy.set_param(ParamType::Props, 0, pod);
-        }
-
-        debug!("Set mute on node {} to {}", node_id, muted);
-        Ok(())
-    }
-
-    /// Set volume and mute atomically on a bound node.
-    fn set_volume_mute(
-        &self,
-        node_id: u32,
-        volume: f32,
-        muted: bool,
-    ) -> Result<(), control::ControlError> {
-        let bound = self
-            .bound_nodes
-            .get(&node_id)
-            .ok_or(control::ControlError::NodeNotBound(node_id))?;
-
-        let pod_data = control::build_volume_mute_pod(volume, muted)?;
-
-        unsafe {
-            let pod = Pod::from_bytes(&pod_data)
-                .ok_or_else(|| control::ControlError::SerializationFailed("Invalid pod".into()))?;
-
-            bound.proxy.set_param(ParamType::Props, 0, pod);
-        }
-
-        debug!(
-            "Set volume+mute on node {}: vol={:.3}, mute={}",
-            node_id, volume, muted
-        );
-        Ok(())
-    }
-
-    /// Set EQ parameters on a filter-chain node.
-    fn set_eq_params(
-        &self,
-        node_id: u32,
-        band: &str,
-        freq: f32,
-        q: f32,
-        gain: f32,
-    ) -> Result<(), control::ControlError> {
-        let bound = self
-            .bound_nodes
-            .get(&node_id)
-            .ok_or(control::ControlError::NodeNotBound(node_id))?;
-
-        let pod_data = control::build_eq_band_pod(band, freq, q, gain)?;
-
-        unsafe {
-            let pod = Pod::from_bytes(&pod_data)
-                .ok_or_else(|| control::ControlError::SerializationFailed("Invalid pod".into()))?;
-
-            bound.proxy.set_param(ParamType::Props, 0, pod);
-        }
-
-        debug!(
-            "Set EQ on node {} band {}: freq={:.1}, Q={:.2}, gain={:.1}",
-            node_id, band, freq, q, gain
-        );
-        Ok(())
     }
 }
 
@@ -305,18 +188,18 @@ fn run_pipewire_loop(
 
     // Create main loop
     let main_loop =
-        pipewire::main_loop::MainLoop::new(None).map_err(|e| PwError::InitFailed(e.to_string()))?;
+        pipewire::main_loop::MainLoopRc::new(None).map_err(|e| PwError::InitFailed(e.to_string()))?;
 
     // Create context and connect
-    let context = pipewire::context::Context::new(&main_loop)
+    let context = pipewire::context::ContextRc::new(&main_loop, None)
         .map_err(|e| PwError::InitFailed(e.to_string()))?;
 
     let core = context
-        .connect(None)
+        .connect_rc(None)
         .map_err(|e| PwError::ConnectionFailed(e.to_string()))?;
 
     let registry = core
-        .get_registry()
+        .get_registry_rc()
         .map_err(|e| PwError::ConnectionFailed(e.to_string()))?;
 
     info!("Connected to PipeWire");
@@ -329,15 +212,12 @@ fn run_pipewire_loop(
     // Attach command receiver to main loop
     let main_loop_weak = main_loop.downgrade();
     let state_cmd = state.clone();
-    let core_cmd = core.clone();
-    let registry_cmd = registry.clone();
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), move |cmd| {
-        handle_command(cmd, &state_cmd, &core_cmd, &registry_cmd, &main_loop_weak);
+        handle_command(cmd, &state_cmd, &main_loop_weak);
     });
 
     // Set up registry listener for discovering nodes, ports, links
-    let _registry_listener =
-        setup_registry_listener(&registry, state.clone(), event_tx.clone(), &core);
+    let _registry_listener = setup_registry_listener(&registry, state.clone(), event_tx.clone());
 
     // Run the main loop (blocks until quit)
     main_loop.run();
@@ -352,9 +232,7 @@ fn run_pipewire_loop(
 fn handle_command(
     cmd: PwCommand,
     state: &Rc<RefCell<PwThreadState>>,
-    core: &pipewire::core::Core,
-    registry: &pipewire::registry::Registry,
-    main_loop_weak: &pipewire::main_loop::WeakMainLoop,
+    main_loop_weak: &pipewire::main_loop::MainLoopWeak,
 ) {
     match cmd {
         PwCommand::Shutdown => {
@@ -366,8 +244,6 @@ fn handle_command(
 
         PwCommand::CreateVirtualSink { channel_id, name } => {
             debug!("Creating virtual sink: {} for channel {}", name, channel_id);
-            // For now, still use the config-based approach
-            // TODO: Implement native module loading
             let event_tx = state.borrow().event_tx.clone();
             match crate::audio::virtual_sink::create_virtual_sink(&name, &name) {
                 Ok(node_id) => {
@@ -404,49 +280,32 @@ fn handle_command(
             input_port,
         } => {
             debug!("Creating link: {} -> {}", output_port, input_port);
-            create_link_native(core, output_port, input_port, state);
+            // TODO: Implement native link creation
+            warn!("Native link creation not yet implemented");
         }
 
         PwCommand::DestroyLink { link_id } => {
             debug!("Destroying link: {}", link_id);
-            destroy_link_native(core, link_id, state);
+            if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                let event_tx = state.borrow().event_tx.clone();
+                let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
+            }
         }
 
         PwCommand::SetVolume { node_id, volume } => {
-            trace!("Setting volume on node {}: {:.3}", node_id, volume);
-            let state_ref = state.borrow();
-
-            // Try native first, fall back to ensuring node is bound
-            if let Err(e) = state_ref.set_volume(node_id, volume) {
-                warn!("Failed to set volume on node {}: {}", node_id, e);
-                // Try to bind the node if not already bound
-                drop(state_ref);
-                if !state.borrow().bound_nodes.contains_key(&node_id) {
-                    bind_node(registry, node_id, state.clone());
-                    // Retry
-                    if let Err(e) = state.borrow().set_volume(node_id, volume) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ =
-                            event_tx.send(PwEvent::Error(format!("Failed to set volume: {}", e)));
-                    }
-                }
+            debug!("Setting volume on node {}: {:.3}", node_id, volume);
+            // TODO: Implement native volume control via node proxy
+            // For now, use CLI fallback
+            if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
+                warn!("Failed to set volume: {}", e);
             }
         }
 
         PwCommand::SetMute { node_id, muted } => {
-            trace!("Setting mute on node {}: {}", node_id, muted);
-            let state_ref = state.borrow();
-
-            if let Err(e) = state_ref.set_mute(node_id, muted) {
-                warn!("Failed to set mute on node {}: {}", node_id, e);
-                drop(state_ref);
-                if !state.borrow().bound_nodes.contains_key(&node_id) {
-                    bind_node(registry, node_id, state.clone());
-                    if let Err(e) = state.borrow().set_mute(node_id, muted) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ = event_tx.send(PwEvent::Error(format!("Failed to set mute: {}", e)));
-                    }
-                }
+            debug!("Setting mute on node {}: {}", node_id, muted);
+            // TODO: Implement native mute control via node proxy
+            if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
+                warn!("Failed to set mute: {}", e);
             }
         }
 
@@ -455,25 +314,16 @@ fn handle_command(
             volume,
             muted,
         } => {
-            trace!(
+            debug!(
                 "Setting volume+mute on node {}: vol={:.3}, mute={}",
-                node_id,
-                volume,
-                muted
+                node_id, volume, muted
             );
-            let state_ref = state.borrow();
-
-            if let Err(e) = state_ref.set_volume_mute(node_id, volume, muted) {
-                warn!("Failed to set volume+mute on node {}: {}", node_id, e);
-                drop(state_ref);
-                if !state.borrow().bound_nodes.contains_key(&node_id) {
-                    bind_node(registry, node_id, state.clone());
-                    if let Err(e) = state.borrow().set_volume_mute(node_id, volume, muted) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ = event_tx
-                            .send(PwEvent::Error(format!("Failed to set volume+mute: {}", e)));
-                    }
-                }
+            // TODO: Implement native combined control
+            if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
+                warn!("Failed to set volume: {}", e);
+            }
+            if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
+                warn!("Failed to set mute: {}", e);
             }
         }
 
@@ -488,139 +338,22 @@ fn handle_command(
                 "Setting EQ on node {} band {}: freq={:.1}, Q={:.2}, gain={:.1}",
                 node_id, band, freq, q, gain
             );
-            let state_ref = state.borrow();
-
-            if let Err(e) = state_ref.set_eq_params(node_id, &band, freq, q, gain) {
-                warn!("Failed to set EQ on node {}: {}", node_id, e);
-                drop(state_ref);
-                if !state.borrow().bound_nodes.contains_key(&node_id) {
-                    bind_node(registry, node_id, state.clone());
-                    if let Err(e) = state.borrow().set_eq_params(node_id, &band, freq, q, gain) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ = event_tx.send(PwEvent::Error(format!("Failed to set EQ: {}", e)));
-                    }
-                }
-            }
+            // TODO: Implement EQ control
+            warn!("EQ control not yet implemented");
         }
     }
-}
-
-/// Create a link between ports using native API.
-fn create_link_native(
-    core: &pipewire::core::Core,
-    output_port: u32,
-    input_port: u32,
-    state: &Rc<RefCell<PwThreadState>>,
-) {
-    let props = pipewire::properties::properties! {
-        "link.output.port" => output_port.to_string(),
-        "link.input.port" => input_port.to_string(),
-        "object.linger" => "true",
-    };
-
-    match core.create_object::<pipewire::link::Link>("link-factory", &props) {
-        Ok(_link) => {
-            debug!("Created link: {} -> {}", output_port, input_port);
-        }
-        Err(e) => {
-            let event_tx = state.borrow().event_tx.clone();
-            let _ = event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
-        }
-    }
-}
-
-/// Destroy a link using native API.
-fn destroy_link_native(
-    core: &pipewire::core::Core,
-    link_id: u32,
-    state: &Rc<RefCell<PwThreadState>>,
-) {
-    // To destroy a link, we need to call destroy() on the proxy
-    // Since we don't store link proxies, we use pw-cli for now
-    // TODO: Store link proxies and destroy natively
-    if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-        let event_tx = state.borrow().event_tx.clone();
-        let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
-    }
-}
-
-/// Bind to a node to get a proxy for control operations.
-fn bind_node(
-    registry: &pipewire::registry::Registry,
-    node_id: u32,
-    state: Rc<RefCell<PwThreadState>>,
-) {
-    debug!("Binding to node {}", node_id);
-
-    // Get cached node info if available
-    let node_info = state
-        .borrow()
-        .nodes
-        .get(&node_id)
-        .cloned()
-        .unwrap_or_else(|| PwNode::new(node_id));
-
-    // Bind to the node
-    let proxy: Node = match registry.bind(node_id, pipewire::types::ObjectType::Node, 0) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("Failed to bind to node {}: {}", node_id, e);
-            return;
-        }
-    };
-
-    // Subscribe to param changes
-    proxy.subscribe_params(&[ParamType::Props.as_raw()]);
-
-    // Set up listener for param events
-    let state_listener = state.clone();
-    let listener = proxy
-        .add_listener_local()
-        .param(move |_seq, param_type, _index, _next, param| {
-            if param_type == Some(ParamType::Props) {
-                if let Some(pod) = param {
-                    parse_props_param(node_id, pod, &state_listener);
-                }
-            }
-        })
-        .register();
-
-    // Store the bound node
-    state.borrow_mut().bound_nodes.insert(
-        node_id,
-        BoundNode {
-            proxy,
-            _listener: listener,
-            info: node_info,
-        },
-    );
-
-    debug!("Successfully bound to node {}", node_id);
-}
-
-/// Parse a Props param pod to extract volume and mute values.
-fn parse_props_param(node_id: u32, pod: &Pod, state: &Rc<RefCell<PwThreadState>>) {
-    // TODO: Implement proper pod parsing to extract volume/mute values
-    // For now, we just log that we received a param update
-    trace!("Received Props param for node {}", node_id);
-
-    // The pod contains an Object with properties for volume, mute, etc.
-    // Proper parsing would iterate through the properties and extract values.
-    // This is complex due to the SPA pod format.
 }
 
 /// Set up the registry listener to watch for nodes, ports, and links.
 fn setup_registry_listener(
-    registry: &pipewire::registry::Registry,
+    registry: &pipewire::registry::RegistryRc,
     state: Rc<RefCell<PwThreadState>>,
     event_tx: Rc<mpsc::Sender<PwEvent>>,
-    core: &pipewire::core::Core,
 ) -> pipewire::registry::Listener {
     let state_add = state.clone();
     let state_remove = state;
     let event_tx_add = event_tx.clone();
     let event_tx_remove = event_tx;
-    let registry_clone = registry.clone();
 
     registry
         .add_listener_local()
@@ -663,19 +396,8 @@ fn setup_registry_listener(
                         node.id, node.name, node.media_class
                     );
 
-                    // Auto-bind to sinks and streams for volume control
-                    let should_bind = matches!(
-                        node.media_class,
-                        MediaClass::AudioSink | MediaClass::StreamOutputAudio
-                    ) || node.name.starts_with("sootmix.");
-
                     state_add.borrow_mut().nodes.insert(global.id, node.clone());
                     let _ = event_tx_add.send(PwEvent::NodeAdded(node));
-
-                    // Bind to controllable nodes
-                    if should_bind {
-                        bind_node(&registry_clone, global.id, state_add.clone());
-                    }
                 }
                 ObjectType::Port => {
                     let mut port = PwPort::new(global.id, 0);
@@ -732,11 +454,6 @@ fn setup_registry_listener(
         })
         .global_remove(move |id| {
             let mut state = state_remove.borrow_mut();
-
-            // Remove bound node proxy if exists
-            if state.bound_nodes.remove(&id).is_some() {
-                debug!("Unbound node: {}", id);
-            }
 
             if state.nodes.remove(&id).is_some() {
                 debug!("Node removed: {}", id);

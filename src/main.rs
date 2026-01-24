@@ -29,9 +29,10 @@ fn main() -> iced::Result {
     info!("Starting SootMix");
 
     // Run the Iced application
-    iced::application("SootMix", SootMix::update, SootMix::view)
+    iced::application(SootMix::new, SootMix::update, SootMix::view)
+        .title("SootMix")
         .subscription(SootMix::subscription)
-        .theme(SootMix::theme)
+        .theme(crate::ui::theme::sootmix_theme())
         .window_size((900.0, 600.0))
-        .run_with(SootMix::new)
+        .run()
 }

@@ -8,11 +8,11 @@ use crate::message::Message;
 use crate::state::MixerChannel;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, row, slider, text, vertical_slider, Space};
-use iced::{Alignment, Background, Border, Element, Fill, Length, Theme};
+use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
 
 /// Create a channel strip widget for a mixer channel.
-pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
+pub fn channel_strip(channel: &MixerChannel) -> Element<'_, Message> {
     let id = channel.id;
     let volume_db = channel.volume_db;
     let muted = channel.muted;
@@ -21,7 +21,7 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
     let assigned_apps = channel.assigned_apps.clone();
 
     // Channel name
-    let name_text = text(&name)
+    let name_text = text(name)
         .size(14)
         .color(TEXT);
 
@@ -48,24 +48,24 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
         Message::ChannelVolumeChanged(id, v)
     })
     .step(0.5)
-    .height(VOLUME_SLIDER_HEIGHT as u16)
+    .height(VOLUME_SLIDER_HEIGHT)
     .on_release(Message::ChannelVolumeReleased(id))
     .style(move |theme: &Theme, status| {
         slider::Style {
             rail: slider::Rail {
-                colors: (
-                    theme::db_to_color(volume_db),
-                    SLIDER_TRACK,
+                backgrounds: (
+                    Background::Color(theme::db_to_color(volume_db)),
+                    Background::Color(SLIDER_TRACK),
                 ),
                 width: 8.0,
-                border_radius: 4.0.into(),
+                border: Border::default().rounded(4.0),
             },
             handle: slider::Handle {
                 shape: slider::HandleShape::Rectangle {
                     width: 20,
                     border_radius: 3.0.into(),
                 },
-                color: if muted { MUTED_COLOR } else { TEXT },
+                background: Background::Color(if muted { MUTED_COLOR } else { TEXT }),
                 border_width: 0.0,
                 border_color: Color::TRANSPARENT,
             },
@@ -133,24 +133,24 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
         // Header row with name and delete
         row![
             name_text,
-            Space::with_width(Fill),
+            Space::new().width(Fill),
             delete_button,
         ]
         .align_y(Alignment::Center),
-        Space::with_height(SPACING_SMALL),
+        Space::new().height(SPACING_SMALL),
         // EQ button
         eq_button,
-        Space::with_height(SPACING),
+        Space::new().height(SPACING),
         // Volume slider
         container(volume_slider)
             .center_x(Fill),
-        Space::with_height(SPACING_SMALL),
+        Space::new().height(SPACING_SMALL),
         // Volume display
         volume_text,
-        Space::with_height(SPACING_SMALL),
+        Space::new().height(SPACING_SMALL),
         // Mute button
         mute_button,
-        Space::with_height(SPACING),
+        Space::new().height(SPACING),
         // Apps list
         apps_list,
     ]
@@ -160,7 +160,7 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
 
     // Wrap in a styled container
     container(content)
-        .width(CHANNEL_STRIP_WIDTH as u16)
+        .width(CHANNEL_STRIP_WIDTH)
         .style(|theme: &Theme| {
             container::Style {
                 background: Some(Background::Color(SURFACE)),
@@ -172,7 +172,7 @@ pub fn channel_strip(channel: &MixerChannel) -> Element<'static, Message> {
 }
 
 /// Create a master channel strip widget.
-pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) -> Element<'static, Message> {
+pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) -> Element<'_, Message> {
     // Title
     let title = text("Master")
         .size(14)
@@ -181,24 +181,24 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
     // Volume slider
     let volume_slider = vertical_slider(-60.0..=12.0, volume_db, Message::MasterVolumeChanged)
         .step(0.5)
-        .height(VOLUME_SLIDER_HEIGHT as u16)
+        .height(VOLUME_SLIDER_HEIGHT)
         .on_release(Message::MasterVolumeReleased)
         .style(move |theme: &Theme, status| {
             slider::Style {
                 rail: slider::Rail {
-                    colors: (
-                        theme::db_to_color(volume_db),
-                        SLIDER_TRACK,
+                    backgrounds: (
+                        Background::Color(theme::db_to_color(volume_db)),
+                        Background::Color(SLIDER_TRACK),
                     ),
                     width: 8.0,
-                    border_radius: 4.0.into(),
+                    border: Border::default().rounded(4.0),
                 },
                 handle: slider::Handle {
                     shape: slider::HandleShape::Rectangle {
                         width: 20,
                         border_radius: 3.0.into(),
                     },
-                    color: if muted { MUTED_COLOR } else { PRIMARY },
+                    background: Background::Color(if muted { MUTED_COLOR } else { PRIMARY }),
                     border_width: 0.0,
                     border_color: Color::TRANSPARENT,
                 },
@@ -240,13 +240,13 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
     // Assemble
     let content = column![
         title,
-        Space::with_height(SPACING),
+        Space::new().height(SPACING),
         container(volume_slider).center_x(Fill),
-        Space::with_height(SPACING_SMALL),
+        Space::new().height(SPACING_SMALL),
         volume_text,
-        Space::with_height(SPACING_SMALL),
+        Space::new().height(SPACING_SMALL),
         mute_button,
-        Space::with_height(SPACING),
+        Space::new().height(SPACING),
         output_text,
     ]
     .align_x(Alignment::Center)
@@ -254,7 +254,7 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
     .spacing(SPACING_SMALL);
 
     container(content)
-        .width(CHANNEL_STRIP_WIDTH as u16)
+        .width(CHANNEL_STRIP_WIDTH)
         .style(|theme: &Theme| {
             container::Style {
                 background: Some(Background::Color(SURFACE)),

@@ -80,14 +80,17 @@ impl SootMix {
                 debug!("Volume released for channel {}", id);
             }
             Message::ChannelMuteToggled(id) => {
-                if let Some(channel) = self.state.channel_mut(id) {
+                let cmd = if let Some(channel) = self.state.channel_mut(id) {
                     channel.muted = !channel.muted;
-                    if let Some(node_id) = channel.pw_sink_id {
-                        self.send_pw_command(PwCommand::SetMute {
-                            node_id,
-                            muted: channel.muted,
-                        });
-                    }
+                    channel.pw_sink_id.map(|node_id| PwCommand::SetMute {
+                        node_id,
+                        muted: channel.muted,
+                    })
+                } else {
+                    None
+                };
+                if let Some(cmd) = cmd {
+                    self.send_pw_command(cmd);
                 }
             }
             Message::ChannelEqToggled(id) => {
@@ -226,9 +229,9 @@ impl SootMix {
         // Main content
         let content = column![
             header,
-            Space::with_height(SPACING),
+            Space::new().height(SPACING),
             channel_strips,
-            Space::with_height(SPACING),
+            Space::new().height(SPACING),
             self.view_footer(),
         ]
         .padding(PADDING);
@@ -272,11 +275,11 @@ impl SootMix {
 
         row![
             title,
-            Space::with_width(SPACING),
+            Space::new().width(SPACING),
             status,
-            Space::with_width(Fill),
+            Space::new().width(Fill),
             preset_text,
-            Space::with_width(SPACING),
+            Space::new().width(SPACING),
             settings_button,
         ]
         .align_y(Alignment::Center)
@@ -295,8 +298,8 @@ impl SootMix {
 
         // Add separator before master
         strips.push(
-            container(Space::with_width(2))
-                .height(CHANNEL_STRIP_HEIGHT as u16)
+            container(Space::new().width(2))
+                .height(CHANNEL_STRIP_HEIGHT)
                 .style(|_| container::Style {
                     background: Some(Background::Color(SURFACE_LIGHT)),
                     ..container::Style::default()
@@ -341,12 +344,12 @@ impl SootMix {
                 .color(MUTED_COLOR)
                 .into()
         } else {
-            Space::with_width(0).into()
+            Space::new().width(0).into()
         };
 
         row![
             add_button,
-            Space::with_width(Fill),
+            Space::new().width(Fill),
             error_text,
         ]
         .align_y(Alignment::Center)
@@ -375,11 +378,20 @@ impl SootMix {
 
     /// Poll for PipeWire events.
     fn poll_pw_events(&mut self) {
-        if let Some(ref rx) = self.pw_event_rx {
-            // Drain all available events
+        // Collect events first to avoid borrow conflict
+        let events: Vec<PwEvent> = if let Some(ref rx) = self.pw_event_rx {
+            let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
-                self.handle_pw_event(event);
+                events.push(event);
             }
+            events
+        } else {
+            Vec::new()
+        };
+
+        // Now handle them with mutable self
+        for event in events {
+            self.handle_pw_event(event);
         }
     }
 
@@ -431,6 +443,10 @@ impl SootMix {
             }
             PwEvent::Error(err) => {
                 self.state.last_error = Some(err);
+            }
+            PwEvent::ParamChanged { node_id, volume, muted } => {
+                // Handle control parameter feedback from PipeWire
+                debug!("Param changed on node {}: vol={:?}, mute={:?}", node_id, volume, muted);
             }
         }
     }
