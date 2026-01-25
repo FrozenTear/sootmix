@@ -100,6 +100,14 @@ impl SootMix {
         let plugin_count = plugin_manager.scan();
         info!("Plugin scan complete: {} plugins found", plugin_count);
 
+        // Send shared plugin instances to PipeWire thread for RT audio processing
+        if let Some(ref pw) = pw_thread {
+            let shared_instances = plugin_manager.shared_instances();
+            if let Err(e) = pw.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
+                error!("Failed to send shared plugin instances to PW thread: {:?}", e);
+            }
+        }
+
         // Initialize plugin filter manager with shared instances
         let mut plugin_filter_manager = PluginFilterManager::new();
         plugin_filter_manager.set_plugin_instances(plugin_manager.shared_instances());
@@ -1072,9 +1080,19 @@ impl SootMix {
                             config.parameters.insert(param_idx, value);
                         }
 
-                        // Send parameter update to the RT thread via ring buffer
-                        // This allows RT-safe parameter updates during audio processing
+                        // Send parameter update to the RT thread via PipeWire thread
+                        // This is the primary path for RT-safe parameter updates
                         let channel_id = channel.id;
+                        if let Some(ref pw) = self.pw_thread {
+                            let _ = pw.send(PwCommand::SendPluginParamUpdate {
+                                channel_id,
+                                instance_id,
+                                param_index: param_idx,
+                                value,
+                            });
+                        }
+
+                        // Also send through PluginFilterManager (legacy path)
                         self.plugin_filter_manager.send_param_update(
                             channel_id,
                             instance_id,

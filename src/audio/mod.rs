@@ -10,6 +10,7 @@ pub mod meter;
 pub mod pipewire_thread;
 pub mod plugin_filter;
 pub mod plugin_processor;
+pub mod plugin_stream;
 pub mod routing;
 pub mod types;
 pub mod virtual_sink;

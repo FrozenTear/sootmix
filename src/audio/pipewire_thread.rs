@@ -9,7 +9,10 @@
 //! are not Send/Sync.
 
 use crate::audio::control::{build_channel_volumes_pod, build_mute_pod, build_volume_mute_pod};
+use crate::audio::plugin_stream::PluginFilterStreams;
 use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
+use crate::plugins::SharedPluginInstances;
+use crate::realtime::{PluginParamUpdate, RingBuffer, RingBufferWriter};
 use pipewire::link::Link;
 use pipewire::node::{Node, NodeListener};
 use pipewire::properties::properties;
@@ -26,7 +29,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// Commands sent from the UI thread to the PipeWire thread.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PwCommand {
     /// Create a virtual sink for a channel.
     CreateVirtualSink { channel_id: Uuid, name: String },
@@ -77,6 +80,21 @@ pub enum PwCommand {
     UpdatePluginChain {
         channel_id: Uuid,
         plugin_chain: Vec<Uuid>,
+    },
+    /// Set shared plugin instances for audio processing.
+    ///
+    /// This should be called once after the PluginManager is initialized.
+    /// The SharedPluginInstances will be used by plugin filter streams for
+    /// real-time audio processing.
+    SetSharedPluginInstances(SharedPluginInstances),
+    /// Send a plugin parameter update to the RT thread.
+    ///
+    /// This is used when plugin parameters are changed from the UI.
+    SendPluginParamUpdate {
+        channel_id: Uuid,
+        instance_id: Uuid,
+        param_index: u32,
+        value: f32,
     },
     /// Shutdown the PipeWire thread.
     Shutdown,
@@ -152,6 +170,14 @@ struct CreatedLink {
 /// Minimum interval between CLI fallback commands per node.
 const CLI_THROTTLE_MS: u64 = 50;
 
+/// Info about a plugin filter for a channel.
+struct PluginFilterInfo {
+    /// The filter streams.
+    streams: PluginFilterStreams,
+    /// Ring buffer writer for sending param updates to RT thread.
+    param_writer: RingBufferWriter<crate::realtime::PluginParamUpdate>,
+}
+
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -166,6 +192,10 @@ struct PwThreadState {
     bound_nodes: HashMap<u32, BoundNode>,
     /// Links we created (port pair -> link proxy).
     created_links: HashMap<(u32, u32), CreatedLink>,
+    /// Plugin filter streams by channel ID.
+    plugin_filters: HashMap<Uuid, PluginFilterInfo>,
+    /// Shared plugin instances for RT audio processing.
+    shared_plugin_instances: Option<SharedPluginInstances>,
     /// Event sender for notifying UI.
     event_tx: Rc<mpsc::Sender<PwEvent>>,
     /// Last CLI command time per node (for throttling fallback).
@@ -181,6 +211,8 @@ impl PwThreadState {
             virtual_sinks: HashMap::new(),
             bound_nodes: HashMap::new(),
             created_links: HashMap::new(),
+            plugin_filters: HashMap::new(),
+            shared_plugin_instances: None,
             event_tx,
             cli_last_cmd: HashMap::new(),
         }
@@ -668,32 +700,70 @@ fn handle_command(
 
             let event_tx = state.borrow().event_tx.clone();
 
-            // TODO: In the future, this should create a real PipeWire filter stream
-            // using the Stream API with process callbacks. For now, we use an
-            // external process approach similar to EQ filters.
-            //
-            // The full implementation would:
-            // 1. Create a PipeWire Stream with Direction::Input (capture)
-            // 2. Register a process callback that:
-            //    - Drains parameter updates from ring buffer
-            //    - Processes audio through plugin chain
-            //    - Queues output buffers
-            // 3. Set node properties: media.class = Audio/Duplex
-            //
-            // For now, store the plugin filter info and use passthrough.
-            // The actual processing happens when we integrate with the RT thread.
+            // Check if we have shared plugin instances
+            let shared_instances = match &state.borrow().shared_plugin_instances {
+                Some(instances) => instances.clone(),
+                None => {
+                    warn!("SharedPluginInstances not set, cannot create plugin filter");
+                    let _ = event_tx.send(PwEvent::Error(
+                        "Plugin filter creation failed: SharedPluginInstances not initialized".to_string()
+                    ));
+                    return;
+                }
+            };
 
-            // Use placeholder node IDs (0) until we implement real filter creation
-            let _ = event_tx.send(PwEvent::PluginFilterCreated {
+            // Create ring buffer for parameter updates
+            let (param_writer, param_reader) = RingBuffer::<PluginParamUpdate>::new(256).split();
+
+            // Create the plugin filter streams
+            match PluginFilterStreams::new(
+                core,
                 channel_id,
-                sink_node_id: 0,
-                output_node_id: 0,
-            });
+                &channel_name,
+                shared_instances,
+                plugin_chain,
+                param_reader,
+                48000.0,  // Default sample rate, should come from system
+                512,      // Default block size
+            ) {
+                Ok(streams) => {
+                    let capture_node_id = streams.capture_node_id();
+                    let playback_node_id = streams.playback_node_id();
 
-            debug!(
-                "Plugin filter stub created for channel '{}' (full implementation pending)",
-                channel_name
-            );
+                    // Connect the streams (auto-connect for now)
+                    if let Err(e) = streams.connect(None, None) {
+                        warn!("Failed to connect plugin filter streams: {:?}", e);
+                        let _ = event_tx.send(PwEvent::Error(
+                            format!("Failed to connect plugin filter: {:?}", e)
+                        ));
+                        return;
+                    }
+
+                    // Store the filter info
+                    let filter_info = PluginFilterInfo {
+                        streams,
+                        param_writer,
+                    };
+                    state.borrow_mut().plugin_filters.insert(channel_id, filter_info);
+
+                    info!(
+                        "Plugin filter created for channel '{}': capture={}, playback={}",
+                        channel_name, capture_node_id, playback_node_id
+                    );
+
+                    let _ = event_tx.send(PwEvent::PluginFilterCreated {
+                        channel_id,
+                        sink_node_id: capture_node_id,
+                        output_node_id: playback_node_id,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to create plugin filter streams: {:?}", e);
+                    let _ = event_tx.send(PwEvent::Error(
+                        format!("Failed to create plugin filter: {:?}", e)
+                    ));
+                }
+            }
         }
 
         PwCommand::DestroyPluginFilter { channel_id } => {
@@ -701,8 +771,17 @@ fn handle_command(
 
             let event_tx = state.borrow().event_tx.clone();
 
-            // TODO: Destroy the PipeWire stream and clean up resources
-            // For now, just send the event
+            // Remove and destroy the filter
+            if let Some(mut filter_info) = state.borrow_mut().plugin_filters.remove(&channel_id) {
+                // Disconnect the streams
+                if let Err(e) = filter_info.streams.disconnect() {
+                    warn!("Error disconnecting plugin filter streams: {:?}", e);
+                }
+                // The streams will be dropped here, cleaning up PipeWire resources
+                info!("Plugin filter destroyed for channel {}", channel_id);
+            } else {
+                debug!("No plugin filter found for channel {} to destroy", channel_id);
+            }
 
             let _ = event_tx.send(PwEvent::PluginFilterDestroyed { channel_id });
         }
@@ -717,9 +796,35 @@ fn handle_command(
                 plugin_chain.len()
             );
 
-            // TODO: Update the plugin chain in the RT context
-            // This would involve sending the new chain to the processing context
-            // via the parameter ring buffer or a separate command channel
+            // Update the plugin chain in the existing filter
+            if let Some(filter_info) = state.borrow().plugin_filters.get(&channel_id) {
+                filter_info.streams.update_plugin_chain(plugin_chain);
+            } else {
+                warn!("No plugin filter found for channel {} to update", channel_id);
+            }
+        }
+
+        PwCommand::SetSharedPluginInstances(instances) => {
+            info!("Setting shared plugin instances for RT audio processing");
+            state.borrow_mut().shared_plugin_instances = Some(instances);
+        }
+
+        PwCommand::SendPluginParamUpdate {
+            channel_id,
+            instance_id,
+            param_index,
+            value,
+        } => {
+            trace!(
+                "Sending param update: channel={}, plugin={}, param={}, value={}",
+                channel_id, instance_id, param_index, value
+            );
+
+            // Send the parameter update to the filter's ring buffer
+            if let Some(filter_info) = state.borrow_mut().plugin_filters.get_mut(&channel_id) {
+                let update = crate::realtime::PluginParamUpdate::new(instance_id, param_index, value);
+                filter_info.param_writer.push(update);
+            }
         }
     }
 }
