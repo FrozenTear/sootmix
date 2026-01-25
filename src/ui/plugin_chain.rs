@@ -397,6 +397,10 @@ fn plugin_browser_item(channel_id: Uuid, meta: &PluginMetadata) -> Element<'stat
         PluginType::Native => "Native",
         PluginType::Wasm => "WASM",
         PluginType::Builtin => "Built-in",
+        #[cfg(feature = "lv2-plugins")]
+        PluginType::Lv2 => "LV2",
+        #[cfg(feature = "vst3-plugins")]
+        PluginType::Vst3 => "VST3",
     };
 
     let plugin_id_clone = plugin_id.clone();

@@ -5,28 +5,28 @@
 //! Plugin system for SootMix.
 //!
 //! This module provides infrastructure for loading, managing, and running
-//! audio effect plugins. Supports both native plugins (via abi_stable) and
-//! sandboxed WASM plugins (via wasmtime).
+//! audio effect plugins. Supports native plugins (via abi_stable), sandboxed
+//! WASM plugins (via wasmtime), LV2 plugins (via lv2), and VST3 plugins.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────┐
-//! │  PluginManager  │  ← Discovery, lifecycle, registry
-//! └────────┬────────┘
-//!          │
-//!    ┌─────┴─────┐
-//!    │           │
-//!    ▼           ▼
-//! ┌──────┐   ┌──────┐
-//! │Native│   │ WASM │  ← Loader implementations
-//! └──────┘   └──────┘
-//!    │           │
-//!    └─────┬─────┘
-//!          │
-//!    ┌─────▼─────┐
-//!    │PluginHost │  ← Host functions, parameter bridge
-//!    └───────────┘
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                    PluginManager                         │
+//! ├─────────────────────────────────────────────────────────┤
+//! │  native_loader    lv2_loader       vst3_loader          │
+//! │       │               │                 │               │
+//! │       ▼               ▼                 ▼               │
+//! │   NativePlugin   LV2 Instance    VST3 Component         │
+//! │       │               │                 │               │
+//! │       └───────────────┴─────────────────┘               │
+//! │                       │                                 │
+//! │                       ▼                                 │
+//! │              Adapter (impl AudioEffect)                 │
+//! │                       │                                 │
+//! │                       ▼                                 │
+//! │                   PluginBox                             │
+//! └─────────────────────────────────────────────────────────┘
 //! ```
 
 pub mod host;
@@ -36,8 +36,20 @@ pub mod native;
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 
+#[cfg(feature = "lv2-plugins")]
+pub mod lv2;
+
+#[cfg(feature = "vst3-plugins")]
+pub mod vst3;
+
 pub use host::PluginHost;
 pub use manager::{PluginInstance, PluginManager, PluginRegistry, SharedPluginInstances};
+
+#[cfg(feature = "lv2-plugins")]
+pub use lv2::{Lv2PluginLoader, Lv2PluginMeta};
+
+#[cfg(feature = "vst3-plugins")]
+pub use vst3::{Vst3PluginLoader, Vst3PluginMeta};
 
 use serde::{Deserialize, Serialize};
 use sootmix_plugin_api::{PluginCategory, PluginInfo};
@@ -66,6 +78,12 @@ pub enum PluginType {
     Wasm,
     /// Built-in plugin (compiled into SootMix).
     Builtin,
+    /// LV2 plugin.
+    #[cfg(feature = "lv2-plugins")]
+    Lv2,
+    /// VST3 plugin.
+    #[cfg(feature = "vst3-plugins")]
+    Vst3,
 }
 
 impl PluginType {
@@ -75,6 +93,10 @@ impl PluginType {
             Self::Native => "so",
             Self::Wasm => "wasm",
             Self::Builtin => "",
+            #[cfg(feature = "lv2-plugins")]
+            Self::Lv2 => "lv2",
+            #[cfg(feature = "vst3-plugins")]
+            Self::Vst3 => "vst3",
         }
     }
 }
@@ -114,6 +136,16 @@ pub enum PluginLoadError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// LV2 plugin error.
+    #[cfg(feature = "lv2-plugins")]
+    #[error("LV2 error: {0}")]
+    Lv2Error(String),
+
+    /// VST3 plugin error.
+    #[cfg(feature = "vst3-plugins")]
+    #[error("VST3 error: {0}")]
+    Vst3Error(String),
 }
 
 /// Result type for plugin operations.
@@ -191,13 +223,17 @@ impl PluginFilter {
 pub struct PluginSlotConfig {
     /// Plugin identifier (filename stem, e.g., "sootmix-eq").
     pub plugin_id: String,
-    /// Type of plugin (Native, WASM, Builtin).
+    /// Type of plugin (Native, WASM, Builtin, Lv2, Vst3).
     pub plugin_type: PluginType,
     /// Whether this plugin slot is bypassed.
     pub bypassed: bool,
     /// Saved parameter values (param_index -> value).
     #[serde(default)]
     pub parameters: HashMap<u32, f32>,
+    /// External identifier for LV2 URI or VST3 class ID.
+    /// Used to locate and load external plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 impl PluginSlotConfig {
@@ -208,6 +244,22 @@ impl PluginSlotConfig {
             plugin_type,
             bypassed: false,
             parameters: HashMap::new(),
+            external_id: None,
+        }
+    }
+
+    /// Create a new plugin slot config for an external plugin (LV2/VST3).
+    pub fn new_external(
+        plugin_id: impl Into<String>,
+        plugin_type: PluginType,
+        external_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            plugin_type,
+            bypassed: false,
+            parameters: HashMap::new(),
+            external_id: Some(external_id.into()),
         }
     }
 }

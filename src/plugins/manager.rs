@@ -5,11 +5,15 @@
 //! Plugin manager - discovery, lifecycle, and registry.
 
 use super::{native::NativePluginLoader, PluginFilter, PluginLoadError, PluginMetadata, PluginResult, PluginType};
+#[cfg(feature = "lv2-plugins")]
+use super::lv2::Lv2PluginLoader;
+#[cfg(feature = "vst3-plugins")]
+use super::vst3::Vst3PluginLoader;
 use sootmix_plugin_api::{ActivationContext, PluginBox, PluginInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Registry of all discovered plugins.
@@ -45,6 +49,20 @@ impl PluginRegistry {
         // System plugins
         paths.push(PathBuf::from("/usr/share/sootmix/plugins"));
         paths.push(PathBuf::from("/usr/local/share/sootmix/plugins"));
+
+        // LV2 search paths
+        #[cfg(feature = "lv2-plugins")]
+        {
+            use super::lv2::Lv2PluginLoader;
+            paths.extend(Lv2PluginLoader::search_paths());
+        }
+
+        // VST3 search paths
+        #[cfg(feature = "vst3-plugins")]
+        {
+            use super::vst3::Vst3PluginLoader;
+            paths.extend(Vst3PluginLoader::search_paths());
+        }
 
         paths
     }
@@ -288,6 +306,12 @@ pub struct PluginManager {
     registry: Arc<RwLock<PluginRegistry>>,
     /// Native plugin loader.
     native_loader: NativePluginLoader,
+    /// LV2 plugin loader.
+    #[cfg(feature = "lv2-plugins")]
+    lv2_loader: Option<Lv2PluginLoader>,
+    /// VST3 plugin loader.
+    #[cfg(feature = "vst3-plugins")]
+    vst3_loader: Vst3PluginLoader,
     /// Active plugin instances (thread-safe).
     instances: SharedPluginInstances,
     /// Default sample rate for activation.
@@ -306,9 +330,23 @@ impl PluginManager {
             registry.add_search_path(path);
         }
 
+        // Initialize LV2 loader
+        #[cfg(feature = "lv2-plugins")]
+        let lv2_loader = match Lv2PluginLoader::new() {
+            Ok(loader) => Some(loader),
+            Err(e) => {
+                warn!("Failed to initialize LV2 loader: {}", e);
+                None
+            }
+        };
+
         Self {
             registry: Arc::new(RwLock::new(registry)),
             native_loader: NativePluginLoader::new(),
+            #[cfg(feature = "lv2-plugins")]
+            lv2_loader,
+            #[cfg(feature = "vst3-plugins")]
+            vst3_loader: Vst3PluginLoader::new(),
             instances: Arc::new(Mutex::new(HashMap::new())),
             sample_rate: 48000.0,
             block_size: 512,
@@ -330,9 +368,68 @@ impl PluginManager {
     }
 
     /// Scan for available plugins.
-    pub fn scan(&self) -> usize {
-        let mut registry = self.registry.write().unwrap();
-        registry.scan()
+    pub fn scan(&mut self) -> usize {
+        let mut count = {
+            let mut registry = self.registry.write().unwrap();
+            registry.scan()
+        };
+
+        // Scan LV2 plugins
+        #[cfg(feature = "lv2-plugins")]
+        if let Some(ref mut lv2_loader) = self.lv2_loader {
+            let lv2_count = lv2_loader.scan();
+            // Add LV2 plugins to registry
+            let mut registry = self.registry.write().unwrap();
+            for meta in lv2_loader.plugins() {
+                let plugin_meta = PluginMetadata {
+                    // For LV2, path stores the URI which is used for loading
+                    path: PathBuf::from(&meta.uri),
+                    plugin_type: PluginType::Lv2,
+                    info: Some(sootmix_plugin_api::PluginInfo {
+                        id: meta.uri.clone().into(),
+                        name: meta.name.clone().into(),
+                        vendor: meta.author.clone().unwrap_or_else(|| "Unknown".to_string()).into(),
+                        version: "1.0.0".into(),
+                        category: meta.category,
+                        input_channels: meta.audio_inputs,
+                        output_channels: meta.audio_outputs,
+                    }),
+                    enabled: true,
+                };
+                registry.plugins.insert(meta.uri.clone(), plugin_meta);
+            }
+            count += lv2_count;
+            info!("LV2 plugins added to registry: {}", lv2_count);
+        }
+
+        // Scan VST3 plugins
+        #[cfg(feature = "vst3-plugins")]
+        {
+            let vst3_count = self.vst3_loader.scan();
+            // Add VST3 plugins to registry
+            let mut registry = self.registry.write().unwrap();
+            for meta in self.vst3_loader.plugins() {
+                let plugin_meta = PluginMetadata {
+                    path: meta.bundle_path.clone(),
+                    plugin_type: PluginType::Vst3,
+                    info: Some(sootmix_plugin_api::PluginInfo {
+                        id: meta.class_id.clone().into(),
+                        name: meta.name.clone().into(),
+                        vendor: meta.vendor.clone().into(),
+                        version: meta.version.clone().into(),
+                        category: meta.category,
+                        input_channels: meta.audio_inputs,
+                        output_channels: meta.audio_outputs,
+                    }),
+                    enabled: true,
+                };
+                registry.plugins.insert(meta.class_id.clone(), plugin_meta);
+            }
+            count += vst3_count;
+            info!("VST3 plugins added to registry: {}", vst3_count);
+        }
+
+        count
     }
 
     /// Add a custom search path.
@@ -386,6 +483,24 @@ impl PluginManager {
                     "Builtin plugins should be created directly".to_string(),
                 ));
             }
+            #[cfg(feature = "lv2-plugins")]
+            PluginType::Lv2 => {
+                // For LV2, the path is actually the URI
+                let uri = path.to_string_lossy();
+                if let Some(ref lv2_loader) = self.lv2_loader {
+                    lv2_loader.load(&uri)?
+                } else {
+                    return Err(PluginLoadError::Lv2Error(
+                        "LV2 loader not initialized".to_string(),
+                    ));
+                }
+            }
+            #[cfg(feature = "vst3-plugins")]
+            PluginType::Vst3 => {
+                // For VST3, the path is the class ID
+                let class_id = path.to_string_lossy();
+                self.vst3_loader.load(&class_id)?
+            }
         };
 
         let mut instance = PluginInstance::new(metadata, plugin);
@@ -398,6 +513,18 @@ impl PluginManager {
 
         info!("Loaded plugin: {} (id={})", path.display(), id);
         Ok(id)
+    }
+
+    /// Load an LV2 plugin by URI.
+    #[cfg(feature = "lv2-plugins")]
+    pub fn load_lv2(&mut self, uri: &str) -> PluginResult<Uuid> {
+        self.load_from_path(Path::new(uri), PluginType::Lv2)
+    }
+
+    /// Load a VST3 plugin by class ID.
+    #[cfg(feature = "vst3-plugins")]
+    pub fn load_vst3(&mut self, class_id: &str) -> PluginResult<Uuid> {
+        self.load_from_path(Path::new(class_id), PluginType::Vst3)
     }
 
     /// Unload a plugin instance.

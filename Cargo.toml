@@ -13,6 +13,12 @@ repository = "https://github.com/FrozenTear/sootmix"
 keywords = ["audio", "pipewire", "mixer", "linux"]
 categories = ["multimedia::audio"]
 
+[features]
+default = []
+lv2-plugins = ["lilv"]
+vst3-plugins = ["vst3"]
+all-plugins = ["lv2-plugins", "vst3-plugins"]
+
 [dependencies]
 # Plugin system
 sootmix-plugin-api = { path = "crates/sootmix-plugin-api" }
@@ -44,6 +50,10 @@ tempfile = "3"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Plugin formats (optional)
+lilv = { version = "0.2", optional = true }
+vst3 = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

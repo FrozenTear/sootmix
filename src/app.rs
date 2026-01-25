@@ -96,7 +96,7 @@ impl SootMix {
         };
 
         // Initialize plugin manager and scan for plugins
-        let plugin_manager = PluginManager::new();
+        let mut plugin_manager = PluginManager::new();
         let plugin_count = plugin_manager.scan();
         info!("Plugin scan complete: {} plugins found", plugin_count);
 
