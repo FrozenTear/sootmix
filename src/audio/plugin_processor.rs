@@ -5,9 +5,8 @@
 //! Plugin audio processor using PipeWire filter streams.
 //!
 //! This module handles routing audio through per-channel plugin chains.
-//! It creates PipeWire filter nodes that capture audio from the channel's
-//! virtual sink, process it through the plugin chain, and output to the
-//! master bus.
+//! It tracks which channels have active plugin chains and provides the
+//! processing infrastructure.
 //!
 //! # Architecture
 //!
@@ -19,6 +18,37 @@
 //!                                    - Plugin 2
 //!                                    - ...
 //! ```
+//!
+//! # Current Status
+//!
+//! The plugin processor infrastructure is implemented:
+//! - Tracks per-channel plugin chains
+//! - Provides audio processing through plugin instances
+//! - Syncs with app state when plugins are added/removed
+//!
+//! # TODO: PipeWire Audio Routing
+//!
+//! To complete the audio integration, we need to create PipeWire filter
+//! streams that route audio through the plugins. This involves:
+//!
+//! 1. **Create a filter stream** for each channel with plugins
+//!    - Use pipewire::stream API with both input and output
+//!    - Register process callback for real-time audio handling
+//!
+//! 2. **Route audio through the filter**
+//!    - Disconnect channel virtual sink from master
+//!    - Connect: virtual sink output → filter input
+//!    - Connect: filter output → master sink
+//!
+//! 3. **Process callback implementation**
+//!    - Dequeue input buffer from stream
+//!    - Call process_audio() with plugin chain
+//!    - Queue processed buffer to output
+//!
+//! 4. **Thread safety considerations**
+//!    - PipeWire runs on its own real-time thread
+//!    - Plugin instances need to be accessed from callback
+//!    - Use lock-free communication for parameter updates
 
 use crate::plugins::PluginManager;
 use std::collections::HashMap;
