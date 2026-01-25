@@ -7,8 +7,10 @@
 pub mod apps_panel;
 pub mod channel_strip;
 pub mod meter;
+pub mod plugin_chain;
 pub mod routing_rules_panel;
 pub mod theme;
 
 pub use meter::{vu_meter, METER_WIDTH};
+pub use plugin_chain::{fx_button, plugin_browser, plugin_chain_panel, plugin_editor, PluginEditorParam};
 pub use theme::THEME_PALETTE;

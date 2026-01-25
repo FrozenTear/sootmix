@@ -124,6 +124,28 @@ pub enum Message {
     /// Save a single channel's current state to the active snapshot.
     SaveChannelToSnapshot(Uuid),
 
+    // ==================== Plugin Chain ====================
+    /// Open the plugin browser for a channel.
+    OpenPluginBrowser(Uuid),
+    /// Close the plugin browser.
+    ClosePluginBrowser,
+    /// Add a plugin to a channel's chain (channel_id, plugin_id).
+    AddPluginToChannel(Uuid, String),
+    /// Remove a plugin from a channel's chain (channel_id, instance_id).
+    RemovePluginFromChannel(Uuid, Uuid),
+    /// Move a plugin in the chain (channel_id, instance_id, direction: -1=up, 1=down).
+    MovePluginInChain(Uuid, Uuid, i32),
+    /// Toggle plugin bypass (channel_id, instance_id).
+    TogglePluginBypass(Uuid, Uuid),
+    /// Open the plugin parameter editor (channel_id, instance_id).
+    OpenPluginEditor(Uuid, Uuid),
+    /// Close the plugin editor.
+    ClosePluginEditor,
+    /// Plugin parameter changed (instance_id, param_index, value).
+    PluginParameterChanged(Uuid, u32, f32),
+    /// Plugin chain loaded from persistence (channel_id).
+    PluginChainLoaded(Uuid),
+
     // ==================== PipeWire Events (from PW thread) ====================
     /// PipeWire connection established.
     PwConnected,

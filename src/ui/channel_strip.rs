@@ -8,6 +8,7 @@ use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::state::{MeterDisplayState, MixerChannel};
 use crate::ui::meter::vu_meter;
+use crate::ui::plugin_chain::fx_button;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
@@ -227,6 +228,10 @@ pub fn channel_strip<'a>(
     ]
     .align_y(Alignment::Center);
 
+    // FX button (plugin chain)
+    let plugin_count = channel.plugin_chain.len();
+    let fx_btn = fx_button(id, plugin_count);
+
     // Assemble the channel strip
     let content = column![
         // Header row with name and delete
@@ -237,8 +242,13 @@ pub fn channel_strip<'a>(
         ]
         .align_y(Alignment::Center),
         Space::new().height(SPACING_SMALL),
-        // EQ button
-        eq_button,
+        // EQ and FX buttons row
+        row![
+            eq_button,
+            Space::new().width(SPACING_SMALL),
+            fx_btn,
+        ]
+        .align_y(Alignment::Center),
         Space::new().height(SPACING),
         // Volume slider with meter
         container(slider_meter_row)

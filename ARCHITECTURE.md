@@ -488,7 +488,7 @@ output_device = "alsa_output.pci-0000_00_1f.3.analog-stereo"
 - [x] VU meters with peak hold
 - [x] Drag-and-drop app assignment
 - [x] Auto-routing rules (pattern-based app routing)
-- [ ] Per-channel plugin chains
+- [~] Per-channel plugin chains (UI complete, persistence complete, audio routing pending)
 - [x] Snapshot recall (A/B comparison)
 - [x] Channel routing persistence (auto-reconnect on restart)
 - [ ] MIDI controller mapping

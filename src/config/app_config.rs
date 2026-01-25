@@ -4,6 +4,7 @@
 
 //! Application configuration (window settings, behavior).
 
+use crate::plugins::PluginSlotConfig;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -110,6 +111,9 @@ pub struct SavedChannel {
     pub eq_preset: String,
     /// Assigned app identifiers.
     pub assigned_apps: Vec<String>,
+    /// Plugin chain configuration.
+    #[serde(default)]
+    pub plugin_chain: Vec<PluginSlotConfig>,
 }
 
 /// Master output configuration.

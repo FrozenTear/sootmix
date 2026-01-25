@@ -239,6 +239,11 @@ impl PluginInstance {
         self.plugin.parameter_count()
     }
 
+    /// Get parameter info by index.
+    pub fn parameter_info(&self, index: u32) -> Option<sootmix_plugin_api::ParameterInfo> {
+        self.plugin.parameter_info(index).into()
+    }
+
     /// Get parameter value.
     pub fn get_parameter(&self, index: u32) -> f32 {
         self.plugin.get_parameter(index)

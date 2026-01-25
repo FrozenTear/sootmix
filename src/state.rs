@@ -6,6 +6,7 @@
 
 use crate::audio::types::{AudioChannel, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort};
 use crate::config::RoutingRulesConfig;
+use crate::plugins::{PluginSlotConfig, PluginType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -154,6 +155,13 @@ pub struct MixerChannel {
     /// VU meter display state (not serialized).
     #[serde(skip)]
     pub meter_display: MeterDisplayState,
+    /// Plugin chain configuration for persistence.
+    #[serde(default)]
+    pub plugin_chain: Vec<PluginSlotConfig>,
+    /// Runtime plugin instance IDs (not serialized).
+    /// These are the Uuids of loaded PluginInstance objects in the PluginManager.
+    #[serde(skip)]
+    pub plugin_instances: Vec<Uuid>,
 }
 
 fn default_is_managed() -> bool {
@@ -177,6 +185,8 @@ impl MixerChannel {
             pw_sink_id: None,
             pw_eq_node_id: None,
             meter_display: MeterDisplayState::default(),
+            plugin_chain: Vec::new(),
+            plugin_instances: Vec::new(),
         }
     }
 
@@ -484,6 +494,10 @@ pub struct AppState {
     pub snapshot_b: Option<MixerSnapshot>,
     /// Which snapshot is currently active (applied).
     pub active_snapshot: Option<SnapshotSlot>,
+    /// Plugin browser open for channel (channel_id).
+    pub plugin_browser_channel: Option<Uuid>,
+    /// Plugin editor open (channel_id, instance_id).
+    pub plugin_editor_open: Option<(Uuid, Uuid)>,
 }
 
 impl Default for AppState {
@@ -519,6 +533,8 @@ impl AppState {
             snapshot_a: None,
             snapshot_b: None,
             active_snapshot: None,
+            plugin_browser_channel: None,
+            plugin_editor_open: None,
         }
     }
 

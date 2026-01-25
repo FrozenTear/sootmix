@@ -8,6 +8,7 @@ use crate::audio::{filter_chain, MeterManager, PwCommand, PwEvent, PwThread};
 use crate::config::eq_preset::EqPreset;
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
+use crate::plugins::{PluginFilter, PluginManager, PluginSlotConfig, PluginType};
 use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel, SnapshotSlot};
 use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{channel_strip, master_strip};
@@ -38,6 +39,8 @@ pub struct SootMix {
     meter_manager: MeterManager,
     /// Last tick time for delta time calculation.
     last_tick: Instant,
+    /// Plugin manager for loading and managing audio effect plugins.
+    plugin_manager: PluginManager,
 }
 
 impl SootMix {
@@ -88,6 +91,11 @@ impl SootMix {
             }
         };
 
+        // Initialize plugin manager and scan for plugins
+        let plugin_manager = PluginManager::new();
+        let plugin_count = plugin_manager.scan();
+        info!("Plugin scan complete: {} plugins found", plugin_count);
+
         let now = Instant::now();
         let app = Self {
             state,
@@ -98,6 +106,7 @@ impl SootMix {
             pending_config,
             meter_manager: MeterManager::new(),
             last_tick: now,
+            plugin_manager,
         };
 
         (app, Task::none())
@@ -106,6 +115,71 @@ impl SootMix {
     /// Application title.
     pub fn title(&self) -> String {
         "SootMix".to_string()
+    }
+
+    /// Get plugin chain info for a channel (for UI display).
+    /// Returns Vec of (instance_id, plugin_name, bypassed).
+    fn get_plugin_chain_info(&self, channel_id: Uuid) -> Vec<(Uuid, String, bool)> {
+        let channel = match self.state.channel(channel_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
+        channel
+            .plugin_instances
+            .iter()
+            .enumerate()
+            .map(|(idx, &instance_id)| {
+                // Get plugin name from the manager
+                let name = self
+                    .plugin_manager
+                    .get(instance_id)
+                    .map(|p| p.info().name.to_string())
+                    .unwrap_or_else(|| {
+                        // Fallback to config name
+                        channel
+                            .plugin_chain
+                            .get(idx)
+                            .map(|c| c.plugin_id.clone())
+                            .unwrap_or_else(|| "Unknown".to_string())
+                    });
+
+                // Get bypass state from config
+                let bypassed = channel
+                    .plugin_chain
+                    .get(idx)
+                    .map(|c| c.bypassed)
+                    .unwrap_or(false);
+
+                (instance_id, name, bypassed)
+            })
+            .collect()
+    }
+
+    /// Get plugin editor info (plugin name and parameters).
+    /// Returns (plugin_name, Vec<PluginEditorParam>).
+    fn get_plugin_editor_info(&self, instance_id: Uuid) -> Option<(String, Vec<crate::ui::plugin_chain::PluginEditorParam>)> {
+        let instance = self.plugin_manager.get(instance_id)?;
+        let info = instance.info();
+        let plugin_name = info.name.to_string();
+
+        let param_count = instance.parameter_count();
+        let params: Vec<crate::ui::plugin_chain::PluginEditorParam> = (0..param_count)
+            .filter_map(|idx| {
+                let param_info = instance.parameter_info(idx)?;
+                let value = instance.get_parameter(idx);
+                Some(crate::ui::plugin_chain::PluginEditorParam {
+                    index: idx,
+                    name: param_info.name.to_string(),
+                    unit: param_info.unit.to_string(),
+                    min: param_info.min,
+                    max: param_info.max,
+                    value,
+                })
+            })
+            .collect();
+
+        Some((plugin_name, params))
     }
 
     /// Handle messages.
@@ -799,6 +873,145 @@ impl SootMix {
                 }
             }
 
+            // ==================== Plugin Chain ====================
+            Message::OpenPluginBrowser(channel_id) => {
+                info!("Opening plugin browser for channel {}", channel_id);
+                self.state.plugin_browser_channel = Some(channel_id);
+            }
+            Message::ClosePluginBrowser => {
+                self.state.plugin_browser_channel = None;
+            }
+            Message::AddPluginToChannel(channel_id, plugin_id) => {
+                info!("Adding plugin '{}' to channel {}", plugin_id, channel_id);
+
+                // Try to load the plugin via PluginManager
+                match self.plugin_manager.load(&plugin_id) {
+                    Ok(instance_id) => {
+                        info!("Loaded plugin instance: {}", instance_id);
+
+                        // Add to channel state
+                        if let Some(channel) = self.state.channel_mut(channel_id) {
+                            // Add config for persistence
+                            let config = PluginSlotConfig::new(
+                                plugin_id.clone(),
+                                PluginType::Native,
+                            );
+                            channel.plugin_chain.push(config);
+
+                            // Track the runtime instance ID
+                            channel.plugin_instances.push(instance_id);
+
+                            info!(
+                                "Channel '{}' now has {} plugins",
+                                channel.name,
+                                channel.plugin_chain.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to load plugin '{}': {}", plugin_id, e);
+                        self.state.last_error = Some(format!("Failed to load plugin: {}", e));
+                    }
+                }
+
+                // Close browser after adding
+                self.state.plugin_browser_channel = None;
+            }
+            Message::RemovePluginFromChannel(channel_id, instance_id) => {
+                info!("Removing plugin {} from channel {}", instance_id, channel_id);
+
+                // Find and remove from channel
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    // Find the index of the instance
+                    if let Some(idx) = channel.plugin_instances.iter().position(|&id| id == instance_id) {
+                        // Remove from runtime instances
+                        channel.plugin_instances.remove(idx);
+
+                        // Remove corresponding config (same index)
+                        if idx < channel.plugin_chain.len() {
+                            channel.plugin_chain.remove(idx);
+                        }
+
+                        // Unload from plugin manager
+                        self.plugin_manager.unload(instance_id);
+
+                        info!(
+                            "Removed plugin from channel '{}', {} plugins remaining",
+                            channel.name,
+                            channel.plugin_chain.len()
+                        );
+                    } else {
+                        warn!("Plugin instance {} not found in channel", instance_id);
+                    }
+                }
+            }
+            Message::MovePluginInChain(channel_id, instance_id, direction) => {
+                debug!("Moving plugin {} in channel {} by {}", instance_id, channel_id, direction);
+
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    // Find the current index of the plugin
+                    if let Some(idx) = channel.plugin_instances.iter().position(|&id| id == instance_id) {
+                        let new_idx = if direction < 0 {
+                            idx.saturating_sub(1)
+                        } else {
+                            (idx + 1).min(channel.plugin_instances.len().saturating_sub(1))
+                        };
+
+                        if new_idx != idx {
+                            // Swap in both vectors
+                            channel.plugin_instances.swap(idx, new_idx);
+                            if idx < channel.plugin_chain.len() && new_idx < channel.plugin_chain.len() {
+                                channel.plugin_chain.swap(idx, new_idx);
+                            }
+                            debug!("Moved plugin from {} to {}", idx, new_idx);
+                        }
+                    }
+                }
+            }
+            Message::TogglePluginBypass(channel_id, instance_id) => {
+                debug!("Toggling bypass for plugin {} in channel {}", instance_id, channel_id);
+
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    // Find the index of the plugin instance
+                    if let Some(idx) = channel.plugin_instances.iter().position(|&id| id == instance_id) {
+                        // Toggle bypass in the config
+                        if let Some(config) = channel.plugin_chain.get_mut(idx) {
+                            config.bypassed = !config.bypassed;
+                            info!("Plugin bypass toggled to {}", config.bypassed);
+                        }
+                    }
+                }
+            }
+            Message::OpenPluginEditor(channel_id, instance_id) => {
+                info!("Opening editor for plugin {} in channel {}", instance_id, channel_id);
+                self.state.plugin_editor_open = Some((channel_id, instance_id));
+            }
+            Message::ClosePluginEditor => {
+                self.state.plugin_editor_open = None;
+            }
+            Message::PluginParameterChanged(instance_id, param_idx, value) => {
+                debug!("Plugin {} parameter {} changed to {}", instance_id, param_idx, value);
+
+                // Update the plugin instance parameter
+                if let Some(plugin) = self.plugin_manager.get_mut(instance_id) {
+                    plugin.set_parameter(param_idx, value);
+                }
+
+                // Also update the stored config for persistence
+                for channel in &mut self.state.channels {
+                    if let Some(idx) = channel.plugin_instances.iter().position(|&id| id == instance_id) {
+                        if let Some(config) = channel.plugin_chain.get_mut(idx) {
+                            config.parameters.insert(param_idx, value);
+                        }
+                        break;
+                    }
+                }
+            }
+            Message::PluginChainLoaded(channel_id) => {
+                debug!("Plugin chain loaded for channel {}", channel_id);
+                // TODO: Handle plugin chain restoration from persistence
+            }
+
             // ==================== PipeWire Events ====================
             Message::PwConnected => {
                 info!("Connected to PipeWire");
@@ -967,6 +1180,46 @@ impl SootMix {
             Space::new().height(0).into()
         };
 
+        // Plugin panel (shown when a channel's plugin browser is open)
+        let plugin_panel: Element<Message> = if let Some(channel_id) = self.state.plugin_browser_channel {
+            // Get channel info
+            let channel_name = self.state.channel(channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            // Get current plugin chain info
+            let chain_info = self.get_plugin_chain_info(channel_id);
+
+            // Get available plugins from the PluginManager
+            let available_plugins = self.plugin_manager.list_plugins(&PluginFilter::default());
+
+            // Show both chain panel and browser side by side
+            row![
+                crate::ui::plugin_chain::plugin_chain_panel(
+                    channel_id,
+                    &channel_name,
+                    chain_info,
+                ),
+                Space::new().width(SPACING),
+                crate::ui::plugin_chain::plugin_browser(channel_id, available_plugins),
+            ]
+            .spacing(SPACING)
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+        // Plugin editor (shown when editing a plugin's parameters)
+        let plugin_editor_panel: Element<Message> = if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
+            if let Some((plugin_name, params)) = self.get_plugin_editor_info(instance_id) {
+                crate::ui::plugin_chain::plugin_editor(instance_id, &plugin_name, params)
+            } else {
+                Space::new().height(0).into()
+            }
+        } else {
+            Space::new().height(0).into()
+        };
+
         // Main content
         let content = column![
             header,
@@ -976,6 +1229,10 @@ impl SootMix {
             apps,
             Space::new().height(SPACING),
             rules_panel,
+            Space::new().height(SPACING_SMALL),
+            plugin_panel,
+            Space::new().height(SPACING_SMALL),
+            plugin_editor_panel,
             self.view_footer(),
         ]
         .padding(PADDING);
@@ -1569,6 +1826,7 @@ impl SootMix {
                         eq_enabled: c.eq_enabled,
                         eq_preset: c.eq_preset.clone(),
                         assigned_apps: c.assigned_apps.clone(),
+                        plugin_chain: c.plugin_chain.clone(),
                     })
                     .collect(),
             };
@@ -1632,13 +1890,45 @@ impl SootMix {
                     channel.eq_enabled = saved.eq_enabled;
                     channel.eq_preset = saved.eq_preset;
                     channel.assigned_apps = saved.assigned_apps;
+                    channel.plugin_chain = saved.plugin_chain.clone();
 
                     let id = channel.id;
                     let name = channel.name.clone();
+
+                    // Reload plugins from saved config
+                    let mut loaded_instances = Vec::new();
+                    for slot_config in &saved.plugin_chain {
+                        match self.plugin_manager.load(&slot_config.plugin_id) {
+                            Ok(instance_id) => {
+                                info!(
+                                    "Restored plugin '{}' for channel '{}' (instance {})",
+                                    slot_config.plugin_id, name, instance_id
+                                );
+                                // Restore parameter values
+                                if let Some(instance) = self.plugin_manager.get_mut(instance_id) {
+                                    for (&param_idx, &value) in &slot_config.parameters {
+                                        instance.set_parameter(param_idx, value);
+                                    }
+                                }
+                                loaded_instances.push(instance_id);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to restore plugin '{}' for channel '{}': {}",
+                                    slot_config.plugin_id, name, e
+                                );
+                            }
+                        }
+                    }
+                    channel.plugin_instances = loaded_instances;
+
                     self.state.channels.push(channel);
 
-                    info!("Created channel in state: id={}, name='{}', assigned_apps count={}",
-                        id, name, self.state.channel(id).map(|c| c.assigned_apps.len()).unwrap_or(0));
+                    info!("Created channel in state: id={}, name='{}', assigned_apps count={}, plugins={}",
+                        id, name,
+                        self.state.channel(id).map(|c| c.assigned_apps.len()).unwrap_or(0),
+                        self.state.channel(id).map(|c| c.plugin_instances.len()).unwrap_or(0)
+                    );
 
                     // Create the virtual sink
                     self.send_pw_command(PwCommand::CreateVirtualSink {

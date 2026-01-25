@@ -5,6 +5,7 @@
 //! Audio subsystem - PipeWire integration.
 
 pub mod control;
+pub mod filter_chain;
 pub mod meter;
 pub mod pipewire_thread;
 pub mod routing;

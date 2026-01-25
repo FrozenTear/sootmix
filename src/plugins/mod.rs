@@ -39,7 +39,9 @@ pub mod wasm;
 pub use host::PluginHost;
 pub use manager::{PluginInstance, PluginManager, PluginRegistry};
 
+use serde::{Deserialize, Serialize};
 use sootmix_plugin_api::{PluginCategory, PluginInfo};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Metadata about a discovered plugin (before loading).
@@ -56,7 +58,7 @@ pub struct PluginMetadata {
 }
 
 /// Type of plugin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PluginType {
     /// Native shared library (.so on Linux).
     Native,
@@ -180,5 +182,32 @@ impl PluginFilter {
         }
 
         true
+    }
+}
+
+/// Configuration for a plugin slot in a channel's plugin chain.
+/// Used for serialization/persistence of plugin state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSlotConfig {
+    /// Plugin identifier (filename stem, e.g., "sootmix-eq").
+    pub plugin_id: String,
+    /// Type of plugin (Native, WASM, Builtin).
+    pub plugin_type: PluginType,
+    /// Whether this plugin slot is bypassed.
+    pub bypassed: bool,
+    /// Saved parameter values (param_index -> value).
+    #[serde(default)]
+    pub parameters: HashMap<u32, f32>,
+}
+
+impl PluginSlotConfig {
+    /// Create a new plugin slot config.
+    pub fn new(plugin_id: impl Into<String>, plugin_type: PluginType) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            plugin_type,
+            bypassed: false,
+            parameters: HashMap::new(),
+        }
     }
 }
