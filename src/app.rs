@@ -1055,8 +1055,10 @@ impl SootMix {
                 self.state.pw_graph.links.remove(&id);
             }
             PwEvent::VirtualSinkCreated { channel_id, node_id } => {
+                info!("PwEvent: VirtualSinkCreated channel={} node={}", channel_id, node_id);
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.pw_sink_id = Some(node_id);
+                    info!("Updated channel '{}' pw_sink_id to {}", channel.name, node_id);
                 }
             }
             PwEvent::VirtualSinkDestroyed { node_id } => {
