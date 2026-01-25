@@ -647,7 +647,7 @@ fn bind_node_from_global(
 }
 
 /// Set up the registry listener to watch for nodes, ports, and links.
-/// Also binds sootmix virtual sink nodes for native control.
+/// Also binds audio sink nodes (sootmix virtual sinks and hardware outputs) for native control.
 fn setup_registry_listener(
     registry: &pipewire::registry::RegistryRc,
     state: Rc<RefCell<PwThreadState>>,
@@ -702,11 +702,16 @@ fn setup_registry_listener(
                         node.id, node.name, node.media_class
                     );
 
-                    // Auto-bind sootmix virtual sink nodes for native control
-                    if node.name.starts_with("sootmix.") {
-                        debug!("Detected sootmix node, binding for native control: {}", node.name);
+                    // Auto-bind nodes for native volume/mute control:
+                    // - sootmix virtual sinks (our channel sinks)
+                    // - hardware audio sinks (for master volume control)
+                    let should_bind = node.name.starts_with("sootmix.")
+                        || node.media_class == MediaClass::AudioSink;
+
+                    if should_bind {
+                        debug!("Binding node for native control: {} ({:?})", node.name, node.media_class);
                         if let Err(e) = bind_node_from_global(global, &state_add, &registry_clone) {
-                            warn!("Failed to bind sootmix node {}: {}", node.id, e);
+                            warn!("Failed to bind node {}: {}", node.id, e);
                         }
                     }
 
