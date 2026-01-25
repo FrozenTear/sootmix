@@ -257,8 +257,8 @@ impl PluginFilterStreams {
     /// Connect the streams and start processing.
     ///
     /// # Arguments
-    /// * `capture_target` - Node ID to capture from (virtual sink), or None for any
-    /// * `playback_target` - Node ID to play to (master sink), or None for default
+    /// * `capture_target` - Node ID to capture from (loopback output), or None for auto-connect
+    /// * `playback_target` - Node ID to play to (master sink), or None for default sink
     pub fn connect(
         &self,
         capture_target: Option<u32>,
@@ -269,19 +269,30 @@ impl PluginFilterStreams {
             self.channel_id, capture_target, playback_target
         );
 
+        // Base flags for all streams
+        let base_flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+
         // Connect capture stream (input direction = receiving audio)
+        // Use AUTOCONNECT only if no specific target is provided
+        let capture_flags = if capture_target.is_some() {
+            base_flags
+        } else {
+            base_flags | StreamFlags::AUTOCONNECT
+        };
+
         self.capture_stream.connect(
             libspa::utils::Direction::Input,
             capture_target,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            capture_flags,
             &mut [],
         )?;
 
         // Connect playback stream (output direction = sending audio)
+        // Always use AUTOCONNECT for playback to connect to default sink
         self.playback_stream.connect(
             libspa::utils::Direction::Output,
             playback_target,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            base_flags | StreamFlags::AUTOCONNECT,
             &mut [],
         )?;
 

@@ -238,6 +238,25 @@ impl PwThreadState {
         self.ports.get(&port_id).map(|p| p.node_id)
     }
 
+    /// Find a node ID by name.
+    fn find_node_by_name(&self, name: &str) -> Option<u32> {
+        self.nodes.iter()
+            .find(|(_, node)| node.name == name)
+            .map(|(&id, _)| id)
+    }
+
+    /// Get the loopback output node ID for a channel's virtual sink.
+    ///
+    /// Virtual sinks are created with pw-loopback which creates two nodes:
+    /// - `sootmix.{name}` - Audio/Sink (apps connect here)
+    /// - `sootmix.{name}.output` - Stream/Output/Audio (loopback output)
+    ///
+    /// This returns the output node ID for routing through plugin filters.
+    fn get_loopback_output_node(&self, channel_name: &str) -> Option<u32> {
+        let output_name = format!("sootmix.{}.output", channel_name);
+        self.find_node_by_name(&output_name)
+    }
+
     /// Set volume on a bound node using native API.
     ///
     /// Uses channelVolumes (stereo FL/FR) which is what WirePlumber/wpctl uses.
@@ -730,8 +749,27 @@ fn handle_command(
                     let capture_node_id = streams.capture_node_id();
                     let playback_node_id = streams.playback_node_id();
 
-                    // Connect the streams (auto-connect for now)
-                    if let Err(e) = streams.connect(None, None) {
+                    // Sanitize channel name to match virtual sink naming
+                    let safe_name: String = channel_name
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                        .collect();
+
+                    // Find the loopback output node to capture from
+                    // The virtual sink creates: sootmix.{name} (sink) + sootmix.{name}.output (output)
+                    let loopback_output_id = state.borrow().get_loopback_output_node(&safe_name);
+
+                    if loopback_output_id.is_none() {
+                        debug!(
+                            "Loopback output node 'sootmix.{}.output' not found yet, will auto-connect",
+                            safe_name
+                        );
+                    }
+
+                    // Connect the streams
+                    // - Capture from loopback output (or auto-connect if not found)
+                    // - Playback to default sink (None = auto-connect to default)
+                    if let Err(e) = streams.connect(loopback_output_id, None) {
                         warn!("Failed to connect plugin filter streams: {:?}", e);
                         let _ = event_tx.send(PwEvent::Error(
                             format!("Failed to connect plugin filter: {:?}", e)
@@ -747,8 +785,8 @@ fn handle_command(
                     state.borrow_mut().plugin_filters.insert(channel_id, filter_info);
 
                     info!(
-                        "Plugin filter created for channel '{}': capture={}, playback={}",
-                        channel_name, capture_node_id, playback_node_id
+                        "Plugin filter created for channel '{}': capture={}, playback={}, loopback_output={:?}",
+                        channel_name, capture_node_id, playback_node_id, loopback_output_id
                     );
 
                     let _ = event_tx.send(PwEvent::PluginFilterCreated {
