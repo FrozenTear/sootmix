@@ -21,4 +21,4 @@ pub mod atomic_params;
 pub mod ringbuf;
 
 pub use atomic_params::{AtomicBool, AtomicF32, AtomicI32, AtomicU32, ParameterBlock};
-pub use ringbuf::{RingBuffer, RingBufferReader, RingBufferWriter};
+pub use ringbuf::{PluginParamUpdate, RingBuffer, RingBufferReader, RingBufferWriter};

@@ -307,6 +307,30 @@ pub struct StereoMeterData {
     pub right: MeterData,
 }
 
+/// Plugin parameter update sent from UI thread to RT audio thread.
+///
+/// Used to update plugin parameters without locking in the audio callback.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginParamUpdate {
+    /// Plugin instance ID.
+    pub instance_id: uuid::Uuid,
+    /// Parameter index.
+    pub param_index: u32,
+    /// New parameter value.
+    pub value: f32,
+}
+
+impl PluginParamUpdate {
+    /// Create a new parameter update.
+    pub fn new(instance_id: uuid::Uuid, param_index: u32, value: f32) -> Self {
+        Self {
+            instance_id,
+            param_index,
+            value,
+        }
+    }
+}
+
 impl StereoMeterData {
     /// Create new stereo meter data.
     pub fn new(left: MeterData, right: MeterData) -> Self {

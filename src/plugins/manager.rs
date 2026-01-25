@@ -8,7 +8,7 @@ use super::{native::NativePluginLoader, PluginFilter, PluginLoadError, PluginMet
 use sootmix_plugin_api::{ActivationContext, PluginBox, PluginInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -271,14 +271,25 @@ impl Drop for PluginInstance {
     }
 }
 
+/// Thread-safe plugin instances storage.
+///
+/// Used to share plugin instances between UI thread and RT audio thread.
+/// The UI thread holds the PluginManager and uses regular lock access.
+/// The RT audio thread uses try_lock() to avoid blocking.
+pub type SharedPluginInstances = Arc<Mutex<HashMap<Uuid, PluginInstance>>>;
+
 /// Plugin manager - handles loading, instantiation, and lifecycle.
+///
+/// The manager provides thread-safe access to plugin instances through
+/// the `shared_instances()` method, which returns an Arc<Mutex<>> that
+/// can be shared with the RT audio thread.
 pub struct PluginManager {
     /// Plugin registry.
     registry: Arc<RwLock<PluginRegistry>>,
     /// Native plugin loader.
     native_loader: NativePluginLoader,
-    /// Active plugin instances.
-    instances: HashMap<Uuid, PluginInstance>,
+    /// Active plugin instances (thread-safe).
+    instances: SharedPluginInstances,
     /// Default sample rate for activation.
     sample_rate: f32,
     /// Default block size for activation.
@@ -298,10 +309,18 @@ impl PluginManager {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             native_loader: NativePluginLoader::new(),
-            instances: HashMap::new(),
+            instances: Arc::new(Mutex::new(HashMap::new())),
             sample_rate: 48000.0,
             block_size: 512,
         }
+    }
+
+    /// Get a shared reference to the plugin instances.
+    ///
+    /// Use this to share instances with the RT audio thread.
+    /// The RT thread should use `try_lock()` to avoid blocking.
+    pub fn shared_instances(&self) -> SharedPluginInstances {
+        Arc::clone(&self.instances)
     }
 
     /// Set default audio parameters for plugin activation.
@@ -375,7 +394,7 @@ impl PluginManager {
         instance.activate(self.sample_rate, self.block_size);
 
         let id = instance.id;
-        self.instances.insert(id, instance);
+        self.instances.lock().unwrap().insert(id, instance);
 
         info!("Loaded plugin: {} (id={})", path.display(), id);
         Ok(id)
@@ -383,7 +402,8 @@ impl PluginManager {
 
     /// Unload a plugin instance.
     pub fn unload(&mut self, id: Uuid) -> bool {
-        if let Some(mut instance) = self.instances.remove(&id) {
+        let mut instances = self.instances.lock().unwrap();
+        if let Some(mut instance) = instances.remove(&id) {
             instance.deactivate();
             info!("Unloaded plugin: {}", id);
             true
@@ -392,24 +412,74 @@ impl PluginManager {
         }
     }
 
-    /// Get a reference to a plugin instance.
-    pub fn get(&self, id: Uuid) -> Option<&PluginInstance> {
-        self.instances.get(&id)
+    /// Get plugin info by instance ID.
+    ///
+    /// This acquires a lock on the instances map. For RT-safe access,
+    /// use `shared_instances()` with `try_lock()` instead.
+    pub fn get_info(&self, id: Uuid) -> Option<PluginInfo> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&id).map(|i| i.info())
     }
 
-    /// Get a mutable reference to a plugin instance.
-    pub fn get_mut(&mut self, id: Uuid) -> Option<&mut PluginInstance> {
-        self.instances.get_mut(&id)
+    /// Get parameter count for a plugin instance.
+    pub fn get_parameter_count(&self, id: Uuid) -> Option<u32> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&id).map(|i| i.parameter_count())
     }
 
-    /// Get all active plugin instances.
-    pub fn active_instances(&self) -> impl Iterator<Item = &PluginInstance> {
-        self.instances.values()
+    /// Get parameter info for a plugin instance.
+    pub fn get_parameter_info(&self, id: Uuid, index: u32) -> Option<sootmix_plugin_api::ParameterInfo> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&id).and_then(|i| i.parameter_info(index))
+    }
+
+    /// Get parameter value for a plugin instance.
+    pub fn get_parameter(&self, id: Uuid, index: u32) -> Option<f32> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&id).map(|i| i.get_parameter(index))
+    }
+
+    /// Set parameter value for a plugin instance.
+    ///
+    /// This acquires a lock. For RT-safe parameter updates, use
+    /// the parameter ring buffer and apply updates in the audio callback.
+    pub fn set_parameter(&self, id: Uuid, index: u32, value: f32) {
+        let mut instances = self.instances.lock().unwrap();
+        if let Some(instance) = instances.get_mut(&id) {
+            instance.set_parameter(index, value);
+        }
+    }
+
+    /// Execute a function with access to a plugin instance.
+    ///
+    /// This provides safe access without exposing references outside the lock scope.
+    pub fn with_instance<F, R>(&self, id: Uuid, f: F) -> Option<R>
+    where
+        F: FnOnce(&PluginInstance) -> R,
+    {
+        let instances = self.instances.lock().unwrap();
+        instances.get(&id).map(f)
+    }
+
+    /// Execute a function with mutable access to a plugin instance.
+    pub fn with_instance_mut<F, R>(&self, id: Uuid, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut PluginInstance) -> R,
+    {
+        let mut instances = self.instances.lock().unwrap();
+        instances.get_mut(&id).map(f)
+    }
+
+    /// Get all active plugin instance IDs.
+    pub fn active_instance_ids(&self) -> Vec<Uuid> {
+        let instances = self.instances.lock().unwrap();
+        instances.keys().copied().collect()
     }
 
     /// Unload all plugin instances.
     pub fn unload_all(&mut self) {
-        for (_, mut instance) in self.instances.drain() {
+        let mut instances = self.instances.lock().unwrap();
+        for (_, mut instance) in instances.drain() {
             instance.deactivate();
         }
         info!("Unloaded all plugins");

@@ -37,7 +37,7 @@ pub mod native;
 pub mod wasm;
 
 pub use host::PluginHost;
-pub use manager::{PluginInstance, PluginManager, PluginRegistry};
+pub use manager::{PluginInstance, PluginManager, PluginRegistry, SharedPluginInstances};
 
 use serde::{Deserialize, Serialize};
 use sootmix_plugin_api::{PluginCategory, PluginInfo};

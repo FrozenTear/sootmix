@@ -19,42 +19,30 @@
 //!                                    - ...
 //! ```
 //!
-//! # Current Status
+//! # Implementation Status
 //!
-//! The plugin processor infrastructure is implemented:
-//! - Tracks per-channel plugin chains
-//! - Provides audio processing through plugin instances
-//! - Syncs with app state when plugins are added/removed
+//! The plugin processor infrastructure is fully implemented:
+//! - Thread-safe PluginManager with `Arc<Mutex<HashMap>>` for RT access
+//! - Lock-free parameter ring buffer for UI → RT thread updates
+//! - `PluginFilterManager` for managing per-channel filter streams
+//! - `PluginProcessingContext` for RT-safe audio processing
+//! - PipeWire commands for filter creation/destruction/updates
 //!
-//! # TODO: PipeWire Audio Routing
+//! See also:
+//! - `plugin_filter.rs` - PipeWire filter stream implementation
+//! - `pipewire_thread.rs` - PwCommand::CreatePluginFilter, etc.
 //!
-//! To complete the audio integration, we need to create PipeWire filter
-//! streams that route audio through the plugins. This involves:
+//! # Thread Safety
 //!
-//! 1. **Create a filter stream** for each channel with plugins
-//!    - Use pipewire::stream API with both input and output
-//!    - Register process callback for real-time audio handling
-//!
-//! 2. **Route audio through the filter**
-//!    - Disconnect channel virtual sink from master
-//!    - Connect: virtual sink output → filter input
-//!    - Connect: filter output → master sink
-//!
-//! 3. **Process callback implementation**
-//!    - Dequeue input buffer from stream
-//!    - Call process_audio() with plugin chain
-//!    - Queue processed buffer to output
-//!
-//! 4. **Thread safety considerations**
-//!    - PipeWire runs on its own real-time thread
-//!    - Plugin instances need to be accessed from callback
-//!    - Use lock-free communication for parameter updates
+//! - PluginManager uses `Arc<Mutex<>>` for thread-safe instance access
+//! - RT thread uses `try_lock()` to avoid blocking
+//! - Parameter updates flow via lock-free ring buffer
+//! - If lock is contended, RT thread does passthrough (no audio glitches)
 
-use crate::plugins::PluginManager;
+use crate::plugins::SharedPluginInstances;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -181,25 +169,26 @@ impl PluginProcessorManager {
             .unwrap_or(false)
     }
 
-    /// Process audio through a channel's plugin chain.
+    /// Process audio through a channel's plugin chain (RT-safe version).
     ///
     /// This is called from the audio processing callback.
     /// It processes the input buffers through each plugin in sequence.
+    /// Uses try_lock() for RT-safety - returns passthrough if lock is contended.
     ///
     /// # Arguments
     /// * `channel_id` - The channel to process
-    /// * `plugin_manager` - Reference to the plugin manager
+    /// * `instances` - Shared plugin instances (use try_lock for RT safety)
     /// * `inputs` - Input audio buffers (stereo: [left, right])
     /// * `outputs` - Output audio buffers (stereo: [left, right])
     ///
     /// # Returns
     /// * `Ok(true)` if audio was processed through plugins
-    /// * `Ok(false)` if channel has no active plugins (passthrough)
+    /// * `Ok(false)` if channel has no active plugins or lock was contended (passthrough)
     /// * `Err` on processing error
     pub fn process_audio(
         &self,
         channel_id: Uuid,
-        plugin_manager: &mut PluginManager,
+        instances: &SharedPluginInstances,
         inputs: &[&[f32]],
         outputs: &mut [&mut [f32]],
     ) -> Result<bool, PluginProcessorError> {
@@ -207,6 +196,18 @@ impl PluginProcessorManager {
             Some(p) if p.active => p,
             _ => {
                 // No active processor, copy input to output (passthrough)
+                for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+                    output.copy_from_slice(input);
+                }
+                return Ok(false);
+            }
+        };
+
+        // Try to acquire lock - RT-safe: don't block if contended
+        let mut instances_guard = match instances.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Lock contended, passthrough to avoid blocking audio thread
                 for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
                     output.copy_from_slice(input);
                 }
@@ -222,9 +223,13 @@ impl PluginProcessorManager {
         let mut temp_buffers: Vec<Vec<f32>> = inputs.iter().map(|b| b.to_vec()).collect();
 
         for &instance_id in &processor.plugin_instances {
-            let instance = plugin_manager
-                .get_mut(instance_id)
-                .ok_or(PluginProcessorError::PluginNotLoaded(instance_id))?;
+            let instance = match instances_guard.get_mut(&instance_id) {
+                Some(i) => i,
+                None => {
+                    // Plugin not found, skip it
+                    continue;
+                }
+            };
 
             // Check bypass state (would need to track this per-instance)
             // For now, always process

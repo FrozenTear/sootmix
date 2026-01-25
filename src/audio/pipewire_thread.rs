@@ -60,6 +60,24 @@ pub enum PwCommand {
     },
     /// Set the default audio output sink.
     SetDefaultSink { node_id: u32 },
+    /// Create a plugin filter stream for a channel.
+    ///
+    /// This creates a filter node that routes audio through the plugin chain.
+    /// The filter captures audio from the channel's virtual sink and outputs
+    /// processed audio to the master sink.
+    CreatePluginFilter {
+        channel_id: Uuid,
+        channel_name: String,
+        /// Plugin instance IDs in processing order.
+        plugin_chain: Vec<Uuid>,
+    },
+    /// Destroy a plugin filter stream.
+    DestroyPluginFilter { channel_id: Uuid },
+    /// Update the plugin chain for an existing filter.
+    UpdatePluginChain {
+        channel_id: Uuid,
+        plugin_chain: Vec<Uuid>,
+    },
     /// Shutdown the PipeWire thread.
     Shutdown,
 }
@@ -89,6 +107,14 @@ pub enum PwEvent {
     VirtualSinkCreated { channel_id: Uuid, node_id: u32 },
     /// Virtual sink destroyed.
     VirtualSinkDestroyed { node_id: u32 },
+    /// Plugin filter created for a channel.
+    PluginFilterCreated {
+        channel_id: Uuid,
+        sink_node_id: u32,
+        output_node_id: u32,
+    },
+    /// Plugin filter destroyed.
+    PluginFilterDestroyed { channel_id: Uuid },
     /// Control parameter changed (volume, mute, etc).
     ParamChanged {
         node_id: u32,
@@ -627,6 +653,73 @@ fn handle_command(
                     )));
                 }
             }
+        }
+
+        PwCommand::CreatePluginFilter {
+            channel_id,
+            channel_name,
+            plugin_chain,
+        } => {
+            info!(
+                "Creating plugin filter for channel '{}' with {} plugins",
+                channel_name,
+                plugin_chain.len()
+            );
+
+            let event_tx = state.borrow().event_tx.clone();
+
+            // TODO: In the future, this should create a real PipeWire filter stream
+            // using the Stream API with process callbacks. For now, we use an
+            // external process approach similar to EQ filters.
+            //
+            // The full implementation would:
+            // 1. Create a PipeWire Stream with Direction::Input (capture)
+            // 2. Register a process callback that:
+            //    - Drains parameter updates from ring buffer
+            //    - Processes audio through plugin chain
+            //    - Queues output buffers
+            // 3. Set node properties: media.class = Audio/Duplex
+            //
+            // For now, store the plugin filter info and use passthrough.
+            // The actual processing happens when we integrate with the RT thread.
+
+            // Use placeholder node IDs (0) until we implement real filter creation
+            let _ = event_tx.send(PwEvent::PluginFilterCreated {
+                channel_id,
+                sink_node_id: 0,
+                output_node_id: 0,
+            });
+
+            debug!(
+                "Plugin filter stub created for channel '{}' (full implementation pending)",
+                channel_name
+            );
+        }
+
+        PwCommand::DestroyPluginFilter { channel_id } => {
+            info!("Destroying plugin filter for channel {}", channel_id);
+
+            let event_tx = state.borrow().event_tx.clone();
+
+            // TODO: Destroy the PipeWire stream and clean up resources
+            // For now, just send the event
+
+            let _ = event_tx.send(PwEvent::PluginFilterDestroyed { channel_id });
+        }
+
+        PwCommand::UpdatePluginChain {
+            channel_id,
+            plugin_chain,
+        } => {
+            debug!(
+                "Updating plugin chain for channel {}: {} plugins",
+                channel_id,
+                plugin_chain.len()
+            );
+
+            // TODO: Update the plugin chain in the RT context
+            // This would involve sending the new chain to the processing context
+            // via the parameter ring buffer or a separate command channel
         }
     }
 }

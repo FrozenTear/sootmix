@@ -4,7 +4,7 @@
 
 //! Iced Application implementation for SootMix.
 
-use crate::audio::{filter_chain, MeterManager, PluginProcessorManager, PwCommand, PwEvent, PwThread};
+use crate::audio::{filter_chain, MeterManager, PluginFilterManager, PluginProcessorManager, PwCommand, PwEvent, PwThread};
 use crate::config::eq_preset::EqPreset;
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
@@ -43,6 +43,8 @@ pub struct SootMix {
     plugin_manager: PluginManager,
     /// Plugin audio processor for routing audio through plugin chains.
     plugin_processor: PluginProcessorManager,
+    /// Plugin filter manager for PipeWire audio routing through plugins.
+    plugin_filter_manager: PluginFilterManager,
 }
 
 impl SootMix {
@@ -98,6 +100,10 @@ impl SootMix {
         let plugin_count = plugin_manager.scan();
         info!("Plugin scan complete: {} plugins found", plugin_count);
 
+        // Initialize plugin filter manager with shared instances
+        let mut plugin_filter_manager = PluginFilterManager::new();
+        plugin_filter_manager.set_plugin_instances(plugin_manager.shared_instances());
+
         let now = Instant::now();
         let app = Self {
             state,
@@ -110,6 +116,7 @@ impl SootMix {
             last_tick: now,
             plugin_manager,
             plugin_processor: PluginProcessorManager::new(),
+            plugin_filter_manager,
         };
 
         (app, Task::none())
@@ -136,8 +143,8 @@ impl SootMix {
                 // Get plugin name from the manager
                 let name = self
                     .plugin_manager
-                    .get(instance_id)
-                    .map(|p| p.info().name.to_string())
+                    .get_info(instance_id)
+                    .map(|info| info.name.to_string())
                     .unwrap_or_else(|| {
                         // Fallback to config name
                         channel
@@ -162,15 +169,14 @@ impl SootMix {
     /// Get plugin editor info (plugin name and parameters).
     /// Returns (plugin_name, Vec<PluginEditorParam>).
     fn get_plugin_editor_info(&self, instance_id: Uuid) -> Option<(String, Vec<crate::ui::plugin_chain::PluginEditorParam>)> {
-        let instance = self.plugin_manager.get(instance_id)?;
-        let info = instance.info();
+        let info = self.plugin_manager.get_info(instance_id)?;
         let plugin_name = info.name.to_string();
 
-        let param_count = instance.parameter_count();
+        let param_count = self.plugin_manager.get_parameter_count(instance_id)?;
         let params: Vec<crate::ui::plugin_chain::PluginEditorParam> = (0..param_count)
             .filter_map(|idx| {
-                let param_info = instance.parameter_info(idx)?;
-                let value = instance.get_parameter(idx);
+                let param_info = self.plugin_manager.get_parameter_info(instance_id, idx)?;
+                let value = self.plugin_manager.get_parameter(instance_id, idx)?;
                 Some(crate::ui::plugin_chain::PluginEditorParam {
                     index: idx,
                     name: param_info.name.to_string(),
@@ -904,16 +910,47 @@ impl SootMix {
                             // Track the runtime instance ID
                             channel.plugin_instances.push(instance_id);
 
+                            let channel_name = channel.name.clone();
+                            let plugin_count = channel.plugin_chain.len();
+                            let instances = channel.plugin_instances.clone();
+
                             info!(
                                 "Channel '{}' now has {} plugins",
-                                channel.name,
-                                channel.plugin_chain.len()
+                                channel_name, plugin_count
                             );
 
                             // Update plugin processor with new chain
-                            let instances = channel.plugin_instances.clone();
-                            if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances) {
+                            if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances.clone()) {
                                 warn!("Failed to update plugin processor: {}", e);
+                            }
+
+                            // Create or update PipeWire plugin filter
+                            if !self.plugin_filter_manager.has_filter(channel_id) {
+                                // First plugin - create the filter
+                                if let Err(e) = self.plugin_filter_manager.create_filter(
+                                    channel_id,
+                                    &channel_name,
+                                    plugin_count,
+                                ) {
+                                    warn!("Failed to create plugin filter: {}", e);
+                                }
+
+                                // Send command to PipeWire thread
+                                if let Some(ref pw) = self.pw_thread {
+                                    let _ = pw.send(PwCommand::CreatePluginFilter {
+                                        channel_id,
+                                        channel_name,
+                                        plugin_chain: instances,
+                                    });
+                                }
+                            } else {
+                                // Update existing filter's plugin chain
+                                if let Some(ref pw) = self.pw_thread {
+                                    let _ = pw.send(PwCommand::UpdatePluginChain {
+                                        channel_id,
+                                        plugin_chain: instances,
+                                    });
+                                }
                             }
                         }
                     }
@@ -944,16 +981,34 @@ impl SootMix {
                         // Unload from plugin manager
                         self.plugin_manager.unload(instance_id);
 
+                        let instances = channel.plugin_instances.clone();
+                        let plugin_count = channel.plugin_chain.len();
+
                         info!(
                             "Removed plugin from channel '{}', {} plugins remaining",
-                            channel.name,
-                            channel.plugin_chain.len()
+                            channel.name, plugin_count
                         );
 
                         // Update plugin processor with new chain
-                        let instances = channel.plugin_instances.clone();
-                        if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances) {
+                        if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances.clone()) {
                             warn!("Failed to update plugin processor: {}", e);
+                        }
+
+                        // Update or destroy PipeWire plugin filter
+                        if plugin_count == 0 {
+                            // No more plugins - destroy the filter
+                            self.plugin_filter_manager.destroy_filter(channel_id);
+                            if let Some(ref pw) = self.pw_thread {
+                                let _ = pw.send(PwCommand::DestroyPluginFilter { channel_id });
+                            }
+                        } else {
+                            // Update the plugin chain
+                            if let Some(ref pw) = self.pw_thread {
+                                let _ = pw.send(PwCommand::UpdatePluginChain {
+                                    channel_id,
+                                    plugin_chain: instances,
+                                });
+                            }
                         }
                     } else {
                         warn!("Plugin instance {} not found in channel", instance_id);
@@ -1007,17 +1062,26 @@ impl SootMix {
             Message::PluginParameterChanged(instance_id, param_idx, value) => {
                 debug!("Plugin {} parameter {} changed to {}", instance_id, param_idx, value);
 
-                // Update the plugin instance parameter
-                if let Some(plugin) = self.plugin_manager.get_mut(instance_id) {
-                    plugin.set_parameter(param_idx, value);
-                }
+                // Update the plugin instance parameter (direct, for immediate UI feedback)
+                self.plugin_manager.set_parameter(instance_id, param_idx, value);
 
-                // Also update the stored config for persistence
+                // Also update the stored config for persistence and send to RT thread
                 for channel in &mut self.state.channels {
                     if let Some(idx) = channel.plugin_instances.iter().position(|&id| id == instance_id) {
                         if let Some(config) = channel.plugin_chain.get_mut(idx) {
                             config.parameters.insert(param_idx, value);
                         }
+
+                        // Send parameter update to the RT thread via ring buffer
+                        // This allows RT-safe parameter updates during audio processing
+                        let channel_id = channel.id;
+                        self.plugin_filter_manager.send_param_update(
+                            channel_id,
+                            instance_id,
+                            param_idx,
+                            value,
+                        );
+
                         break;
                     }
                 }
@@ -1704,6 +1768,22 @@ impl SootMix {
                     }
                 }
             }
+            PwEvent::PluginFilterCreated {
+                channel_id,
+                sink_node_id,
+                output_node_id,
+            } => {
+                info!(
+                    "Plugin filter created for channel {}: sink={}, output={}",
+                    channel_id, sink_node_id, output_node_id
+                );
+                // TODO: Store node IDs and set up routing
+                // The filter is now ready to process audio
+            }
+            PwEvent::PluginFilterDestroyed { channel_id } => {
+                info!("Plugin filter destroyed for channel {}", channel_id);
+                // TODO: Clean up any routing state
+            }
             PwEvent::Error(err) => {
                 self.state.last_error = Some(err);
             }
@@ -1920,10 +2000,8 @@ impl SootMix {
                                     slot_config.plugin_id, name, instance_id
                                 );
                                 // Restore parameter values
-                                if let Some(instance) = self.plugin_manager.get_mut(instance_id) {
-                                    for (&param_idx, &value) in &slot_config.parameters {
-                                        instance.set_parameter(param_idx, value);
-                                    }
+                                for (&param_idx, &value) in &slot_config.parameters {
+                                    self.plugin_manager.set_parameter(instance_id, param_idx, value);
                                 }
                                 loaded_instances.push(instance_id);
                             }
