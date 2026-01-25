@@ -8,13 +8,18 @@
 //! - Plugin browser for discovering and adding plugins
 //! - Plugin chain strip showing active plugins on a channel
 //! - Plugin slot for individual plugin controls (bypass, remove, edit)
+//! - Plugin editor for adjusting parameters
 
 use crate::message::Message;
 use crate::plugins::{PluginMetadata, PluginType};
 use crate::ui::theme::*;
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, slider, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 use uuid::Uuid;
+
+// ============================================================================
+// FX BUTTON
+// ============================================================================
 
 /// Create an "FX" button for opening the plugin chain panel.
 /// Shows the number of active plugins if any.
@@ -27,21 +32,31 @@ pub fn fx_button<'a>(channel_id: Uuid, plugin_count: usize) -> Element<'a, Messa
 
     let has_plugins = plugin_count > 0;
 
-    button(text(label).size(11))
-        .padding([4, 8])
+    button(text(label).size(TEXT_SMALL))
+        .padding([SPACING_XS, SPACING_SM])
         .style(move |_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             let bg_color = if has_plugins {
-                if is_hovered { ACCENT } else { PRIMARY }
+                if is_hovered {
+                    lighten(ACCENT, 0.15)
+                } else {
+                    ACCENT
+                }
+            } else if is_hovered {
+                SURFACE_LIGHT
             } else {
-                if is_hovered { SURFACE_LIGHT } else { SURFACE }
+                SURFACE
             };
             button::Style {
                 background: Some(Background::Color(bg_color)),
-                text_color: TEXT,
+                text_color: if has_plugins {
+                    SOOTMIX_DARK.canvas
+                } else {
+                    TEXT
+                },
                 border: Border::default()
-                    .rounded(BORDER_RADIUS_SMALL)
-                    .color(if has_plugins { PRIMARY } else { SURFACE_LIGHT })
+                    .rounded(RADIUS_SM)
+                    .color(if has_plugins { ACCENT } else { SURFACE_LIGHT })
                     .width(1.0),
                 ..button::Style::default()
             }
@@ -49,6 +64,10 @@ pub fn fx_button<'a>(channel_id: Uuid, plugin_count: usize) -> Element<'a, Messa
         .on_press(Message::OpenPluginBrowser(channel_id))
         .into()
 }
+
+// ============================================================================
+// PLUGIN SLOT
+// ============================================================================
 
 /// Create a plugin slot widget showing a single plugin in the chain.
 pub fn plugin_slot<'a>(
@@ -59,13 +78,13 @@ pub fn plugin_slot<'a>(
     slot_index: usize,
     total_slots: usize,
 ) -> Element<'a, Message> {
-    // Plugin name (clickable to open editor)
+    // Plugin name button (opens editor)
     let name_button = button(
-        text(truncate_name(plugin_name, 12))
-            .size(11)
+        text(truncate_name(plugin_name, 14))
+            .size(TEXT_SMALL)
             .color(if bypassed { TEXT_DIM } else { TEXT }),
     )
-    .padding([4, 6])
+    .padding([SPACING_XS, SPACING_SM])
     .style(move |_theme: &Theme, status| {
         let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         button::Style {
@@ -75,15 +94,15 @@ pub fn plugin_slot<'a>(
                 Color::TRANSPARENT
             })),
             text_color: if bypassed { TEXT_DIM } else { TEXT },
-            border: Border::default().rounded(BORDER_RADIUS_SMALL),
+            border: Border::default().rounded(RADIUS_SM),
             ..button::Style::default()
         }
     })
     .on_press(Message::OpenPluginEditor(channel_id, instance_id));
 
     // Bypass button
-    let bypass_button = button(text(if bypassed { "B" } else { "." }).size(10))
-        .padding([2, 6])
+    let bypass_button = button(text(if bypassed { "B" } else { "\u{2022}" }).size(TEXT_CAPTION))
+        .padding([SPACING_XS, SPACING_SM])
         .style(move |_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
@@ -95,18 +114,19 @@ pub fn plugin_slot<'a>(
                     Color::TRANSPARENT
                 })),
                 text_color: if bypassed { TEXT } else { TEXT_DIM },
-                border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                border: Border::default().rounded(RADIUS_SM),
                 ..button::Style::default()
             }
         })
         .on_press(Message::TogglePluginBypass(channel_id, instance_id));
 
-    // Move up button (disabled if first)
+    // Move up button
     let up_button: Element<'a, Message> = if slot_index > 0 {
-        button(text("^").size(10))
-            .padding([2, 4])
+        button(text("\u{2191}").size(TEXT_CAPTION)) // up arrow
+            .padding([SPACING_XS, SPACING_XS])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(if is_hovered {
                         SURFACE_LIGHT
@@ -124,12 +144,13 @@ pub fn plugin_slot<'a>(
         Space::new().width(20).into()
     };
 
-    // Move down button (disabled if last)
+    // Move down button
     let down_button: Element<'a, Message> = if slot_index < total_slots - 1 {
-        button(text("v").size(10))
-            .padding([2, 4])
+        button(text("\u{2193}").size(TEXT_CAPTION)) // down arrow
+            .padding([SPACING_XS, SPACING_XS])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(if is_hovered {
                         SURFACE_LIGHT
@@ -148,17 +169,17 @@ pub fn plugin_slot<'a>(
     };
 
     // Remove button
-    let remove_button = button(text("x").size(10))
-        .padding([2, 4])
+    let remove_button = button(text("\u{00D7}").size(TEXT_CAPTION))
+        .padding([SPACING_XS, SPACING_XS])
         .style(|_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
                 background: Some(Background::Color(if is_hovered {
-                    MUTED_COLOR
+                    Color { a: 0.2, ..MUTED_COLOR }
                 } else {
                     Color::TRANSPARENT
                 })),
-                text_color: if is_hovered { TEXT } else { TEXT_DIM },
+                text_color: if is_hovered { MUTED_COLOR } else { TEXT_DIM },
                 border: Border::default(),
                 ..button::Style::default()
             }
@@ -173,25 +194,29 @@ pub fn plugin_slot<'a>(
         down_button,
         remove_button,
     ]
-    .spacing(2)
+    .spacing(SPACING_XS)
     .align_y(Alignment::Center);
 
     container(slot_content)
-        .padding([4, 6])
+        .padding([SPACING_XS, SPACING_SM])
         .style(move |_theme: &Theme| container::Style {
-            background: Some(Background::Color(if bypassed {
-                SURFACE
-            } else {
-                SURFACE_LIGHT
-            })),
+            background: Some(Background::Color(if bypassed { SURFACE } else { SURFACE_LIGHT })),
             border: Border::default()
-                .rounded(BORDER_RADIUS_SMALL)
-                .color(if bypassed { SURFACE_LIGHT } else { PRIMARY })
+                .rounded(RADIUS_SM)
+                .color(if bypassed {
+                    SOOTMIX_DARK.border_subtle
+                } else {
+                    PRIMARY
+                })
                 .width(1.0),
             ..container::Style::default()
         })
         .into()
 }
+
+// ============================================================================
+// PLUGIN CHAIN PANEL
+// ============================================================================
 
 /// Create the plugin chain panel showing all plugins for a channel.
 pub fn plugin_chain_panel(
@@ -199,23 +224,25 @@ pub fn plugin_chain_panel(
     channel_name: &str,
     plugins: Vec<(Uuid, String, bool)>, // (instance_id, name, bypassed)
 ) -> Element<'static, Message> {
+    // Header
     let header = row![
-        text(format!("{} - Plugin Chain", channel_name))
-            .size(14)
+        text(format!("{} \u{2014} FX Chain", channel_name))
+            .size(TEXT_HEADING)
             .color(TEXT),
         Space::new().width(Length::Fill),
-        button(text("x").size(14))
-            .padding([2, 6])
+        button(text("\u{00D7}").size(TEXT_HEADING))
+            .padding([SPACING_XS, SPACING_SM])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(if is_hovered {
-                        MUTED_COLOR
+                        Color { a: 0.15, ..MUTED_COLOR }
                     } else {
                         Color::TRANSPARENT
                     })),
                     text_color: TEXT_DIM,
-                    border: Border::default(),
+                    border: Border::default().rounded(RADIUS_SM),
                     ..button::Style::default()
                 }
             })
@@ -234,29 +261,32 @@ pub fn plugin_chain_panel(
         .collect();
 
     let slots_column = if plugin_slots.is_empty() {
-        column![text("No plugins").size(11).color(TEXT_DIM)]
-            .align_x(Alignment::Center)
+        column![text("No plugins").size(TEXT_SMALL).color(TEXT_DIM)].align_x(Alignment::Center)
     } else {
-        column(plugin_slots).spacing(4)
+        column(plugin_slots).spacing(SPACING_XS)
     };
 
     // Add plugin button
     let add_button = button(
         row![
-            text("+").size(14),
-            Space::new().width(4),
-            text("Add Plugin").size(11),
+            text("+").size(TEXT_HEADING),
+            Space::new().width(SPACING_XS),
+            text("Add Plugin").size(TEXT_SMALL),
         ]
         .align_y(Alignment::Center),
     )
-    .padding([6, 12])
+    .padding([SPACING_SM, SPACING])
     .style(|_theme: &Theme, status| {
         let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         button::Style {
-            background: Some(Background::Color(if is_hovered { PRIMARY } else { SURFACE_LIGHT })),
-            text_color: TEXT,
+            background: Some(Background::Color(if is_hovered {
+                PRIMARY
+            } else {
+                SURFACE_LIGHT
+            })),
+            text_color: if is_hovered { SOOTMIX_DARK.canvas } else { TEXT },
             border: Border::default()
-                .rounded(BORDER_RADIUS_SMALL)
+                .rounded(RADIUS_SM)
                 .color(PRIMARY)
                 .width(1.0),
             ..button::Style::default()
@@ -264,56 +294,70 @@ pub fn plugin_chain_panel(
     })
     .on_press(Message::OpenPluginBrowser(channel_id));
 
+    // Divider
+    let divider = container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+            ..container::Style::default()
+        });
+
     let content = column![
         header,
-        Space::new().height(SPACING),
-        container(Space::new().height(1))
-            .width(Length::Fill)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(SURFACE_LIGHT)),
-                ..container::Style::default()
-            }),
-        Space::new().height(SPACING),
+        Space::new().height(SPACING_SM),
+        divider,
+        Space::new().height(SPACING_SM),
         scrollable(slots_column).height(Length::Fixed(200.0)),
-        Space::new().height(SPACING),
+        Space::new().height(SPACING_SM),
         container(add_button).center_x(Length::Fill),
     ]
     .padding(PADDING)
-    .spacing(SPACING_SMALL);
+    .spacing(SPACING_XS);
 
     container(content)
-        .width(Length::Fixed(280.0))
+        .width(Length::Fixed(300.0))
         .style(|_theme: &Theme| container::Style {
             background: Some(Background::Color(BACKGROUND)),
             border: Border::default()
-                .rounded(BORDER_RADIUS)
+                .rounded(RADIUS)
                 .color(PRIMARY)
                 .width(1.0),
+            shadow: iced::Shadow {
+                color: Color { a: 0.3, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
             ..container::Style::default()
         })
         .into()
 }
+
+// ============================================================================
+// PLUGIN BROWSER
+// ============================================================================
 
 /// Create the plugin browser modal for selecting plugins to add.
 pub fn plugin_browser(
     channel_id: Uuid,
     available_plugins: Vec<PluginMetadata>,
 ) -> Element<'static, Message> {
+    // Header
     let header = row![
-        text("Add Plugin").size(16).color(TEXT),
+        text("Add Plugin").size(TEXT_HEADING).color(TEXT),
         Space::new().width(Length::Fill),
-        button(text("x").size(14))
-            .padding([2, 6])
+        button(text("\u{00D7}").size(TEXT_HEADING))
+            .padding([SPACING_XS, SPACING_SM])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(if is_hovered {
-                        MUTED_COLOR
+                        Color { a: 0.15, ..MUTED_COLOR }
                     } else {
                         Color::TRANSPARENT
                     })),
                     text_color: TEXT_DIM,
-                    border: Border::default(),
+                    border: Border::default().rounded(RADIUS_SM),
                     ..button::Style::default()
                 }
             })
@@ -323,18 +367,16 @@ pub fn plugin_browser(
 
     // Plugin list
     let plugin_items: Vec<Element<Message>> = if available_plugins.is_empty() {
-        vec![
-            column![
-                text("No plugins found").size(12).color(TEXT_DIM),
-                Space::new().height(8),
-                text("Place .so plugins in:").size(10).color(TEXT_DIM),
-                text("~/.local/share/sootmix/plugins/native/")
-                    .size(9)
-                    .color(TEXT_DIM),
-            ]
-            .align_x(Alignment::Center)
-            .into(),
+        vec![column![
+            text("No plugins found").size(TEXT_SMALL).color(TEXT_DIM),
+            Space::new().height(SPACING_SM),
+            text("Place plugins in:").size(TEXT_CAPTION).color(TEXT_DIM),
+            text("~/.local/share/sootmix/plugins/")
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM),
         ]
+        .align_x(Alignment::Center)
+        .into()]
     } else {
         available_plugins
             .iter()
@@ -342,31 +384,39 @@ pub fn plugin_browser(
             .collect()
     };
 
-    let plugin_list = scrollable(column(plugin_items).spacing(4)).height(Length::Fixed(300.0));
+    let plugin_list = scrollable(column(plugin_items).spacing(SPACING_XS)).height(Length::Fixed(300.0));
+
+    // Divider
+    let divider = container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+            ..container::Style::default()
+        });
 
     let content = column![
         header,
-        Space::new().height(SPACING),
-        container(Space::new().height(1))
-            .width(Length::Fill)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(SURFACE_LIGHT)),
-                ..container::Style::default()
-            }),
-        Space::new().height(SPACING),
+        Space::new().height(SPACING_SM),
+        divider,
+        Space::new().height(SPACING_SM),
         plugin_list,
     ]
     .padding(PADDING)
-    .spacing(SPACING_SMALL);
+    .spacing(SPACING_XS);
 
     container(content)
         .width(Length::Fixed(350.0))
         .style(|_theme: &Theme| container::Style {
             background: Some(Background::Color(BACKGROUND)),
             border: Border::default()
-                .rounded(BORDER_RADIUS)
-                .color(PRIMARY)
+                .rounded(RADIUS)
+                .color(ACCENT)
                 .width(2.0),
+            shadow: iced::Shadow {
+                color: Color { a: 0.3, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
             ..container::Style::default()
         })
         .into()
@@ -403,21 +453,42 @@ fn plugin_browser_item(channel_id: Uuid, meta: &PluginMetadata) -> Element<'stat
         PluginType::Vst3 => "VST3",
     };
 
+    // Type badge color
+    let badge_color = match meta.plugin_type {
+        PluginType::Native => PRIMARY,
+        PluginType::Wasm => WARNING,
+        PluginType::Builtin => SUCCESS,
+        #[cfg(feature = "lv2-plugins")]
+        PluginType::Lv2 => ACCENT,
+        #[cfg(feature = "vst3-plugins")]
+        PluginType::Vst3 => ACCENT,
+    };
+
     let plugin_id_clone = plugin_id.clone();
-    let detail_text = format!("{} - {}", vendor, type_label);
 
     button(
         row![
             column![
-                text(name).size(12).color(TEXT),
-                text(detail_text).size(9).color(TEXT_DIM),
+                text(name).size(TEXT_SMALL).color(TEXT),
+                row![
+                    text(vendor).size(TEXT_CAPTION).color(TEXT_DIM),
+                    Space::new().width(SPACING_SM),
+                    container(text(type_label).size(TEXT_CAPTION).color(TEXT))
+                        .padding([1, SPACING_XS as u16])
+                        .style(move |_theme: &Theme| container::Style {
+                            background: Some(Background::Color(Color { a: 0.2, ..badge_color })),
+                            border: Border::default().rounded(2.0),
+                            ..container::Style::default()
+                        }),
+                ]
+                .align_y(Alignment::Center),
             ]
-            .spacing(2),
+            .spacing(SPACING_XS),
             Space::new().width(Length::Fill),
-            text("+").size(14).color(PRIMARY),
+            text("+").size(TEXT_HEADING).color(PRIMARY),
         ]
         .align_y(Alignment::Center)
-        .padding([4, 8]),
+        .padding([SPACING_XS, SPACING_SM]),
     )
     .padding(0)
     .width(Length::Fill)
@@ -431,8 +502,12 @@ fn plugin_browser_item(channel_id: Uuid, meta: &PluginMetadata) -> Element<'stat
             })),
             text_color: TEXT,
             border: Border::default()
-                .rounded(BORDER_RADIUS_SMALL)
-                .color(if is_hovered { PRIMARY } else { SURFACE_LIGHT })
+                .rounded(RADIUS_SM)
+                .color(if is_hovered {
+                    PRIMARY
+                } else {
+                    SOOTMIX_DARK.border_subtle
+                })
                 .width(1.0),
             ..button::Style::default()
         }
@@ -441,14 +516,9 @@ fn plugin_browser_item(channel_id: Uuid, meta: &PluginMetadata) -> Element<'stat
     .into()
 }
 
-/// Truncate a plugin name for display.
-fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
-        name.to_string()
-    } else {
-        format!("{}...", &name[..max_len.saturating_sub(3)])
-    }
-}
+// ============================================================================
+// PLUGIN EDITOR
+// ============================================================================
 
 /// Parameter info for the plugin editor UI.
 pub struct PluginEditorParam {
@@ -472,25 +542,25 @@ pub fn plugin_editor(
     plugin_name: &str,
     params: Vec<PluginEditorParam>,
 ) -> Element<'static, Message> {
-    let _instance_id_for_close = instance_id;
-
+    // Header
     let header = row![
-        text(format!("{} - Parameters", plugin_name))
-            .size(14)
+        text(format!("{} \u{2014} Parameters", plugin_name))
+            .size(TEXT_HEADING)
             .color(TEXT),
         Space::new().width(Length::Fill),
-        button(text("x").size(14))
-            .padding([2, 6])
+        button(text("\u{00D7}").size(TEXT_HEADING))
+            .padding([SPACING_XS, SPACING_SM])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(if is_hovered {
-                        MUTED_COLOR
+                        Color { a: 0.15, ..MUTED_COLOR }
                     } else {
                         Color::TRANSPARENT
                     })),
                     text_color: TEXT_DIM,
-                    border: Border::default(),
+                    border: Border::default().rounded(RADIUS_SM),
                     ..button::Style::default()
                 }
             })
@@ -500,7 +570,7 @@ pub fn plugin_editor(
 
     // Parameter sliders
     let param_elements: Vec<Element<Message>> = if params.is_empty() {
-        vec![text("No parameters").size(11).color(TEXT_DIM).into()]
+        vec![text("No parameters").size(TEXT_SMALL).color(TEXT_DIM).into()]
     } else {
         params
             .into_iter()
@@ -508,31 +578,39 @@ pub fn plugin_editor(
             .collect()
     };
 
-    let params_column = column(param_elements).spacing(8);
+    let params_column = column(param_elements).spacing(SPACING_SM);
+
+    // Divider
+    let divider = container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+            ..container::Style::default()
+        });
 
     let content = column![
         header,
-        Space::new().height(SPACING),
-        container(Space::new().height(1))
-            .width(Length::Fill)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(SURFACE_LIGHT)),
-                ..container::Style::default()
-            }),
-        Space::new().height(SPACING),
+        Space::new().height(SPACING_SM),
+        divider,
+        Space::new().height(SPACING_SM),
         scrollable(params_column).height(Length::Fixed(300.0)),
     ]
     .padding(PADDING)
-    .spacing(SPACING_SMALL);
+    .spacing(SPACING_XS);
 
     container(content)
-        .width(Length::Fixed(300.0))
+        .width(Length::Fixed(320.0))
         .style(|_theme: &Theme| container::Style {
             background: Some(Background::Color(BACKGROUND)),
             border: Border::default()
-                .rounded(BORDER_RADIUS)
-                .color(ACCENT)
+                .rounded(RADIUS)
+                .color(SOOTMIX_DARK.accent_warm)
                 .width(2.0),
+            shadow: iced::Shadow {
+                color: Color { a: 0.3, ..Color::BLACK },
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
             ..container::Style::default()
         })
         .into()
@@ -540,8 +618,6 @@ pub fn plugin_editor(
 
 /// Create a parameter slider widget.
 fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'static, Message> {
-    use iced::widget::slider;
-
     let param_index = param.index;
     let display_value = if param.unit.is_empty() {
         format!("{:.2}", param.value)
@@ -549,8 +625,8 @@ fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'sta
         format!("{:.2} {}", param.value, param.unit)
     };
 
-    let name_text = text(param.name).size(11).color(TEXT);
-    let value_text = text(display_value).size(10).color(TEXT_DIM);
+    let name_text = text(param.name).size(TEXT_SMALL).color(TEXT);
+    let value_text = text(display_value).size(TEXT_CAPTION).color(TEXT_DIM);
 
     let slider_widget = slider(param.min..=param.max, param.value, move |v| {
         Message::PluginParameterChanged(instance_id, param_index, v)
@@ -560,14 +636,14 @@ fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'sta
     .style(|_theme: &Theme, _status| slider::Style {
         rail: slider::Rail {
             backgrounds: (
-                Background::Color(ACCENT),
+                Background::Color(SOOTMIX_DARK.accent_warm),
                 Background::Color(SLIDER_TRACK),
             ),
             width: 4.0,
             border: Border::default().rounded(2.0),
         },
         handle: slider::Handle {
-            shape: slider::HandleShape::Circle { radius: 6.0 },
+            shape: slider::HandleShape::Circle { radius: 7.0 },
             background: Background::Color(TEXT),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
@@ -578,6 +654,28 @@ fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'sta
         row![name_text, Space::new().width(Length::Fill), value_text,].align_y(Alignment::Center),
         slider_widget,
     ]
-    .spacing(4)
+    .spacing(SPACING_XS)
     .into()
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/// Truncate a plugin name for display.
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if name.len() <= max_len {
+        name.to_string()
+    } else {
+        format!("{}...", &name[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Lighten a color by a factor (0.0-1.0).
+fn lighten(color: Color, factor: f32) -> Color {
+    Color::from_rgb(
+        (color.r + (1.0 - color.r) * factor).min(1.0),
+        (color.g + (1.0 - color.g) * factor).min(1.0),
+        (color.b + (1.0 - color.b) * factor).min(1.0),
+    )
 }

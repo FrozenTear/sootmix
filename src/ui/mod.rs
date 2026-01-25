@@ -6,11 +6,14 @@
 
 pub mod apps_panel;
 pub mod channel_strip;
+pub mod focus_panel;
+pub mod layout_drafts;
 pub mod meter;
 pub mod plugin_chain;
 pub mod routing_rules_panel;
 pub mod theme;
 
+pub use focus_panel::{focus_panel, focus_panel_empty, FocusPluginInfo, FOCUS_PANEL_WIDTH};
 pub use meter::{vu_meter, METER_WIDTH};
 pub use plugin_chain::{fx_button, plugin_browser, plugin_chain_panel, plugin_editor, PluginEditorParam};
 pub use theme::THEME_PALETTE;

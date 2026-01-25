@@ -566,6 +566,20 @@ impl PluginManager {
         instances.get(&id).map(|i| i.get_parameter(index))
     }
 
+    /// Get all parameter info for a plugin instance.
+    pub fn get_parameters(&self, id: Uuid) -> Vec<sootmix_plugin_api::ParameterInfo> {
+        let instances = self.instances.lock().unwrap();
+        instances
+            .get(&id)
+            .map(|i| {
+                let count = i.parameter_count();
+                (0..count)
+                    .filter_map(|idx| i.parameter_info(idx))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Set parameter value for a plugin instance.
     ///
     /// This acquires a lock. For RT-safe parameter updates, use

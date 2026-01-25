@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use sootmix_plugin_api::{PluginCategory, PluginInfo};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 /// Metadata about a discovered plugin (before loading).
 #[derive(Debug, Clone)]
@@ -234,6 +235,11 @@ pub struct PluginSlotConfig {
     /// Used to locate and load external plugins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// Sidechain source channel ID for sidechain-aware plugins.
+    /// When set, the host will send the source channel's meter level
+    /// to any parameter with SidechainLevel hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain_source: Option<Uuid>,
 }
 
 impl PluginSlotConfig {
@@ -245,6 +251,7 @@ impl PluginSlotConfig {
             bypassed: false,
             parameters: HashMap::new(),
             external_id: None,
+            sidechain_source: None,
         }
     }
 
@@ -260,6 +267,7 @@ impl PluginSlotConfig {
             bypassed: false,
             parameters: HashMap::new(),
             external_id: Some(external_id.into()),
+            sidechain_source: None,
         }
     }
 }

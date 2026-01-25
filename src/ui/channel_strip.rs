@@ -3,6 +3,14 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! Channel strip UI component.
+//!
+//! Professional mixer channel strip with:
+//! - Volume fader with dynamic level coloring
+//! - Stereo VU meter
+//! - Mute, EQ, and FX controls
+//! - App assignment display
+//! - Per-channel output routing
+//! - Drop target for drag-and-drop routing
 
 use crate::audio::types::OutputDevice;
 use crate::message::Message;
@@ -10,18 +18,32 @@ use crate::state::{MeterDisplayState, MixerChannel};
 use crate::ui::meter::vu_meter;
 use crate::ui::plugin_chain::fx_button;
 use crate::ui::theme::{self, *};
-use iced::widget::{button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space};
+use iced::widget::{
+    button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space,
+};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
 
+// ============================================================================
+// CHANNEL STRIP
+// ============================================================================
+
 /// Create a channel strip widget for a mixer channel.
-/// `editing` is Some((channel_id, current_text)) if this channel's name is being edited.
-/// `has_active_snapshot` indicates whether there's an active snapshot to save to.
+///
+/// # Arguments
+/// * `channel` - The mixer channel data
+/// * `dragging` - Currently dragged app (if any)
+/// * `editing` - Channel being edited (id, current text)
+/// * `has_active_snapshot` - Whether there's an active snapshot for save button
+/// * `available_outputs` - List of available output devices
+/// * `is_selected` - Whether this channel is currently selected for the focus panel
 pub fn channel_strip<'a>(
     channel: &'a MixerChannel,
     dragging: Option<&'a (u32, String)>,
     editing: Option<&'a (Uuid, String)>,
     has_active_snapshot: bool,
+    available_outputs: &'a [OutputDevice],
+    is_selected: bool,
 ) -> Element<'a, Message> {
     let id = channel.id;
     let volume_db = channel.volume_db;
@@ -30,21 +52,25 @@ pub fn channel_strip<'a>(
     let name = channel.name.clone();
     let assigned_apps = channel.assigned_apps.clone();
     let is_drop_target = dragging.is_some();
+    let output_device_name = channel.output_device_name.clone();
 
     // Check if this channel is being edited
     let is_editing = editing.map(|(eid, _)| *eid == id).unwrap_or(false);
 
-    // Channel name - either text input (editing) or clickable text
+    // === CHANNEL NAME ===
     let name_element: Element<Message> = if is_editing {
         let edit_value = editing.map(|(_, v)| v.clone()).unwrap_or_default();
         text_input("Channel name", &edit_value)
             .on_input(Message::ChannelNameEditChanged)
             .on_submit(Message::ChannelRenamed(id, edit_value.clone()))
-            .size(13)
+            .size(TEXT_BODY)
             .width(Length::Fill)
             .style(|_theme: &Theme, _status| text_input::Style {
                 background: Background::Color(SURFACE_LIGHT),
-                border: Border::default().rounded(BORDER_RADIUS_SMALL).color(PRIMARY).width(1.0),
+                border: Border::default()
+                    .rounded(RADIUS_SM)
+                    .color(PRIMARY)
+                    .width(2.0),
                 icon: TEXT,
                 placeholder: TEXT_DIM,
                 value: TEXT,
@@ -52,14 +78,18 @@ pub fn channel_strip<'a>(
             })
             .into()
     } else {
-        button(text(name.clone()).size(14).color(TEXT))
-            .padding([2, 4])
+        button(text(name.clone()).size(TEXT_BODY).color(TEXT))
+            .padding([SPACING_XS, SPACING_SM])
             .style(|_theme: &Theme, status| {
                 let is_hovered = matches!(status, button::Status::Hovered);
                 button::Style {
-                    background: Some(Background::Color(if is_hovered { SURFACE_LIGHT } else { Color::TRANSPARENT })),
+                    background: Some(Background::Color(if is_hovered {
+                        SURFACE_LIGHT
+                    } else {
+                        Color::TRANSPARENT
+                    })),
                     text_color: TEXT,
-                    border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                    border: Border::default().rounded(RADIUS_SM),
                     ..button::Style::default()
                 }
             })
@@ -67,90 +97,125 @@ pub fn channel_strip<'a>(
             .into()
     };
 
-    // EQ button
-    let eq_button = button(text("EQ").size(11))
-        .padding([4, 8])
-        .style(move |theme: &Theme, status| {
+    // === EQ BUTTON ===
+    let eq_button = button(text("EQ").size(TEXT_SMALL))
+        .padding([SPACING_XS, SPACING_SM])
+        .style(move |_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             let bg_color = if eq_enabled {
-                PRIMARY
-            } else {
+                if is_hovered {
+                    lighten(PRIMARY, 0.15)
+                } else {
+                    PRIMARY
+                }
+            } else if is_hovered {
                 SURFACE_LIGHT
+            } else {
+                SURFACE
             };
             button::Style {
                 background: Some(Background::Color(bg_color)),
-                text_color: TEXT,
-                border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                text_color: if eq_enabled {
+                    SOOTMIX_DARK.canvas
+                } else {
+                    TEXT
+                },
+                border: Border::default()
+                    .rounded(RADIUS_SM)
+                    .color(if eq_enabled { PRIMARY } else { SURFACE_LIGHT })
+                    .width(1.0),
                 ..button::Style::default()
             }
         })
         .on_press(Message::ChannelEqToggled(id));
 
-    // Volume slider (vertical)
+    // === VOLUME SLIDER ===
     let volume_slider = vertical_slider(-60.0..=12.0, volume_db, move |v| {
         Message::ChannelVolumeChanged(id, v)
     })
     .step(0.5)
     .height(VOLUME_SLIDER_HEIGHT)
     .on_release(Message::ChannelVolumeReleased(id))
-    .style(move |theme: &Theme, status| {
-        slider::Style {
-            rail: slider::Rail {
-                backgrounds: (
-                    Background::Color(theme::db_to_color(volume_db)),
-                    Background::Color(SLIDER_TRACK),
-                ),
-                width: 8.0,
-                border: Border::default().rounded(4.0),
+    .style(move |_theme: &Theme, _status| slider::Style {
+        rail: slider::Rail {
+            backgrounds: (
+                Background::Color(theme::db_to_color(volume_db)),
+                Background::Color(SLIDER_TRACK),
+            ),
+            width: 10.0,
+            border: Border::default().rounded(5.0),
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Rectangle {
+                width: 24,
+                border_radius: RADIUS_SM.into(),
             },
-            handle: slider::Handle {
-                shape: slider::HandleShape::Rectangle {
-                    width: 20,
-                    border_radius: 3.0.into(),
-                },
-                background: Background::Color(if muted { MUTED_COLOR } else { TEXT }),
-                border_width: 0.0,
-                border_color: Color::TRANSPARENT,
-            },
-        }
+            background: Background::Color(if muted { MUTED_COLOR } else { TEXT }),
+            border_width: 0.0,
+            border_color: Color::TRANSPARENT,
+        },
     });
 
-    // VU meter
+    // === VU METER ===
     let meter = vu_meter(&channel.meter_display, VOLUME_SLIDER_HEIGHT);
 
-    // Volume display
-    let volume_text = text(theme::format_db(volume_db))
-        .size(12)
-        .color(if muted { TEXT_DIM } else { TEXT });
+    // === VOLUME DISPLAY ===
+    let volume_text = container(
+        text(theme::format_db(volume_db))
+            .size(TEXT_SMALL)
+            .color(if muted { TEXT_DIM } else { TEXT }),
+    )
+    .padding([SPACING_XS, SPACING_SM])
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border::default().rounded(RADIUS_SM),
+        ..container::Style::default()
+    });
 
-    // Mute button
-    let mute_icon = if muted { "M" } else { "S" }; // M for muted, S for sound
-    let mute_button = button(text(mute_icon).size(14))
-        .padding([6, 10])
-        .style(move |_theme: &Theme, _status| {
+    // === MUTE BUTTON ===
+    let mute_icon = if muted { "M" } else { "S" };
+    let mute_button = button(text(mute_icon).size(TEXT_BODY))
+        .padding([SPACING_SM, SPACING])
+        .style(move |_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             let bg_color = if muted {
-                MUTED_COLOR
-            } else {
+                if is_hovered {
+                    lighten(MUTED_COLOR, 0.15)
+                } else {
+                    MUTED_COLOR
+                }
+            } else if is_hovered {
                 SURFACE_LIGHT
+            } else {
+                SURFACE
             };
             button::Style {
                 background: Some(Background::Color(bg_color)),
                 text_color: TEXT,
-                border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                border: Border::default().rounded(RADIUS_SM),
                 ..button::Style::default()
             }
         })
         .on_press(Message::ChannelMuteToggled(id));
 
-    // Save to snapshot button (checkmark) - only shown when there's an active snapshot
+    // === SAVE TO SNAPSHOT BUTTON ===
     let save_button: Element<Message> = if has_active_snapshot {
-        button(text("✓").size(12))
-            .padding([4, 8])
+        button(text("\u{2713}").size(TEXT_SMALL)) // checkmark
+            .padding([SPACING_XS, SPACING_SM])
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
-                    background: Some(Background::Color(if is_hovered { SUCCESS } else { SURFACE_LIGHT })),
+                    background: Some(Background::Color(if is_hovered {
+                        SUCCESS
+                    } else {
+                        SURFACE
+                    })),
                     text_color: if is_hovered { TEXT } else { SUCCESS },
-                    border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                    border: Border::default()
+                        .rounded(RADIUS_SM)
+                        .color(SUCCESS)
+                        .width(1.0),
                     ..button::Style::default()
                 }
             })
@@ -160,149 +225,216 @@ pub fn channel_strip<'a>(
         Space::new().width(0).height(0).into()
     };
 
-    // Assigned apps list or drop indicator
+    // === ASSIGNED APPS LIST ===
     let apps_list: Element<Message> = if is_drop_target {
-        // Show assignment indicator when in assign mode
-        column![
-            text("+ Assign")
-                .size(12)
-                .color(ACCENT),
-        ]
-        .align_x(Alignment::Center)
+        container(
+            text("+ Drop here")
+                .size(TEXT_SMALL)
+                .color(SOOTMIX_DARK.accent_warm),
+        )
+        .padding(SPACING_SM)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.1,
+                ..SOOTMIX_DARK.accent_warm
+            })),
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(SOOTMIX_DARK.accent_warm)
+                .width(1.0),
+            ..container::Style::default()
+        })
         .into()
     } else if assigned_apps.is_empty() {
-        text("No apps")
-            .size(10)
-            .color(TEXT_DIM)
-            .into()
+        text("No apps").size(TEXT_CAPTION).color(TEXT_DIM).into()
     } else {
-        // Create clickable buttons for each assigned app
         let app_buttons: Vec<Element<Message>> = assigned_apps
             .iter()
             .take(3)
             .map(|app_id| {
                 let app_id_clone = app_id.clone();
-                button(
-                    text(format!("× {}", truncate_string(app_id, 8)))
-                        .size(9)
-                )
-                .padding([2, 4])
-                .style(|_theme: &Theme, status| {
-                    let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-                    button::Style {
-                        background: Some(Background::Color(if is_hovered { MUTED_COLOR } else { SURFACE_LIGHT })),
-                        text_color: if is_hovered { TEXT } else { TEXT_DIM },
-                        border: Border::default().rounded(BORDER_RADIUS_SMALL),
-                        ..button::Style::default()
-                    }
-                })
-                .on_press(Message::AppUnassigned(id, app_id_clone))
-                .into()
+                button(text(format!("\u{00D7} {}", truncate_string(app_id, 8))).size(TEXT_CAPTION))
+                    .padding([SPACING_XS, SPACING_SM])
+                    .style(|_theme: &Theme, status| {
+                        let is_hovered =
+                            matches!(status, button::Status::Hovered | button::Status::Pressed);
+                        button::Style {
+                            background: Some(Background::Color(if is_hovered {
+                                Color {
+                                    a: 0.2,
+                                    ..MUTED_COLOR
+                                }
+                            } else {
+                                SURFACE
+                            })),
+                            text_color: if is_hovered { TEXT } else { TEXT_DIM },
+                            border: Border::default().rounded(RADIUS_SM),
+                            ..button::Style::default()
+                        }
+                    })
+                    .on_press(Message::AppUnassigned(id, app_id_clone))
+                    .into()
             })
             .collect();
 
         column(app_buttons)
-            .spacing(2)
+            .spacing(SPACING_XS)
             .align_x(Alignment::Center)
             .into()
     };
 
-    // Delete button
-    let delete_button = button(text("×").size(14))
-        .padding([2, 6])
-        .style(|theme: &Theme, status| {
+    // === DELETE BUTTON ===
+    let delete_button = button(text("\u{00D7}").size(TEXT_BODY).color(TEXT_DIM))
+        .padding([SPACING_XS, SPACING_SM])
+        .style(|_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
-                background: Some(Background::Color(Color::TRANSPARENT)),
-                text_color: TEXT_DIM,
-                border: Border::default(),
+                background: Some(Background::Color(if is_hovered {
+                    Color {
+                        a: 0.15,
+                        ..MUTED_COLOR
+                    }
+                } else {
+                    Color::TRANSPARENT
+                })),
+                text_color: if is_hovered { MUTED_COLOR } else { TEXT_DIM },
+                border: Border::default().rounded(RADIUS_SM),
                 ..button::Style::default()
             }
         })
         .on_press(Message::ChannelDeleted(id));
 
-    // Slider and meter row
-    let slider_meter_row = row![
-        volume_slider,
-        Space::new().width(SPACING_SMALL),
-        meter,
-    ]
-    .align_y(Alignment::Center);
+    // === SLIDER + METER ROW ===
+    let slider_meter_row = row![volume_slider, Space::new().width(SPACING_SM), meter,]
+        .align_y(Alignment::Center);
 
-    // FX button (plugin chain)
+    // === FX BUTTON ===
     let plugin_count = channel.plugin_chain.len();
     let fx_btn = fx_button(id, plugin_count);
 
-    // Assemble the channel strip
+    // === OUTPUT DEVICE PICKER ===
+    let output_options: Vec<String> = std::iter::once("Default".to_string())
+        .chain(available_outputs.iter().map(|d| d.description.clone()))
+        .collect();
+
+    let selected_output = output_device_name
+        .clone()
+        .or_else(|| Some("Default".to_string()));
+
+    let output_picker: Element<'a, Message> = if available_outputs.is_empty() {
+        Space::new().width(0).height(0).into()
+    } else {
+        column![
+            text("Output").size(TEXT_CAPTION).color(TEXT_DIM),
+            pick_list(output_options, selected_output, move |selection| {
+                let device = if selection == "Default" {
+                    None
+                } else {
+                    Some(selection)
+                };
+                Message::ChannelOutputDeviceChanged(id, device)
+            },)
+                .text_size(TEXT_CAPTION)
+                .padding([SPACING_XS, SPACING_SM])
+                .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
+                .style(|_theme: &Theme, _status| {
+                    pick_list::Style {
+                        text_color: TEXT,
+                        placeholder_color: TEXT_DIM,
+                        handle_color: TEXT_DIM,
+                        background: Background::Color(SURFACE),
+                        border: Border::default()
+                            .rounded(RADIUS_SM)
+                            .color(SOOTMIX_DARK.border_default)
+                            .width(1.0),
+                    }
+                }),
+        ]
+        .spacing(SPACING_XS)
+        .into()
+    };
+
+    // === ASSEMBLE CHANNEL STRIP ===
     let content = column![
-        // Header row with name and delete
-        row![
-            name_element,
-            Space::new().width(Fill),
-            delete_button,
-        ]
-        .align_y(Alignment::Center),
-        Space::new().height(SPACING_SMALL),
-        // EQ and FX buttons row
-        row![
-            eq_button,
-            Space::new().width(SPACING_SMALL),
-            fx_btn,
-        ]
-        .align_y(Alignment::Center),
+        // Header: name + delete
+        row![name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
+        Space::new().height(SPACING_SM),
+        // Controls: EQ + FX
+        row![eq_button, Space::new().width(SPACING_SM), fx_btn,].align_y(Alignment::Center),
         Space::new().height(SPACING),
-        // Volume slider with meter
-        container(slider_meter_row)
-            .center_x(Fill),
-        Space::new().height(SPACING_SMALL),
-        // Volume display
-        volume_text,
-        Space::new().height(SPACING_SMALL),
-        // Mute and save buttons row
-        row![
-            mute_button,
-            Space::new().width(SPACING_SMALL),
-            save_button,
-        ]
-        .align_y(Alignment::Center),
+        // Fader section
+        container(slider_meter_row).center_x(Fill),
+        Space::new().height(SPACING_SM),
+        // Volume readout
+        container(volume_text).center_x(Fill),
+        Space::new().height(SPACING_SM),
+        // Mute + Save
+        row![mute_button, Space::new().width(SPACING_SM), save_button,].align_y(Alignment::Center),
         Space::new().height(SPACING),
-        // Apps list
+        // Apps
         apps_list,
+        Space::new().height(SPACING_SM),
+        // Output picker
+        output_picker,
     ]
     .align_x(Alignment::Center)
     .padding(PADDING)
-    .spacing(SPACING_SMALL);
+    .spacing(SPACING_XS);
 
-    // Wrap in a styled container
+    // === CONTAINER STYLING ===
+    // Border color based on selection and drop target state
+    let border_color = if is_drop_target {
+        SOOTMIX_DARK.accent_warm
+    } else if is_selected {
+        PRIMARY
+    } else {
+        SOOTMIX_DARK.border_subtle
+    };
+    let border_width = if is_drop_target || is_selected { 2.0 } else { 1.0 };
+
     let strip_container = container(content)
         .width(CHANNEL_STRIP_WIDTH)
-        .style(move |_theme: &Theme| {
-            container::Style {
-                background: Some(Background::Color(SURFACE)),
-                border: Border::default()
-                    .rounded(BORDER_RADIUS)
-                    .color(if is_drop_target { PRIMARY } else { SURFACE_LIGHT })
-                    .width(if is_drop_target { 2.0 } else { 1.0 }),
-                ..container::Style::default()
-            }
+        .height(CHANNEL_STRIP_HEIGHT)
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(if is_selected {
+                // Slightly lighter background when selected
+                SURFACE_LIGHT
+            } else {
+                SURFACE
+            })),
+            border: Border::default()
+                .rounded(RADIUS)
+                .color(border_color)
+                .width(border_width),
+            ..container::Style::default()
         });
 
-    // When dragging an app, wrap in a button to accept drops
+    // === DROP TARGET OR SELECTABLE WRAPPER ===
     if is_drop_target {
+        // Drop target mode: click to assign app
         button(strip_container)
             .padding(0)
             .style(|_theme: &Theme, status| {
-                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
                     background: Some(Background::Color(Color::TRANSPARENT)),
                     border: Border::default()
-                        .rounded(BORDER_RADIUS)
-                        .color(if is_hovered { ACCENT } else { PRIMARY })
+                        .rounded(RADIUS)
+                        .color(if is_hovered {
+                            SOOTMIX_DARK.accent_warm
+                        } else {
+                            PRIMARY
+                        })
                         .width(if is_hovered { 3.0 } else { 2.0 }),
                     shadow: if is_hovered {
                         iced::Shadow {
-                            color: Color { a: 0.3, ..ACCENT },
+                            color: Color {
+                                a: 0.4,
+                                ..SOOTMIX_DARK.accent_warm
+                            },
                             offset: iced::Vector::new(0.0, 0.0),
-                            blur_radius: 8.0,
+                            blur_radius: 12.0,
                         }
                     } else {
                         iced::Shadow::default()
@@ -313,156 +445,233 @@ pub fn channel_strip<'a>(
             .on_press(Message::DropAppOnChannel(id))
             .into()
     } else {
-        strip_container.into()
+        // Normal mode: click to select channel for focus panel
+        button(strip_container)
+            .padding(0)
+            .style(move |_theme: &Theme, status| {
+                let is_hovered =
+                    matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(Color::TRANSPARENT)),
+                    border: Border::default()
+                        .rounded(RADIUS)
+                        .color(if is_selected {
+                            PRIMARY
+                        } else if is_hovered {
+                            SOOTMIX_DARK.border_emphasis
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .width(if is_selected { 2.0 } else if is_hovered { 1.0 } else { 0.0 }),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::SelectChannel(Some(id)))
+            .into()
     }
 }
 
+// ============================================================================
+// MASTER STRIP
+// ============================================================================
+
 /// Create a master channel strip widget.
+///
+/// The master strip has a distinctive styling (golden border) and includes
+/// the output device selector.
 pub fn master_strip<'a>(
     volume_db: f32,
     muted: bool,
     available_outputs: &'a [OutputDevice],
     selected_output: Option<&'a str>,
     meter_display: &'a MeterDisplayState,
+    recording_enabled: bool,
 ) -> Element<'a, Message> {
-    // Title
-    let title = text("Master")
-        .size(14)
-        .color(TEXT);
+    // === TITLE ===
+    let title = container(
+        text("MASTER")
+            .size(TEXT_BODY)
+            .color(SOOTMIX_DARK.canvas),
+    )
+    .padding([SPACING_XS, SPACING_SM])
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(SOOTMIX_DARK.accent_warm)),
+        border: Border::default().rounded(RADIUS_SM),
+        ..container::Style::default()
+    });
 
-    // Volume slider
+    // === VOLUME SLIDER ===
     let volume_slider = vertical_slider(-60.0..=12.0, volume_db, Message::MasterVolumeChanged)
         .step(0.5)
         .height(VOLUME_SLIDER_HEIGHT)
         .on_release(Message::MasterVolumeReleased)
-        .style(move |_theme: &Theme, _status| {
-            slider::Style {
-                rail: slider::Rail {
-                    backgrounds: (
-                        Background::Color(theme::db_to_color(volume_db)),
-                        Background::Color(SLIDER_TRACK),
-                    ),
-                    width: 8.0,
-                    border: Border::default().rounded(4.0),
+        .style(move |_theme: &Theme, _status| slider::Style {
+            rail: slider::Rail {
+                backgrounds: (
+                    Background::Color(theme::db_to_color(volume_db)),
+                    Background::Color(SLIDER_TRACK),
+                ),
+                width: 10.0,
+                border: Border::default().rounded(5.0),
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Rectangle {
+                    width: 24,
+                    border_radius: RADIUS_SM.into(),
                 },
-                handle: slider::Handle {
-                    shape: slider::HandleShape::Rectangle {
-                        width: 20,
-                        border_radius: 3.0.into(),
-                    },
-                    background: Background::Color(if muted { MUTED_COLOR } else { PRIMARY }),
-                    border_width: 0.0,
-                    border_color: Color::TRANSPARENT,
-                },
-            }
+                background: Background::Color(if muted {
+                    MUTED_COLOR
+                } else {
+                    SOOTMIX_DARK.accent_warm
+                }),
+                border_width: 0.0,
+                border_color: Color::TRANSPARENT,
+            },
         });
 
-    // VU meter
+    // === VU METER ===
     let meter = vu_meter(meter_display, VOLUME_SLIDER_HEIGHT);
 
-    // Slider and meter row
-    let slider_meter_row = row![
-        volume_slider,
-        Space::new().width(SPACING_SMALL),
-        meter,
-    ]
-    .align_y(Alignment::Center);
+    // === SLIDER + METER ROW ===
+    let slider_meter_row = row![volume_slider, Space::new().width(SPACING_SM), meter,]
+        .align_y(Alignment::Center);
 
-    // Volume display
-    let volume_text = text(theme::format_db(volume_db))
-        .size(12)
-        .color(if muted { TEXT_DIM } else { TEXT });
+    // === VOLUME DISPLAY ===
+    let volume_text = container(
+        text(theme::format_db(volume_db))
+            .size(TEXT_SMALL)
+            .color(if muted { TEXT_DIM } else { TEXT }),
+    )
+    .padding([SPACING_XS, SPACING_SM])
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border::default().rounded(RADIUS_SM),
+        ..container::Style::default()
+    });
 
-    // Mute button
+    // === MUTE BUTTON ===
     let mute_icon = if muted { "M" } else { "S" };
-    let mute_button = button(text(mute_icon).size(14))
-        .padding([6, 10])
-        .style(move |_theme: &Theme, _status| {
+    let mute_button = button(text(mute_icon).size(TEXT_BODY))
+        .padding([SPACING_SM, SPACING])
+        .style(move |_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             let bg_color = if muted {
-                MUTED_COLOR
+                if is_hovered {
+                    lighten(MUTED_COLOR, 0.15)
+                } else {
+                    MUTED_COLOR
+                }
+            } else if is_hovered {
+                lighten(SOOTMIX_DARK.accent_warm, 0.1)
             } else {
-                PRIMARY
+                SOOTMIX_DARK.accent_warm
             };
             button::Style {
                 background: Some(Background::Color(bg_color)),
-                text_color: TEXT,
-                border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                text_color: if muted { TEXT } else { SOOTMIX_DARK.canvas },
+                border: Border::default().rounded(RADIUS_SM),
                 ..button::Style::default()
             }
         })
         .on_press(Message::MasterMuteToggled);
 
-    // Output device picker
+    // === RECORDING TOGGLE ===
+    let rec_label = if recording_enabled { "REC" } else { "rec" };
+    let recording_button = button(text(rec_label).size(TEXT_SMALL))
+        .padding([SPACING_XS, SPACING_SM])
+        .style(move |_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let bg_color = if recording_enabled {
+                if is_hovered {
+                    lighten(MUTED_COLOR, 0.15)
+                } else {
+                    MUTED_COLOR
+                }
+            } else if is_hovered {
+                SURFACE_LIGHT
+            } else {
+                SURFACE
+            };
+            button::Style {
+                background: Some(Background::Color(bg_color)),
+                text_color: if recording_enabled { TEXT } else { TEXT_DIM },
+                border: Border::default()
+                    .rounded(RADIUS_SM)
+                    .color(if recording_enabled { MUTED_COLOR } else { SURFACE_LIGHT })
+                    .width(1.0),
+                ..button::Style::default()
+            }
+        })
+        .on_press(Message::ToggleMasterRecording);
+
+    // === OUTPUT DEVICE PICKER ===
     let output_options: Vec<String> = available_outputs
         .iter()
         .map(|d| d.description.clone())
         .collect();
 
     let output_picker: Element<'a, Message> = if output_options.is_empty() {
-        text("No outputs")
-            .size(10)
-            .color(TEXT_DIM)
-            .into()
+        text("No outputs").size(TEXT_CAPTION).color(TEXT_DIM).into()
     } else {
         let selected = selected_output.map(|s| s.to_string());
         column![
-            text("Output").size(10).color(TEXT_DIM),
-            pick_list(
-                output_options,
-                selected,
-                Message::OutputDeviceChanged,
-            )
-            .placeholder("Select...")
-            .text_size(11)
-            .padding([4, 8])
-            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
-            .style(|_theme: &Theme, _status| {
-                pick_list::Style {
-                    text_color: TEXT,
-                    placeholder_color: TEXT_DIM,
-                    handle_color: TEXT_DIM,
-                    background: Background::Color(SURFACE_LIGHT),
-                    border: Border::default()
-                        .rounded(BORDER_RADIUS_SMALL)
-                        .color(SURFACE_LIGHT)
-                        .width(1.0),
-                }
-            }),
+            text("Output").size(TEXT_CAPTION).color(TEXT_DIM),
+            pick_list(output_options, selected, Message::OutputDeviceChanged,)
+                .placeholder("Select...")
+                .text_size(TEXT_SMALL)
+                .padding([SPACING_XS, SPACING_SM])
+                .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
+                .style(|_theme: &Theme, _status| {
+                    pick_list::Style {
+                        text_color: TEXT,
+                        placeholder_color: TEXT_DIM,
+                        handle_color: TEXT_DIM,
+                        background: Background::Color(SURFACE),
+                        border: Border::default()
+                            .rounded(RADIUS_SM)
+                            .color(SOOTMIX_DARK.border_default)
+                            .width(1.0),
+                    }
+                }),
         ]
-        .spacing(2)
+        .spacing(SPACING_XS)
         .into()
     };
 
-    // Assemble
+    // === ASSEMBLE ===
     let content = column![
-        title,
+        container(title).center_x(Fill),
         Space::new().height(SPACING),
         container(slider_meter_row).center_x(Fill),
-        Space::new().height(SPACING_SMALL),
-        volume_text,
-        Space::new().height(SPACING_SMALL),
-        mute_button,
+        Space::new().height(SPACING_SM),
+        container(volume_text).center_x(Fill),
+        Space::new().height(SPACING_SM),
+        container(row![mute_button, Space::new().width(SPACING_SM), recording_button].align_y(Alignment::Center))
+            .center_x(Fill),
         Space::new().height(SPACING),
         output_picker,
     ]
     .align_x(Alignment::Center)
     .padding(PADDING)
-    .spacing(SPACING_SMALL);
+    .spacing(SPACING_XS);
 
     container(content)
         .width(CHANNEL_STRIP_WIDTH)
-        .style(|_theme: &Theme| {
-            container::Style {
-                background: Some(Background::Color(SURFACE)),
-                border: Border::default()
-                    .rounded(BORDER_RADIUS)
-                    .color(PRIMARY)
-                    .width(2.0),
-                ..container::Style::default()
-            }
+        .height(CHANNEL_STRIP_HEIGHT)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border::default()
+                .rounded(RADIUS)
+                .color(SOOTMIX_DARK.accent_warm)
+                .width(2.0),
+            ..container::Style::default()
         })
         .into()
 }
+
+// ============================================================================
+// HELPERS
+// ============================================================================
 
 /// Truncate a string to max length with ellipsis.
 fn truncate_string(s: &str, max_len: usize) -> String {
@@ -471,4 +680,13 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
     }
+}
+
+/// Lighten a color by a factor (0.0-1.0).
+fn lighten(color: Color, factor: f32) -> Color {
+    Color::from_rgb(
+        (color.r + (1.0 - color.r) * factor).min(1.0),
+        (color.g + (1.0 - color.g) * factor).min(1.0),
+        (color.b + (1.0 - color.b) * factor).min(1.0),
+    )
 }

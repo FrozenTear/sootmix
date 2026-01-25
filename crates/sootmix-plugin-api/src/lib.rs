@@ -157,6 +157,21 @@ impl PluginInfo {
 // Parameters
 // ============================================================================
 
+/// Hint about special parameter behavior.
+///
+/// Used to enable special features like sidechain routing.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, StableAbi)]
+pub enum ParameterHint {
+    /// No special behavior.
+    #[default]
+    None,
+    /// This parameter receives level from a sidechain source channel.
+    /// The host will automatically update this parameter with the RMS level
+    /// of the sidechain source channel (if configured).
+    SidechainLevel,
+}
+
 /// Parameter value range and characteristics.
 #[repr(C)]
 #[derive(Debug, Clone, StableAbi)]
@@ -187,6 +202,9 @@ pub struct ParameterInfo {
 
     /// Step size for discrete parameters (0.0 for continuous).
     pub step: f32,
+
+    /// Hint about special parameter behavior.
+    pub hint: ParameterHint,
 }
 
 impl ParameterInfo {
@@ -202,7 +220,14 @@ impl ParameterInfo {
             default,
             curve: ParameterCurve::Linear,
             step: 0.0,
+            hint: ParameterHint::None,
         }
+    }
+
+    /// Builder: set parameter hint.
+    pub fn with_hint(mut self, hint: ParameterHint) -> Self {
+        self.hint = hint;
+        self
     }
 
     /// Builder: set unit label.

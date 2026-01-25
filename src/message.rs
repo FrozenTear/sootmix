@@ -37,6 +37,8 @@ pub enum Message {
     AppAssigned(Uuid, String),
     /// App unassigned from channel (channel_id, app_identifier).
     AppUnassigned(Uuid, String),
+    /// Channel output device changed (channel_id, device_name or None for default).
+    ChannelOutputDeviceChanged(Uuid, Option<String>),
     /// Start dragging an app for assignment (node_id, app_identifier).
     StartDraggingApp(u32, String),
     /// Cancel the current drag operation.
@@ -52,6 +54,8 @@ pub enum Message {
     MasterMuteToggled,
     /// Output device changed.
     OutputDeviceChanged(String),
+    /// Toggle master recording output.
+    ToggleMasterRecording,
 
     /// Request to create a new channel.
     NewChannelRequested,
@@ -61,6 +65,13 @@ pub enum Message {
     PresetSaved(String),
     /// Delete a preset.
     PresetDeleted(String),
+
+    /// Select a channel for the focus panel (None to deselect).
+    SelectChannel(Option<Uuid>),
+    /// Toggle the left sidebar collapsed state.
+    ToggleLeftSidebar,
+    /// Toggle the bottom detail panel expanded state.
+    ToggleBottomPanel,
 
     /// Open EQ panel for channel.
     OpenEqPanel(Uuid),
@@ -145,6 +156,8 @@ pub enum Message {
     PluginParameterChanged(Uuid, u32, f32),
     /// Plugin chain loaded from persistence (channel_id).
     PluginChainLoaded(Uuid),
+    /// Plugin sidechain source changed (channel_id, slot_index, source_channel_id or None).
+    PluginSidechainSourceChanged(Uuid, usize, Option<Uuid>),
 
     // ==================== PipeWire Events (from PW thread) ====================
     /// PipeWire connection established.

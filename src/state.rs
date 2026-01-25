@@ -162,6 +162,18 @@ pub struct MixerChannel {
     /// These are the Uuids of loaded PluginInstance objects in the PluginManager.
     #[serde(skip)]
     pub plugin_instances: Vec<Uuid>,
+    /// Output device node ID for this channel (not serialized).
+    /// None means use default output device.
+    #[serde(skip)]
+    pub output_device_id: Option<u32>,
+    /// Output device name for persistence (description of the device).
+    /// None means use default output device.
+    #[serde(default)]
+    pub output_device_name: Option<String>,
+    /// Runtime loopback output node ID (not serialized).
+    /// This is the Stream/Output/Audio node created by pw-loopback for routing.
+    #[serde(skip)]
+    pub pw_loopback_output_id: Option<u32>,
 }
 
 fn default_is_managed() -> bool {
@@ -187,6 +199,9 @@ impl MixerChannel {
             meter_display: MeterDisplayState::default(),
             plugin_chain: Vec::new(),
             plugin_instances: Vec::new(),
+            output_device_id: None,
+            output_device_name: None,
+            pw_loopback_output_id: None,
         }
     }
 
@@ -498,6 +513,18 @@ pub struct AppState {
     pub plugin_browser_channel: Option<Uuid>,
     /// Plugin editor open (channel_id, instance_id).
     pub plugin_editor_open: Option<(Uuid, Uuid)>,
+    /// Whether master recording output is enabled.
+    pub master_recording_enabled: bool,
+    /// Node ID of the virtual recording source (Audio/Source).
+    pub master_recording_source_id: Option<u32>,
+    /// Currently selected channel for focus panel.
+    pub selected_channel: Option<Uuid>,
+    /// Whether the left sidebar is collapsed.
+    pub left_sidebar_collapsed: bool,
+    /// Whether the bottom detail panel is expanded.
+    pub bottom_panel_expanded: bool,
+    /// Height of the bottom detail panel in pixels.
+    pub bottom_panel_height: f32,
 }
 
 impl Default for AppState {
@@ -535,6 +562,12 @@ impl AppState {
             active_snapshot: None,
             plugin_browser_channel: None,
             plugin_editor_open: None,
+            master_recording_enabled: false,
+            master_recording_source_id: None,
+            selected_channel: None,
+            left_sidebar_collapsed: false,
+            bottom_panel_expanded: false,
+            bottom_panel_height: 200.0,
         }
     }
 

@@ -15,7 +15,7 @@ use crate::ui::channel_strip::{channel_strip, master_strip};
 use crate::ui::routing_rules_panel::routing_rules_panel;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
-use iced::{Alignment, Background, Element, Fill, Subscription, Task, Theme};
+use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
 use std::sync::mpsc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -604,6 +604,56 @@ impl SootMix {
                     channel.assigned_apps.retain(|a| a != &app_id);
                 }
             }
+            Message::ChannelOutputDeviceChanged(channel_id, device_name) => {
+                info!("Channel {:?} output device changed to {:?}", channel_id, device_name);
+
+                // Find the device node ID if a specific device is selected
+                let target_device_id = device_name.as_ref().and_then(|name| {
+                    self.state.available_outputs.iter()
+                        .find(|d| d.description == *name || d.name == *name)
+                        .map(|d| d.node_id)
+                });
+
+                // Update channel state
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.output_device_name = device_name;
+                    channel.output_device_id = target_device_id;
+
+                    // Get the loopback output node ID for routing
+                    if let Some(loopback_output_id) = channel.pw_loopback_output_id {
+                        // Send command to route to new device
+                        self.send_pw_command(PwCommand::RouteChannelToDevice {
+                            loopback_output_node: loopback_output_id,
+                            target_device_id,
+                        });
+                    } else {
+                        // Try to find the loopback output node by name
+                        let safe_name: String = channel.name
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                            .collect();
+                        let loopback_output_name = format!("sootmix.{}.output", safe_name);
+
+                        if let Some(loopback_node) = self.state.pw_graph.nodes.values()
+                            .find(|n| n.name == loopback_output_name)
+                        {
+                            let loopback_id = loopback_node.id;
+                            // Update the channel with the found ID
+                            if let Some(ch) = self.state.channel_mut(channel_id) {
+                                ch.pw_loopback_output_id = Some(loopback_id);
+                            }
+                            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                                loopback_output_node: loopback_id,
+                                target_device_id,
+                            });
+                        } else {
+                            warn!("Loopback output node '{}' not found for routing", loopback_output_name);
+                        }
+                    }
+                }
+
+                self.save_config();
+            }
 
             // ==================== Master Actions ====================
             Message::MasterVolumeChanged(volume) => {
@@ -655,6 +705,24 @@ impl SootMix {
 
                 self.save_config();
             }
+            Message::ToggleMasterRecording => {
+                if self.state.master_recording_enabled {
+                    // Disable recording - destroy the source
+                    if let Some(node_id) = self.state.master_recording_source_id {
+                        info!("Disabling master recording output");
+                        self.send_pw_command(PwCommand::DestroyRecordingSource { node_id });
+                        self.state.master_recording_enabled = false;
+                        self.state.master_recording_source_id = None;
+                    }
+                } else {
+                    // Enable recording - create the source
+                    info!("Enabling master recording output");
+                    self.send_pw_command(PwCommand::CreateRecordingSource {
+                        name: "master".to_string(),
+                    });
+                    self.state.master_recording_enabled = true;
+                }
+            }
 
             // ==================== EQ Panel ====================
             Message::OpenEqPanel(id) => {
@@ -670,6 +738,21 @@ impl SootMix {
             }
             Message::CloseSettings => {
                 self.state.settings_open = false;
+            }
+
+            // ==================== Layout & Selection ====================
+            Message::SelectChannel(channel_id) => {
+                self.state.selected_channel = channel_id;
+                // Close plugin browser when selecting a different channel
+                if channel_id != self.state.plugin_browser_channel {
+                    self.state.plugin_browser_channel = None;
+                }
+            }
+            Message::ToggleLeftSidebar => {
+                self.state.left_sidebar_collapsed = !self.state.left_sidebar_collapsed;
+            }
+            Message::ToggleBottomPanel => {
+                self.state.bottom_panel_expanded = !self.state.bottom_panel_expanded;
             }
 
             // ==================== Routing Rules ====================
@@ -1108,6 +1191,18 @@ impl SootMix {
                 debug!("Plugin chain loaded for channel {}", channel_id);
                 // TODO: Handle plugin chain restoration from persistence
             }
+            Message::PluginSidechainSourceChanged(channel_id, slot_index, source_channel_id) => {
+                info!(
+                    "Plugin sidechain source changed: channel={} slot={} source={:?}",
+                    channel_id, slot_index, source_channel_id
+                );
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    if let Some(slot_config) = channel.plugin_chain.get_mut(slot_index) {
+                        slot_config.sidechain_source = source_channel_id;
+                    }
+                }
+                self.save_config();
+            }
 
             // ==================== PipeWire Events ====================
             Message::PwConnected => {
@@ -1176,6 +1271,9 @@ impl SootMix {
                     self.state.master_muted,
                     dt,
                 );
+
+                // Pump sidechain levels to plugin parameters
+                self.pump_sidechain_levels();
 
                 // Check for PipeWire events
                 self.poll_pw_events();
@@ -1253,17 +1351,27 @@ impl SootMix {
     }
 
     /// Render the application view.
+    ///
+    /// Bottom panel layout (Ableton/FL Studio style):
+    /// - Header at top
+    /// - Channel strips (full width, horizontally scrollable)
+    /// - Apps panel (compact, below strips)
+    /// - Collapsible bottom panel for selected channel detail
     pub fn view(&self) -> Element<Message> {
         // Header bar
         let header = self.view_header();
 
-        // Channel strips
+        // Channel strips (full width)
         let channel_strips = self.view_channel_strips();
 
-        // Apps panel
-        let apps = apps_panel(&self.state.available_apps, &self.state.channels, self.state.dragging_app.as_ref());
+        // Apps panel (compact horizontal)
+        let apps = apps_panel(
+            &self.state.available_apps,
+            &self.state.channels,
+            self.state.dragging_app.as_ref(),
+        );
 
-        // Routing rules panel (shown below apps when open)
+        // Routing rules panel (shown inline when open)
         let rules_panel: Element<Message> = if self.state.routing_rules_panel_open {
             let channel_names: Vec<String> = self.state.channels.iter()
                 .map(|c| c.name.clone())
@@ -1277,37 +1385,22 @@ impl SootMix {
             Space::new().height(0).into()
         };
 
-        // Plugin panel (shown when a channel's plugin browser is open)
+        // Plugin browser/editor (shown when open)
         let plugin_panel: Element<Message> = if let Some(channel_id) = self.state.plugin_browser_channel {
-            // Get channel info
             let channel_name = self.state.channel(channel_id)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
-
-            // Get current plugin chain info
             let chain_info = self.get_plugin_chain_info(channel_id);
-
-            // Get available plugins from the PluginManager
             let available_plugins = self.plugin_manager.list_plugins(&PluginFilter::default());
 
-            // Show both chain panel and browser side by side
             row![
-                crate::ui::plugin_chain::plugin_chain_panel(
-                    channel_id,
-                    &channel_name,
-                    chain_info,
-                ),
+                crate::ui::plugin_chain::plugin_chain_panel(channel_id, &channel_name, chain_info),
                 Space::new().width(SPACING),
                 crate::ui::plugin_chain::plugin_browser(channel_id, available_plugins),
             ]
             .spacing(SPACING)
             .into()
-        } else {
-            Space::new().height(0).into()
-        };
-
-        // Plugin editor (shown when editing a plugin's parameters)
-        let plugin_editor_panel: Element<Message> = if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
+        } else if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
             if let Some((plugin_name, params)) = self.get_plugin_editor_info(instance_id) {
                 crate::ui::plugin_chain::plugin_editor(instance_id, &plugin_name, params)
             } else {
@@ -1317,20 +1410,24 @@ impl SootMix {
             Space::new().height(0).into()
         };
 
-        // Main content
+        // Bottom detail panel
+        let bottom_panel = self.view_bottom_panel();
+
+        // Footer
+        let footer = self.view_footer();
+
+        // Main layout
         let content = column![
             header,
             Space::new().height(SPACING),
-            channel_strips,
-            Space::new().height(SPACING),
+            container(channel_strips).height(Fill),
+            Space::new().height(SPACING_SM),
             apps,
-            Space::new().height(SPACING),
             rules_panel,
-            Space::new().height(SPACING_SMALL),
             plugin_panel,
-            Space::new().height(SPACING_SMALL),
-            plugin_editor_panel,
-            self.view_footer(),
+            Space::new().height(SPACING_SM),
+            bottom_panel,
+            footer,
         ]
         .padding(PADDING);
 
@@ -1343,6 +1440,471 @@ impl SootMix {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// View the bottom detail panel (Ableton-style).
+    fn view_bottom_panel(&self) -> Element<Message> {
+        if self.state.bottom_panel_expanded {
+            // Expanded state: show drag handle + content
+            let drag_handle = container(
+                container(Space::new().width(60).height(4))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(SOOTMIX_DARK.border_emphasis)),
+                        border: Border::default().rounded(2.0),
+                        ..container::Style::default()
+                    }),
+            )
+            .width(Fill)
+            .height(8)
+            .center_x(Fill)
+            .center_y(8)
+            .style(|_| container::Style {
+                background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+                ..container::Style::default()
+            });
+
+            let panel_content: Element<Message> = if let Some(channel_id) = self.state.selected_channel {
+                if let Some(channel) = self.state.channel(channel_id) {
+                    Self::view_bottom_panel_content(channel)
+                } else {
+                    self.view_bottom_panel_empty()
+                }
+            } else {
+                self.view_bottom_panel_empty()
+            };
+
+            column![
+                drag_handle,
+                container(panel_content)
+                    .width(Fill)
+                    .height(Length::Fixed(self.state.bottom_panel_height))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(SURFACE)),
+                        border: Border::default()
+                            .color(SOOTMIX_DARK.border_subtle)
+                            .width(1.0),
+                        ..container::Style::default()
+                    }),
+            ]
+            .into()
+        } else {
+            // Collapsed state: just show expand bar
+            button(
+                container(text("▲ Show Detail").size(TEXT_CAPTION).color(TEXT_DIM))
+                    .center_x(Fill)
+                    .padding([SPACING_XS, 0.0]),
+            )
+            .width(Fill)
+            .padding(0)
+            .style(|_: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(Background::Color(if is_hovered {
+                        SURFACE_LIGHT
+                    } else {
+                        SURFACE
+                    })),
+                    text_color: TEXT_DIM,
+                    border: Border::default()
+                        .color(SOOTMIX_DARK.border_subtle)
+                        .width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ToggleBottomPanel)
+            .into()
+        }
+    }
+
+    /// Content for the bottom panel when a channel is selected.
+    fn view_bottom_panel_content(channel: &MixerChannel) -> Element<'_, Message> {
+        let id = channel.id;
+        let channel_name = channel.name.clone();
+
+        // Header row
+        let title = text(channel_name).size(TEXT_HEADING).color(TEXT);
+        let close_btn = button(text("▼ Hide").size(TEXT_CAPTION).color(TEXT_DIM))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(|_: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(Background::Color(if is_hovered {
+                        SURFACE_LIGHT
+                    } else {
+                        Color::TRANSPARENT
+                    })),
+                    text_color: TEXT_DIM,
+                    border: Border::default().rounded(RADIUS_SM),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ToggleBottomPanel);
+
+        let header_row = row![title, Space::new().width(Fill), close_btn,]
+            .align_y(Alignment::Center);
+
+        // Content sections (horizontal layout)
+        let eq_section = Self::view_bottom_eq_section(channel);
+        let plugins_section = Self::view_bottom_plugins_section(channel);
+        let routing_section = Self::view_bottom_routing_section(channel);
+        let apps_section = Self::view_bottom_apps_section(channel);
+
+        // Mute button
+        let muted = channel.muted;
+        let mute_btn = button(
+            text(if muted { "UNMUTE" } else { "MUTE" })
+                .size(TEXT_SMALL)
+                .color(if muted { SOOTMIX_DARK.semantic_error } else { TEXT }),
+        )
+        .padding([SPACING_SM, SPACING])
+        .style(move |_: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered);
+            button::Style {
+                background: Some(Background::Color(if muted {
+                    if is_hovered { SOOTMIX_DARK.semantic_error } else { SOOTMIX_DARK.semantic_error.scale_alpha(0.3) }
+                } else if is_hovered { SURFACE_LIGHT } else { SURFACE })),
+                border: Border::default()
+                    .rounded(RADIUS)
+                    .color(if muted { SOOTMIX_DARK.semantic_error } else { SOOTMIX_DARK.border_subtle })
+                    .width(1.0),
+                ..button::Style::default()
+            }
+        })
+        .on_press(Message::ChannelMuteToggled(id));
+
+        let content_row = row![
+            eq_section,
+            Space::new().width(SPACING),
+            plugins_section,
+            Space::new().width(SPACING),
+            routing_section,
+            Space::new().width(SPACING),
+            apps_section,
+            Space::new().width(Fill),
+            mute_btn,
+        ]
+        .align_y(Alignment::Start);
+
+        let scrollable_content = scrollable(content_row)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::default().width(4).scroller_width(4),
+            ));
+
+        column![header_row, Space::new().height(SPACING), scrollable_content,]
+            .padding(SPACING)
+            .into()
+    }
+
+    /// EQ section for bottom panel.
+    fn view_bottom_eq_section(channel: &MixerChannel) -> Element<'_, Message> {
+        let id = channel.id;
+        let eq_enabled = channel.eq_enabled;
+        container(
+            column![
+                text("EQ").size(TEXT_SMALL).color(TEXT_DIM),
+                Space::new().height(SPACING_XS),
+                container(Space::new().width(120).height(50))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(BACKGROUND)),
+                        border: Border::default().rounded(RADIUS_SM).color(SOOTMIX_DARK.border_subtle).width(1.0),
+                        ..container::Style::default()
+                    }),
+                Space::new().height(SPACING_XS),
+                button(
+                    text(if eq_enabled { "ON" } else { "OFF" })
+                        .size(TEXT_CAPTION)
+                        .color(if eq_enabled { TEXT } else { TEXT_DIM }),
+                )
+                .padding([SPACING_XS, SPACING_SM])
+                .style(move |_: &Theme, _| button::Style {
+                    background: Some(Background::Color(if eq_enabled {
+                        SOOTMIX_DARK.semantic_success.scale_alpha(0.3)
+                    } else { SURFACE })),
+                    border: Border::default().rounded(RADIUS_SM),
+                    ..button::Style::default()
+                })
+                .on_press(Message::ChannelEqToggled(id)),
+            ]
+            .align_x(Alignment::Center),
+        )
+        .padding(SPACING)
+        .style(|_| container::Style {
+            background: Some(Background::Color(BACKGROUND)),
+            border: Border::default().rounded(RADIUS).color(SOOTMIX_DARK.border_subtle).width(1.0),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Plugins section for bottom panel.
+    fn view_bottom_plugins_section(channel: &MixerChannel) -> Element<'_, Message> {
+        let id = channel.id;
+        let plugin_count = channel.plugin_chain.len();
+        container(
+            column![
+                text("Plugins").size(TEXT_SMALL).color(TEXT_DIM),
+                Space::new().height(SPACING_XS),
+                text(format!("{} loaded", plugin_count)).size(TEXT_BODY).color(TEXT),
+                Space::new().height(SPACING_XS),
+                button(text("Open Browser").size(TEXT_CAPTION).color(PRIMARY))
+                    .padding([SPACING_XS, SPACING_SM])
+                    .style(|_: &Theme, status| {
+                        let is_hovered = matches!(status, button::Status::Hovered);
+                        button::Style {
+                            background: Some(Background::Color(if is_hovered { PRIMARY.scale_alpha(0.2) } else { Color::TRANSPARENT })),
+                            text_color: PRIMARY,
+                            border: Border::default().rounded(RADIUS_SM).color(PRIMARY).width(1.0),
+                            ..button::Style::default()
+                        }
+                    })
+                    .on_press(Message::OpenPluginBrowser(id)),
+            ]
+            .align_x(Alignment::Center),
+        )
+        .padding(SPACING)
+        .width(Length::Fixed(140.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(BACKGROUND)),
+            border: Border::default().rounded(RADIUS).color(SOOTMIX_DARK.border_subtle).width(1.0),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Routing section for bottom panel.
+    fn view_bottom_routing_section(channel: &MixerChannel) -> Element<'_, Message> {
+        let output_name = channel.output_device_name.clone().unwrap_or_else(|| "Default".to_string());
+        let volume_db = channel.volume_db;
+        container(
+            column![
+                text("Output").size(TEXT_SMALL).color(TEXT_DIM),
+                Space::new().height(SPACING_XS),
+                text(output_name).size(TEXT_BODY).color(TEXT),
+                Space::new().height(SPACING_XS),
+                text(format!("{:+.1} dB", volume_db))
+                    .size(TEXT_BODY)
+                    .color(SOOTMIX_DARK.accent_warm),
+            ]
+            .align_x(Alignment::Center),
+        )
+        .padding(SPACING)
+        .width(Length::Fixed(120.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(BACKGROUND)),
+            border: Border::default().rounded(RADIUS).color(SOOTMIX_DARK.border_subtle).width(1.0),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Apps section for bottom panel.
+    fn view_bottom_apps_section(channel: &MixerChannel) -> Element<'_, Message> {
+        let apps_count = channel.assigned_apps.len();
+        container(
+            column![
+                text("Sources").size(TEXT_SMALL).color(TEXT_DIM),
+                Space::new().height(SPACING_XS),
+                text(format!("{} app{}", apps_count, if apps_count == 1 { "" } else { "s" }))
+                    .size(TEXT_BODY)
+                    .color(TEXT),
+            ]
+            .align_x(Alignment::Center),
+        )
+        .padding(SPACING)
+        .width(Length::Fixed(100.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(BACKGROUND)),
+            border: Border::default().rounded(RADIUS).color(SOOTMIX_DARK.border_subtle).width(1.0),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Empty state for bottom panel.
+    fn view_bottom_panel_empty(&self) -> Element<Message> {
+        container(
+            text("Select a channel to view details").size(TEXT_BODY).color(TEXT_DIM),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
+    }
+
+    /// View the left sidebar (apps panel + routing rules).
+    fn view_left_sidebar(&self) -> Element<Message> {
+        use crate::ui::focus_panel::FOCUS_PANEL_WIDTH;
+
+        // Sidebar width (same as focus panel for symmetry)
+        let sidebar_width = if self.state.left_sidebar_collapsed {
+            48.0 // Collapsed: just show toggle button
+        } else {
+            FOCUS_PANEL_WIDTH
+        };
+
+        // Toggle button
+        let toggle_icon = if self.state.left_sidebar_collapsed { ">" } else { "<" };
+        let toggle_btn = button(text(toggle_icon).size(TEXT_BODY).color(TEXT_DIM))
+            .padding([SPACING_SM, SPACING])
+            .style(|_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered);
+                button::Style {
+                    background: Some(Background::Color(if is_hovered {
+                        SURFACE_LIGHT
+                    } else {
+                        SURFACE
+                    })),
+                    text_color: TEXT_DIM,
+                    border: Border::default().rounded(RADIUS_SM),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ToggleLeftSidebar);
+
+        if self.state.left_sidebar_collapsed {
+            // Collapsed state: just show toggle button
+            container(
+                column![toggle_btn,]
+                    .align_x(Alignment::Center)
+                    .padding(SPACING_SM),
+            )
+            .width(Length::Fixed(sidebar_width))
+            .height(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(SURFACE)),
+                border: Border::default()
+                    .rounded(RADIUS)
+                    .color(SOOTMIX_DARK.border_subtle)
+                    .width(1.0),
+                ..container::Style::default()
+            })
+            .into()
+        } else {
+            // Expanded state: apps panel + routing rules
+            let apps = apps_panel(
+                &self.state.available_apps,
+                &self.state.channels,
+                self.state.dragging_app.as_ref(),
+            );
+
+            // Routing rules panel (inline in sidebar when open)
+            let rules_panel: Element<Message> = if self.state.routing_rules_panel_open {
+                let channel_names: Vec<String> = self.state.channels.iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                routing_rules_panel(
+                    &self.state.routing_rules,
+                    self.state.editing_rule.as_ref(),
+                    channel_names,
+                )
+            } else {
+                Space::new().height(0).into()
+            };
+
+            let sidebar_content = column![
+                row![
+                    text("Apps & Routing").size(TEXT_SMALL).color(TEXT_DIM),
+                    Space::new().width(Fill),
+                    toggle_btn,
+                ]
+                .align_y(Alignment::Center),
+                Space::new().height(SPACING_SM),
+                apps,
+                Space::new().height(SPACING),
+                rules_panel,
+            ]
+            .padding(SPACING);
+
+            let scrollable_sidebar = scrollable(sidebar_content)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::default().width(4).scroller_width(4),
+                ));
+
+            container(scrollable_sidebar)
+                .width(Length::Fixed(sidebar_width))
+                .height(Fill)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(SURFACE)),
+                    border: Border::default()
+                        .rounded(RADIUS)
+                        .color(SOOTMIX_DARK.border_subtle)
+                        .width(1.0),
+                    ..container::Style::default()
+                })
+                .into()
+        }
+    }
+
+    /// View the center panel (channel strips + footer).
+    fn view_center_panel(&self) -> Element<Message> {
+        let channel_strips = self.view_channel_strips();
+        let footer = self.view_footer();
+
+        column![
+            channel_strips,
+            Space::new().height(SPACING),
+            footer,
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    /// View the right panel (focus panel, plugin browser, or plugin editor).
+    fn view_right_panel(&self) -> Element<Message> {
+        use crate::ui::focus_panel::{focus_panel, focus_panel_empty, FocusPluginInfo};
+
+        // Priority: Plugin editor > Plugin browser > Focus panel
+
+        // Plugin editor takes precedence
+        if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
+            if let Some((plugin_name, params)) = self.get_plugin_editor_info(instance_id) {
+                return crate::ui::plugin_chain::plugin_editor(instance_id, &plugin_name, params);
+            }
+        }
+
+        // Plugin browser is next
+        if let Some(channel_id) = self.state.plugin_browser_channel {
+            let channel_name = self.state.channel(channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let chain_info = self.get_plugin_chain_info(channel_id);
+            let available_plugins = self.plugin_manager.list_plugins(&PluginFilter::default());
+
+            return column![
+                crate::ui::plugin_chain::plugin_chain_panel(
+                    channel_id,
+                    &channel_name,
+                    chain_info,
+                ),
+                Space::new().height(SPACING),
+                crate::ui::plugin_chain::plugin_browser(channel_id, available_plugins),
+            ]
+            .spacing(SPACING)
+            .into();
+        }
+
+        // Focus panel for selected channel
+        if let Some(channel_id) = self.state.selected_channel {
+            if let Some(channel) = self.state.channel(channel_id) {
+                // Build plugin info for the focus panel
+                let plugin_chain: Vec<FocusPluginInfo> = self.get_plugin_chain_info(channel_id)
+                    .into_iter()
+                    .map(|(instance_id, name, bypassed)| FocusPluginInfo {
+                        instance_id,
+                        name,
+                        bypassed,
+                    })
+                    .collect();
+
+                return focus_panel(channel, &self.state.available_outputs, plugin_chain);
+            }
+        }
+
+        // No selection: show empty state
+        focus_panel_empty()
     }
 
     /// View the header bar.
@@ -1512,13 +2074,18 @@ impl SootMix {
         let dragging = self.state.dragging_app.as_ref();
         let editing = self.state.editing_channel.as_ref();
         let has_active_snapshot = self.state.active_snapshot.is_some();
+        let selected_channel = self.state.selected_channel;
 
         // Build channel strip widgets
+        let available_outputs = &self.state.available_outputs;
         let mut strips: Vec<Element<Message>> = self
             .state
             .channels
             .iter()
-            .map(|c| channel_strip(c, dragging, editing, has_active_snapshot))
+            .map(|c| {
+                let is_selected = selected_channel == Some(c.id);
+                channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, is_selected)
+            })
             .collect();
 
         // Add separator before master
@@ -1539,6 +2106,7 @@ impl SootMix {
             &self.state.available_outputs,
             self.state.output_device.as_deref(),
             &self.state.master_meter_display,
+            self.state.master_recording_enabled,
         ));
 
         let strips_row = row(strips)
@@ -1632,6 +2200,71 @@ impl SootMix {
         }
     }
 
+    /// Pump sidechain levels from source channels to plugin parameters.
+    ///
+    /// For each plugin slot with a sidechain source configured, reads the source
+    /// channel's meter level and sends it to any parameter with SidechainLevel hint.
+    fn pump_sidechain_levels(&mut self) {
+        use sootmix_plugin_api::ParameterHint;
+
+        // Collect sidechain updates to avoid borrow conflicts
+        let mut updates: Vec<(Uuid, Uuid, u32, f32)> = Vec::new();
+
+        // Build a map of channel ID -> meter level
+        let channel_levels: std::collections::HashMap<Uuid, f32> = self
+            .state
+            .channels
+            .iter()
+            .map(|ch| {
+                let level = (ch.meter_display.level_left + ch.meter_display.level_right) / 2.0;
+                (ch.id, level)
+            })
+            .collect();
+
+        // Iterate over channels and their plugin chains
+        for channel in &self.state.channels {
+            for (slot_idx, slot_config) in channel.plugin_chain.iter().enumerate() {
+                // Check if this slot has a sidechain source
+                if let Some(source_id) = slot_config.sidechain_source {
+                    // Get the source channel's meter level
+                    if let Some(&source_level) = channel_levels.get(&source_id) {
+                        // Get the plugin instance ID for this slot
+                        if let Some(&instance_id) = channel.plugin_instances.get(slot_idx) {
+                            // Find parameters with SidechainLevel hint
+                            let params = self.plugin_manager.get_parameters(instance_id);
+                            for param in params {
+                                if param.hint == ParameterHint::SidechainLevel {
+                                    updates.push((
+                                        channel.id,
+                                        instance_id,
+                                        param.index,
+                                        source_level,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply the updates
+        for (channel_id, instance_id, param_idx, value) in updates {
+            // Update the plugin instance parameter
+            self.plugin_manager.set_parameter(instance_id, param_idx, value);
+
+            // Send to RT thread
+            if let Some(ref pw) = self.pw_thread {
+                let _ = pw.send(PwCommand::SendPluginParamUpdate {
+                    channel_id,
+                    instance_id,
+                    param_index: param_idx,
+                    value,
+                });
+            }
+        }
+    }
+
     /// Poll for PipeWire events.
     fn poll_pw_events(&mut self) {
         // Collect events first to avoid borrow conflict
@@ -1688,14 +2321,41 @@ impl SootMix {
             PwEvent::VirtualSinkCreated { channel_id, node_id } => {
                 info!("PwEvent: VirtualSinkCreated channel={} node={}", channel_id, node_id);
 
-                // Get assigned apps before mutating the channel
-                let assigned_apps = self.state.channel(channel_id)
-                    .map(|c| c.assigned_apps.clone())
+                // Get assigned apps and channel info before mutating
+                let (assigned_apps, channel_name, output_device_name) = self.state.channel(channel_id)
+                    .map(|c| (c.assigned_apps.clone(), c.name.clone(), c.output_device_name.clone()))
                     .unwrap_or_default();
+
+                // Try to find the loopback output node by name
+                let safe_name: String = channel_name
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                let loopback_output_name = format!("sootmix.{}.output", safe_name);
+                let loopback_output_id = self.state.pw_graph.nodes.values()
+                    .find(|n| n.name == loopback_output_name)
+                    .map(|n| n.id);
 
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.pw_sink_id = Some(node_id);
-                    info!("Updated channel '{}' pw_sink_id to {}", channel.name, node_id);
+                    channel.pw_loopback_output_id = loopback_output_id;
+                    info!("Updated channel '{}' pw_sink_id={}, loopback_output_id={:?}",
+                          channel.name, node_id, loopback_output_id);
+                }
+
+                // Route to saved output device if configured
+                if let Some(loopback_id) = loopback_output_id {
+                    let target_device_id = output_device_name.as_ref().and_then(|name| {
+                        self.state.available_outputs.iter()
+                            .find(|d| d.description == *name || d.name == *name)
+                            .map(|d| d.node_id)
+                    });
+
+                    // If no saved device, route to default
+                    self.send_pw_command(PwCommand::RouteChannelToDevice {
+                        loopback_output_node: loopback_id,
+                        target_device_id,
+                    });
                 }
 
                 // Route assigned apps from restored config to this sink
@@ -1801,6 +2461,19 @@ impl SootMix {
             PwEvent::PluginFilterDestroyed { channel_id } => {
                 info!("Plugin filter destroyed for channel {}", channel_id);
                 // TODO: Clean up any routing state
+            }
+            PwEvent::RecordingSourceCreated { name, node_id } => {
+                info!("Recording source '{}' created with node_id={}", name, node_id);
+                if name == "master" {
+                    self.state.master_recording_source_id = Some(node_id);
+                }
+            }
+            PwEvent::RecordingSourceDestroyed { node_id } => {
+                info!("Recording source destroyed: node_id={}", node_id);
+                if self.state.master_recording_source_id == Some(node_id) {
+                    self.state.master_recording_source_id = None;
+                    self.state.master_recording_enabled = false;
+                }
             }
             PwEvent::Error(err) => {
                 self.state.last_error = Some(err);
@@ -1940,6 +2613,7 @@ impl SootMix {
                         eq_preset: c.eq_preset.clone(),
                         assigned_apps: c.assigned_apps.clone(),
                         plugin_chain: c.plugin_chain.clone(),
+                        output_device_name: c.output_device_name.clone(),
                     })
                     .collect(),
             };
@@ -2004,6 +2678,7 @@ impl SootMix {
                     channel.eq_preset = saved.eq_preset;
                     channel.assigned_apps = saved.assigned_apps;
                     channel.plugin_chain = saved.plugin_chain.clone();
+                    channel.output_device_name = saved.output_device_name;
 
                     let id = channel.id;
                     let name = channel.name.clone();

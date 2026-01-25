@@ -114,6 +114,9 @@ pub struct SavedChannel {
     /// Plugin chain configuration.
     #[serde(default)]
     pub plugin_chain: Vec<PluginSlotConfig>,
+    /// Output device name for per-channel routing (None = default output).
+    #[serde(default)]
+    pub output_device_name: Option<String>,
 }
 
 /// Master output configuration.

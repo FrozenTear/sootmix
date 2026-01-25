@@ -10,15 +10,19 @@
 //! is in place but full implementation requires additional work to match
 //! the vst3 crate API.
 
+mod adapter;
 mod factory;
 mod scanner;
+
+use factory::Vst3Module;
 
 pub use scanner::Vst3PluginMeta;
 
 use super::{PluginLoadError, PluginResult};
 use sootmix_plugin_api::PluginBox;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Standard VST3 search paths on Linux.
@@ -36,6 +40,8 @@ pub const VST3_SEARCH_PATHS: &[&str] = &[
 pub struct Vst3PluginLoader {
     /// Discovered plugins by class ID.
     plugins: HashMap<String, Vst3PluginMeta>,
+    /// Cached modules to keep DLLs loaded while plugins are active.
+    modules: HashMap<PathBuf, Arc<Vst3Module>>,
 }
 
 impl Vst3PluginLoader {
@@ -43,7 +49,19 @@ impl Vst3PluginLoader {
     pub fn new() -> Self {
         Self {
             plugins: HashMap::new(),
+            modules: HashMap::new(),
         }
+    }
+
+    /// Get or load a VST3 module from cache.
+    fn get_or_load_module(&mut self, bundle_path: &Path) -> PluginResult<Arc<Vst3Module>> {
+        if let Some(module) = self.modules.get(bundle_path) {
+            return Ok(Arc::clone(module));
+        }
+        let module = Arc::new(Vst3Module::load(bundle_path)?);
+        self.modules
+            .insert(bundle_path.to_path_buf(), Arc::clone(&module));
+        Ok(module)
     }
 
     /// Scan for available VST3 plugins.
@@ -137,17 +155,19 @@ impl Vst3PluginLoader {
     }
 
     /// Load a plugin by class ID.
-    ///
-    /// Note: VST3 plugin loading is not yet fully implemented.
     pub fn load(&mut self, class_id: &str) -> PluginResult<PluginBox> {
-        let _meta = self.plugins.get(class_id).ok_or_else(|| {
-            PluginLoadError::Vst3Error(format!("Plugin not found: {}", class_id))
-        })?;
+        let meta = self
+            .plugins
+            .get(class_id)
+            .ok_or_else(|| PluginLoadError::Vst3Error(format!("Plugin not found: {}", class_id)))?
+            .clone();
 
-        // VST3 loading is not yet implemented
-        Err(PluginLoadError::Vst3Error(
-            "VST3 plugin loading is not yet fully implemented".to_string(),
-        ))
+        let module = self.get_or_load_module(&meta.bundle_path)?;
+        let plugin_adapter = adapter::Vst3PluginAdapter::new(module, &meta)?;
+
+        use abi_stable::sabi_trait::TD_Opaque;
+        use sootmix_plugin_api::AudioEffect_TO;
+        Ok(AudioEffect_TO::from_value(plugin_adapter, TD_Opaque))
     }
 
     /// Get number of discovered plugins.

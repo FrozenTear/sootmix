@@ -96,6 +96,27 @@ pub enum PwCommand {
         param_index: u32,
         value: f32,
     },
+    /// Route a channel's loopback output to a specific device.
+    ///
+    /// This destroys existing links from the loopback output node and creates
+    /// new links to the target device. If target_device_id is None, routes to
+    /// the default sink.
+    RouteChannelToDevice {
+        /// The loopback output node ID (Stream/Output/Audio created by pw-loopback).
+        loopback_output_node: u32,
+        /// Target device node ID, or None to use default sink.
+        target_device_id: Option<u32>,
+    },
+    /// Create a recording source (virtual Audio/Source for capturing SootMix output).
+    CreateRecordingSource {
+        /// Name for the recording source (e.g., "master").
+        name: String,
+    },
+    /// Destroy a recording source.
+    DestroyRecordingSource {
+        /// Node ID of the Audio/Source to destroy.
+        node_id: u32,
+    },
     /// Shutdown the PipeWire thread.
     Shutdown,
 }
@@ -125,6 +146,10 @@ pub enum PwEvent {
     VirtualSinkCreated { channel_id: Uuid, node_id: u32 },
     /// Virtual sink destroyed.
     VirtualSinkDestroyed { node_id: u32 },
+    /// Recording source created successfully.
+    RecordingSourceCreated { name: String, node_id: u32 },
+    /// Recording source destroyed.
+    RecordingSourceDestroyed { node_id: u32 },
     /// Plugin filter created for a channel.
     PluginFilterCreated {
         channel_id: Uuid,
@@ -863,6 +888,134 @@ fn handle_command(
                 let update = crate::realtime::PluginParamUpdate::new(instance_id, param_index, value);
                 filter_info.param_writer.push(update);
             }
+        }
+
+        PwCommand::RouteChannelToDevice {
+            loopback_output_node,
+            target_device_id,
+        } => {
+            info!(
+                "Routing loopback output {} to device {:?}",
+                loopback_output_node, target_device_id
+            );
+
+            let event_tx = state.borrow().event_tx.clone();
+
+            // Find existing links FROM the loopback output node and destroy them
+            let links_to_destroy: Vec<u32> = {
+                let s = state.borrow();
+                s.links
+                    .values()
+                    .filter(|l| l.output_node == loopback_output_node)
+                    .map(|l| l.id)
+                    .collect()
+            };
+
+            for link_id in links_to_destroy {
+                debug!("Destroying existing link {} from loopback output", link_id);
+                if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                    warn!("Failed to destroy link {}: {}", link_id, e);
+                }
+            }
+
+            // Find the target device node ID (or default sink if None)
+            let target_node_id = target_device_id.or_else(|| {
+                // Find the default sink from our tracked nodes
+                let s = state.borrow();
+                s.nodes
+                    .values()
+                    .find(|n| n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix."))
+                    .map(|n| n.id)
+            });
+
+            if let Some(target_id) = target_node_id {
+                // Find port pairs and create links
+                let port_pairs: Vec<(u32, u32)> = {
+                    let s = state.borrow();
+                    // Get output ports of loopback output node
+                    let out_ports: Vec<_> = s.ports
+                        .values()
+                        .filter(|p| p.node_id == loopback_output_node && p.direction == PortDirection::Output)
+                        .collect();
+
+                    // Get input ports of target device
+                    let in_ports: Vec<_> = s.ports
+                        .values()
+                        .filter(|p| p.node_id == target_id && p.direction == PortDirection::Input)
+                        .collect();
+
+                    // Match by channel name patterns (FL/FR)
+                    let mut pairs = Vec::new();
+                    for out_port in &out_ports {
+                        for in_port in &in_ports {
+                            let out_name = out_port.name.to_lowercase();
+                            let in_name = in_port.name.to_lowercase();
+                            let is_match =
+                                (out_name.contains("fl") && in_name.contains("fl"))
+                                || (out_name.contains("fr") && in_name.contains("fr"))
+                                || (out_name.contains("_0") && in_name.contains("_0"))
+                                || (out_name.contains("_1") && in_name.contains("_1"));
+                            if is_match {
+                                pairs.push((out_port.id, in_port.id));
+                            }
+                        }
+                    }
+
+                    // Fallback: pair in order if no matches
+                    if pairs.is_empty() && !out_ports.is_empty() && !in_ports.is_empty() {
+                        for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()) {
+                            pairs.push((out_port.id, in_port.id));
+                        }
+                    }
+
+                    pairs
+                };
+
+                // Create the links
+                for (output_port, input_port) in port_pairs {
+                    info!("Creating link from loopback: {} -> {}", output_port, input_port);
+                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                        warn!("Failed to create link {} -> {}: {}", output_port, input_port, e);
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to route to device: {}", e
+                        )));
+                    }
+                }
+            } else {
+                warn!("No target device found for routing");
+                let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
+            }
+        }
+
+        PwCommand::CreateRecordingSource { name } => {
+            info!("Creating recording source: {}", name);
+            let event_tx = state.borrow().event_tx.clone();
+
+            match crate::audio::virtual_sink::create_virtual_source(&name) {
+                Ok(result) => {
+                    let node_id = result.source_node_id;
+                    info!("Created recording source '{}' with node_id={}", name, node_id);
+                    let _ = event_tx.send(PwEvent::RecordingSourceCreated {
+                        name,
+                        node_id,
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(PwEvent::Error(format!(
+                        "Failed to create recording source: {}", e
+                    )));
+                }
+            }
+        }
+
+        PwCommand::DestroyRecordingSource { node_id } => {
+            info!("Destroying recording source: {}", node_id);
+            let event_tx = state.borrow().event_tx.clone();
+
+            if let Err(e) = crate::audio::virtual_sink::destroy_virtual_source(node_id) {
+                warn!("Failed to destroy recording source {}: {}", node_id, e);
+            }
+            let _ = event_tx.send(PwEvent::RecordingSourceDestroyed { node_id });
         }
     }
 }

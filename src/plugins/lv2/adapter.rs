@@ -330,6 +330,7 @@ impl AudioEffect for Lv2PluginAdapter {
             default: self.normalize_value(index as usize, port.default),
             curve,
             step: 0.0,
+            hint: sootmix_plugin_api::ParameterHint::None,
         })
     }
 

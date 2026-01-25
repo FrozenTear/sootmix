@@ -10,15 +10,15 @@ use abi_stable::std_types::{ROption, RResult, RSlice, RSliceMut, RString, RVec};
 use sootmix_plugin_api::{
     ActivationContext, AudioEffect, ParameterCurve, ParameterInfo, PluginError, PluginInfo,
 };
-use std::ffi::CStr;
 use std::sync::Arc;
 use tracing::{debug, warn};
-use vst3::ComRef;
+use vst3::ComPtr;
 use vst3::Steinberg::Vst::{
-    IAudioProcessor, IComponent, IEditController, ParameterInfo as Vst3ParameterInfo,
-    ProcessData, ProcessSetup, SymbolicSampleSizes,
+    AudioBusBuffers, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
+    IEditController, IEditControllerTrait, ParameterInfo as Vst3ParameterInfo, ProcessData,
+    ProcessSetup, SymbolicSampleSizes_,
 };
-use vst3::Steinberg::{kResultOk, TUID};
+use vst3::Steinberg::{kResultOk, IPluginBaseTrait};
 
 /// Adapter that wraps a VST3 plugin to implement AudioEffect.
 pub struct Vst3PluginAdapter {
@@ -27,11 +27,11 @@ pub struct Vst3PluginAdapter {
     /// Plugin metadata.
     meta: Vst3PluginMeta,
     /// The VST3 component.
-    component: ComRef<IComponent>,
+    component: ComPtr<IComponent>,
     /// The audio processor interface.
-    processor: Option<ComRef<IAudioProcessor>>,
+    processor: Option<ComPtr<IAudioProcessor>>,
     /// The edit controller (for parameters).
-    controller: Option<ComRef<IEditController>>,
+    controller: Option<ComPtr<IEditController>>,
     /// Whether the plugin is activated.
     activated: bool,
     /// Current sample rate.
@@ -67,11 +67,11 @@ impl Vst3PluginAdapter {
         }
 
         // Get the audio processor interface
-        let processor: Option<ComRef<IAudioProcessor>> = component.cast();
+        let processor: Option<ComPtr<IAudioProcessor>> = component.cast();
 
         // Try to get the edit controller
         // First check if the component implements it directly
-        let controller: Option<ComRef<IEditController>> = component.cast();
+        let controller: Option<ComPtr<IEditController>> = component.cast();
 
         // If not, we'd need to create it separately via controller class ID
         // For simplicity, assume single-component architecture for now
@@ -82,7 +82,7 @@ impl Vst3PluginAdapter {
             let mut ids = Vec::with_capacity(count as usize);
 
             for i in 0..count {
-                let mut info = Vst3ParameterInfo::default();
+                let mut info: Vst3ParameterInfo = unsafe { std::mem::zeroed() };
                 if unsafe { ctrl.getParameterInfo(i, &mut info) } == kResultOk {
                     ids.push(info.id);
                 }
@@ -133,14 +133,14 @@ impl AudioEffect for Vst3PluginAdapter {
 
         // Setup the processor
         if let Some(ref processor) = self.processor {
-            let setup = ProcessSetup {
+            let mut setup = ProcessSetup {
                 processMode: 0, // Realtime
-                symbolicSampleSize: SymbolicSampleSizes::kSample32 as i32,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
                 maxSamplesPerBlock: context.max_block_size as i32,
                 sampleRate: context.sample_rate as f64,
             };
 
-            let result = unsafe { processor.setupProcessing(&setup) };
+            let result = unsafe { processor.setupProcessing(&mut setup) };
             if result != kResultOk {
                 warn!("VST3 setupProcessing failed for {}", self.meta.name);
             }
@@ -194,10 +194,12 @@ impl AudioEffect for Vst3PluginAdapter {
         debug!("VST3 plugin deactivated: {}", self.meta.name);
     }
 
-    fn process(&mut self, inputs: RSlice<RSlice<f32>>, outputs: RSliceMut<RSliceMut<f32>>) {
+    fn process(&mut self, inputs: RSlice<RSlice<f32>>, mut outputs: RSliceMut<RSliceMut<f32>>) {
         if !self.activated {
             // Pass-through
-            for (input, mut output) in inputs.iter().zip(outputs.iter()) {
+            for i in 0..inputs.len().min(outputs.len()) {
+                let input = &inputs[i];
+                let output = &mut outputs[i];
                 let len = input.len().min(output.len());
                 output[..len].copy_from_slice(&input[..len]);
             }
@@ -208,7 +210,9 @@ impl AudioEffect for Vst3PluginAdapter {
             Some(p) => p,
             None => {
                 // No processor, pass-through
-                for (input, mut output) in inputs.iter().zip(outputs.iter()) {
+                for i in 0..inputs.len().min(outputs.len()) {
+                    let input = &inputs[i];
+                    let output = &mut outputs[i];
                     let len = input.len().min(output.len());
                     output[..len].copy_from_slice(&input[..len]);
                 }
@@ -252,27 +256,25 @@ impl AudioEffect for Vst3PluginAdapter {
             .map(|b| b.as_mut_ptr())
             .collect();
 
-        // Setup audio buses
-        let mut input_bus = vst3::Steinberg::Vst::AudioBusBuffers {
-            numChannels: self.meta.audio_inputs as i32,
-            silenceFlags: 0,
-            __bindgen_anon_1: vst3::Steinberg::Vst::AudioBusBuffers__bindgen_ty_1 {
-                channelBuffers32: in_ptrs.as_mut_ptr(),
-            },
-        };
+        // Setup audio buses using zeroed structs and direct field access
+        let mut input_bus: AudioBusBuffers = unsafe { std::mem::zeroed() };
+        input_bus.numChannels = self.meta.audio_inputs as i32;
+        input_bus.silenceFlags = 0;
+        unsafe {
+            input_bus.__field0.channelBuffers32 = in_ptrs.as_mut_ptr();
+        }
 
-        let mut output_bus = vst3::Steinberg::Vst::AudioBusBuffers {
-            numChannels: self.meta.audio_outputs as i32,
-            silenceFlags: 0,
-            __bindgen_anon_1: vst3::Steinberg::Vst::AudioBusBuffers__bindgen_ty_1 {
-                channelBuffers32: out_ptrs.as_mut_ptr(),
-            },
-        };
+        let mut output_bus: AudioBusBuffers = unsafe { std::mem::zeroed() };
+        output_bus.numChannels = self.meta.audio_outputs as i32;
+        output_bus.silenceFlags = 0;
+        unsafe {
+            output_bus.__field0.channelBuffers32 = out_ptrs.as_mut_ptr();
+        }
 
         // Setup process data
         let mut process_data = ProcessData {
             processMode: 0, // Realtime
-            symbolicSampleSize: SymbolicSampleSizes::kSample32 as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: 1,
             numOutputs: 1,
@@ -292,8 +294,9 @@ impl AudioEffect for Vst3PluginAdapter {
         }
 
         // Copy output data to output slices
-        for (i, mut output) in outputs.iter().enumerate() {
+        for i in 0..outputs.len() {
             if i < self.audio_out_buffers.len() {
+                let output = &mut outputs[i];
                 let len = output.len().min(frames);
                 output[..len].copy_from_slice(&self.audio_out_buffers[i][..len]);
             }
@@ -305,9 +308,12 @@ impl AudioEffect for Vst3PluginAdapter {
     }
 
     fn parameter_info(&self, index: u32) -> ROption<ParameterInfo> {
-        let controller = self.controller.as_ref()?;
+        let controller = match self.controller.as_ref() {
+            Some(c) => c,
+            None => return ROption::RNone,
+        };
 
-        let mut info = Vst3ParameterInfo::default();
+        let mut info: Vst3ParameterInfo = unsafe { std::mem::zeroed() };
         let result = unsafe { controller.getParameterInfo(index as i32, &mut info) };
 
         if result != kResultOk {
@@ -321,9 +327,9 @@ impl AudioEffect for Vst3PluginAdapter {
 
         ROption::RSome(ParameterInfo {
             index,
-            id: RString::from(if id.is_empty() { &name } else { &id }),
-            name: RString::from(name),
-            unit: RString::from(unit),
+            id: RString::from(if id.is_empty() { name.as_str() } else { id.as_str() }),
+            name: RString::from(name.as_str()),
+            unit: RString::from(unit.as_str()),
             min: 0.0, // VST3 uses normalized 0-1
             max: 1.0,
             default: info.defaultNormalizedValue as f32,
@@ -333,6 +339,7 @@ impl AudioEffect for Vst3PluginAdapter {
             } else {
                 0.0
             },
+            hint: sootmix_plugin_api::ParameterHint::None,
         })
     }
 
@@ -403,7 +410,7 @@ impl AudioEffect for Vst3PluginAdapter {
         // Reset parameters to defaults
         if let Some(ref controller) = self.controller {
             for i in 0..self.parameter_count {
-                let mut info = Vst3ParameterInfo::default();
+                let mut info: Vst3ParameterInfo = unsafe { std::mem::zeroed() };
                 if unsafe { controller.getParameterInfo(i as i32, &mut info) } == kResultOk {
                     unsafe {
                         controller.setParamNormalized(info.id, info.defaultNormalizedValue);
@@ -442,8 +449,7 @@ impl Drop for Vst3PluginAdapter {
 }
 
 /// Convert UTF-16 null-terminated string to Rust String.
-fn utf16_to_string(utf16: &[i16]) -> String {
+fn utf16_to_string(utf16: &[u16]) -> String {
     let end = utf16.iter().position(|&c| c == 0).unwrap_or(utf16.len());
-    let chars: Vec<u16> = utf16[..end].iter().map(|&c| c as u16).collect();
-    String::from_utf16_lossy(&chars)
+    String::from_utf16_lossy(&utf16[..end])
 }
