@@ -48,21 +48,28 @@ pub fn create_virtual_sink(name: &str, description: &str) -> Result<u32, Virtual
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>();
 
+    // Node name for the loopback output (playback side)
+    let loopback_name = format!("sootmix.{}.output", safe_name);
+
     let capture_props = format!(
         "media.class=Audio/Sink node.name=sootmix.{} node.description=\"{}\" audio.position=[FL FR]",
         safe_name, description
     );
 
     let playback_props = format!(
-        "media.class=Stream/Output/Audio node.name=sootmix.{}.output node.passive=true",
-        safe_name
+        "media.class=Stream/Output/Audio node.passive=true audio.position=[FL FR]"
     );
 
     info!("Creating virtual sink: {}", name);
     debug!("capture_props: {}", capture_props);
+    debug!("playback_props: {}", playback_props);
+    debug!("loopback_name: {}", loopback_name);
 
     // Spawn pw-loopback as a background process
+    // --name sets the node name for the loopback output (playback side)
     let child = Command::new("pw-loopback")
+        .arg("--name")
+        .arg(&loopback_name)
         .arg("--capture-props")
         .arg(&capture_props)
         .arg("--playback-props")
