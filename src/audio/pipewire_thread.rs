@@ -31,6 +31,10 @@ pub enum PwCommand {
     CreateVirtualSink { channel_id: Uuid, name: String },
     /// Destroy a virtual sink.
     DestroyVirtualSink { node_id: u32 },
+    /// Bind to an existing node for control (used for adopted sinks).
+    BindNode { node_id: u32 },
+    /// Unbind from a node (release proxy).
+    UnbindNode { node_id: u32 },
     /// Create a link between two ports.
     CreateLink { output_port: u32, input_port: u32 },
     /// Destroy a link.
@@ -304,8 +308,9 @@ fn run_pipewire_loop(
     let main_loop_weak = main_loop.downgrade();
     let state_cmd = state.clone();
     let core_cmd = core.clone();
+    let registry_cmd = registry.clone();
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), move |cmd| {
-        handle_command(cmd, &state_cmd, &main_loop_weak, &core_cmd);
+        handle_command(cmd, &state_cmd, &main_loop_weak, &core_cmd, &registry_cmd);
     });
 
     // Set up registry listener for discovering nodes, ports, links
@@ -326,6 +331,7 @@ fn handle_command(
     state: &Rc<RefCell<PwThreadState>>,
     main_loop_weak: &pipewire::main_loop::MainLoopWeak,
     core: &pipewire::core::CoreRc,
+    _registry: &pipewire::registry::RegistryRc,
 ) {
     match cmd {
         PwCommand::Shutdown => {
@@ -377,7 +383,7 @@ fn handle_command(
             output_port,
             input_port,
         } => {
-            debug!("Creating link: port {} -> port {}", output_port, input_port);
+            info!("PW cmd: CreateLink output_port={} -> input_port={}", output_port, input_port);
 
             // Get node IDs for the ports
             let (out_node, in_node) = {
@@ -453,39 +459,65 @@ fn handle_command(
             }
         }
 
+        PwCommand::BindNode { node_id } => {
+            info!("Request to bind to node {} for control", node_id);
+
+            // Check if already bound
+            if state.borrow().bound_nodes.contains_key(&node_id) {
+                debug!("Node {} already bound", node_id);
+                return;
+            }
+
+            // Note: We can't bind to a node by ID alone - we need the GlobalObject
+            // which comes from the registry listener. For adopted sinks, we'll
+            // rely on the CLI fallback (wpctl) for volume/mute control.
+            //
+            // The node will be auto-bound if it appears in a future registry event.
+            // For now, log this and the CLI fallback will handle control.
+            debug!(
+                "Node {} not in registry cache, will use CLI fallback for control",
+                node_id
+            );
+        }
+
+        PwCommand::UnbindNode { node_id } => {
+            debug!("Unbinding from node {}", node_id);
+            state.borrow_mut().bound_nodes.remove(&node_id);
+        }
+
         PwCommand::SetVolume { node_id, volume } => {
-            debug!("Setting volume on node {}: {:.3}", node_id, volume);
+            info!("PW cmd: SetVolume node={} volume={:.3}", node_id, volume);
 
             // Try native API first if node is bound
             let result = state.borrow().set_node_volume(node_id, volume);
             match result {
                 Ok(()) => {
-                    trace!("Native volume control succeeded for node {}", node_id);
+                    info!("Native volume control succeeded for node {}", node_id);
                 }
                 Err(e) => {
                     // Node not bound or native failed, use CLI fallback
-                    debug!("Native volume failed ({}), using CLI fallback", e);
+                    info!("Native volume failed ({}), using CLI fallback", e);
                     if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
-                        warn!("CLI volume control also failed: {}", e2);
+                        error!("CLI volume control also failed: {}", e2);
                     }
                 }
             }
         }
 
         PwCommand::SetMute { node_id, muted } => {
-            debug!("Setting mute on node {}: {}", node_id, muted);
+            info!("PW cmd: SetMute node={} muted={}", node_id, muted);
 
             // Try native API first if node is bound
             let result = state.borrow().set_node_mute(node_id, muted);
             match result {
                 Ok(()) => {
-                    trace!("Native mute control succeeded for node {}", node_id);
+                    info!("Native mute control succeeded for node {}", node_id);
                 }
                 Err(e) => {
                     // Node not bound or native failed, use CLI fallback
-                    debug!("Native mute failed ({}), using CLI fallback", e);
+                    info!("Native mute failed ({}), using CLI fallback", e);
                     if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
-                        warn!("CLI mute control also failed: {}", e2);
+                        error!("CLI mute control also failed: {}", e2);
                     }
                 }
             }

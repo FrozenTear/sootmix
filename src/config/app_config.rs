@@ -5,6 +5,7 @@
 //! Application configuration (window settings, behavior).
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Window position and size settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +78,65 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Load config from TOML string.
+    pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    /// Serialize to TOML string.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
+    }
+}
+
+/// Saved channel configuration for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedChannel {
+    /// Unique identifier.
+    pub id: Uuid,
+    /// Display name.
+    pub name: String,
+    /// Whether this is a managed (SootMix-created) or adopted (existing) sink.
+    pub is_managed: bool,
+    /// PipeWire sink name for matching on startup.
+    pub sink_name: Option<String>,
+    /// Volume in decibels.
+    pub volume_db: f32,
+    /// Whether muted.
+    pub muted: bool,
+    /// Whether EQ is enabled.
+    pub eq_enabled: bool,
+    /// EQ preset name.
+    pub eq_preset: String,
+    /// Assigned app identifiers.
+    pub assigned_apps: Vec<String>,
+}
+
+/// Master output configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MasterConfig {
+    /// Master volume in decibels.
+    #[serde(default)]
+    pub volume_db: f32,
+    /// Master muted state.
+    #[serde(default)]
+    pub muted: bool,
+    /// Selected output device name.
+    pub output_device: Option<String>,
+}
+
+/// Complete mixer state configuration for persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MixerConfig {
+    /// Master output settings.
+    #[serde(default)]
+    pub master: MasterConfig,
+    /// Saved channel configurations.
+    #[serde(default)]
+    pub channels: Vec<SavedChannel>,
+}
+
+impl MixerConfig {
     /// Load config from TOML string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)

@@ -9,7 +9,7 @@ pub mod eq_preset;
 pub mod persistence;
 pub mod preset;
 
-pub use app_config::AppConfig;
+pub use app_config::{AppConfig, MasterConfig, MixerConfig, SavedChannel};
 pub use eq_preset::EqPreset;
 pub use persistence::ConfigManager;
 pub use preset::GlobalPreset;

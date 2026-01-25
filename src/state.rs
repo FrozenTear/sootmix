@@ -26,6 +26,14 @@ pub struct MixerChannel {
     pub eq_preset: String,
     /// App identifiers assigned to this channel.
     pub assigned_apps: Vec<String>,
+    /// Whether this channel owns its sink (managed) or just controls it (adopted).
+    /// Managed sinks are created/destroyed by SootMix.
+    /// Adopted sinks are user-created sinks that SootMix only controls.
+    #[serde(default = "default_is_managed")]
+    pub is_managed: bool,
+    /// PipeWire sink name for matching on startup (for adopted sinks).
+    #[serde(default)]
+    pub sink_name: Option<String>,
     /// Runtime PipeWire node ID for the virtual sink (not serialized).
     #[serde(skip)]
     pub pw_sink_id: Option<u32>,
@@ -34,16 +42,24 @@ pub struct MixerChannel {
     pub pw_eq_node_id: Option<u32>,
 }
 
+fn default_is_managed() -> bool {
+    true
+}
+
 impl MixerChannel {
+    /// Create a new channel.
     pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
         Self {
             id: Uuid::new_v4(),
-            name: name.into(),
+            sink_name: Some(format!("sootmix.{}", name)),
+            name,
             volume_db: 0.0,
             muted: false,
             eq_enabled: false,
             eq_preset: "Flat".to_string(),
             assigned_apps: Vec::new(),
+            is_managed: true,
             pw_sink_id: None,
             pw_eq_node_id: None,
         }
@@ -264,6 +280,8 @@ pub struct AppState {
     pub editing_channel: Option<(Uuid, String)>,
     /// Apps waiting to be re-routed after a sink rename (channel_id, app_node_ids).
     pub pending_reroute: Option<(Uuid, Vec<u32>)>,
+    /// Startup discovery completed (waited for PipeWire to discover existing sinks).
+    pub startup_complete: bool,
 }
 
 impl Default for AppState {
@@ -290,6 +308,7 @@ impl AppState {
             dragging_app: None,
             editing_channel: None,
             pending_reroute: None,
+            startup_complete: false,
         }
     }
 

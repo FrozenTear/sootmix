@@ -132,4 +132,10 @@ pub enum Message {
     Initialized,
     /// Font loaded.
     FontLoaded(Result<(), iced::font::Error>),
+    /// Save current configuration to disk.
+    SaveConfig,
+    /// Configuration loaded from disk.
+    ConfigLoaded(crate::config::MixerConfig),
+    /// Startup: wait for PipeWire discovery before restoring channels.
+    StartupDiscoveryComplete,
 }

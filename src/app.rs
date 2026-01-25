@@ -5,6 +5,7 @@
 //! Iced Application implementation for SootMix.
 
 use crate::audio::{PwCommand, PwEvent, PwThread};
+use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
 use crate::state::{AppState, MixerChannel};
 use crate::ui::apps_panel::apps_panel;
@@ -13,6 +14,7 @@ use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Background, Element, Fill, Subscription, Task, Theme};
 use std::sync::mpsc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Main application state.
@@ -23,12 +25,33 @@ pub struct SootMix {
     pw_thread: Option<PwThread>,
     /// Receiver for PipeWire events.
     pw_event_rx: Option<mpsc::Receiver<PwEvent>>,
+    /// Configuration manager for persistence.
+    config_manager: Option<ConfigManager>,
+    /// Startup timestamp for discovery delay.
+    startup_time: Instant,
+    /// Pending config to restore after discovery.
+    pending_config: Option<MixerConfig>,
 }
 
 impl SootMix {
     /// Create a new application instance.
     pub fn new() -> (Self, Task<Message>) {
         let state = AppState::new();
+
+        // Initialize config manager and load saved config
+        let config_manager = ConfigManager::new().ok();
+        let pending_config = config_manager.as_ref().and_then(|cm| {
+            match cm.load_mixer_config() {
+                Ok(config) => {
+                    info!("Loaded mixer config: {} channels", config.channels.len());
+                    Some(config)
+                }
+                Err(e) => {
+                    debug!("No saved config or error loading: {}", e);
+                    None
+                }
+            }
+        });
 
         // Create channel for PipeWire events
         let (event_tx, event_rx) = mpsc::channel();
@@ -49,6 +72,9 @@ impl SootMix {
             state,
             pw_thread,
             pw_event_rx: Some(event_rx),
+            config_manager,
+            startup_time: Instant::now(),
+            pending_config,
         };
 
         (app, Task::none())
@@ -66,9 +92,12 @@ impl SootMix {
             Message::ChannelVolumeChanged(id, volume) => {
                 if let Some(channel) = self.state.channel_mut(id) {
                     channel.volume_db = volume;
-                    // Send volume update to PipeWire if we have a sink
                     if let Some(node_id) = channel.pw_sink_id {
                         let linear_vol = channel.volume_linear();
+                        debug!(
+                            "Volume change: channel={}, node_id={}, db={:.1}, linear={:.3}",
+                            channel.name, node_id, volume, linear_vol
+                        );
                         self.send_pw_command(PwCommand::SetVolume {
                             node_id,
                             volume: linear_vol,
@@ -76,9 +105,8 @@ impl SootMix {
                     }
                 }
             }
-            Message::ChannelVolumeReleased(id) => {
+            Message::ChannelVolumeReleased(_id) => {
                 // Could trigger save here
-                debug!("Volume released for channel {}", id);
             }
             Message::ChannelMuteToggled(id) => {
                 let cmd = if let Some(channel) = self.state.channel_mut(id) {
@@ -133,15 +161,11 @@ impl SootMix {
                                 })
                                 .collect();
 
-                            // Find default sink for temporary routing
+                            // Find hardware sink for temporary routing
                             let our_sink_ids: Vec<u32> = self.state.channels.iter()
                                 .filter_map(|c| c.pw_sink_id)
                                 .collect();
-                            let default_sink_id = self.state.pw_graph.nodes.values()
-                                .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                                      && !our_sink_ids.contains(&n.id)
-                                      && !n.name.starts_with("sootmix."))
-                                .map(|n| n.id);
+                            let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
                             // Temporarily route apps to default sink
                             if let Some(old_sink) = old_sink_id {
@@ -189,20 +213,17 @@ impl SootMix {
                 self.state.editing_channel = None;
             }
             Message::ChannelDeleted(id) => {
-                // First, reconnect all assigned apps to default sink before destroying
-                if let Some(channel) = self.state.channel(id) {
-                    let sink_node_id = channel.pw_sink_id;
-                    let assigned_apps = channel.assigned_apps.clone();
+                // Get channel info before removing
+                let channel_info = self.state.channel(id).map(|c| {
+                    (c.pw_sink_id, c.assigned_apps.clone(), c.is_managed)
+                });
 
-                    // Find default sink
+                if let Some((sink_node_id, assigned_apps, is_managed)) = channel_info {
+                    // Find hardware output sink (not virtual sinks)
                     let our_sink_ids: Vec<u32> = self.state.channels.iter()
                         .filter_map(|c| c.pw_sink_id)
                         .collect();
-                    let default_sink_id = self.state.pw_graph.nodes.values()
-                        .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                              && !our_sink_ids.contains(&n.id)
-                              && !n.name.starts_with("sootmix."))
-                        .map(|n| n.id);
+                    let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
                     // Collect all link destruction commands for after we create new links
                     let mut links_to_destroy: Vec<u32> = Vec::new();
@@ -240,15 +261,19 @@ impl SootMix {
                         self.send_pw_command(PwCommand::DestroyLink { link_id });
                     }
 
-                    // Wait a bit more before destroying sink
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Only destroy the sink if it's managed (SootMix-created)
+                    // Adopted sinks are kept alive - we just stop controlling them
+                    if is_managed {
+                        // Wait a bit more before destroying sink
+                        std::thread::sleep(std::time::Duration::from_millis(50));
 
-                    // Now destroy the virtual sink
-                    if let Some(node_id) = sink_node_id {
-                        self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                        if let Some(node_id) = sink_node_id {
+                            self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                        }
                     }
                 }
                 self.state.channels.retain(|c| c.id != id);
+                self.save_config();
             }
             Message::NewChannelRequested => {
                 let channel_num = self.state.channels.len() + 1;
@@ -262,6 +287,7 @@ impl SootMix {
                     channel_id: id,
                     name,
                 });
+                self.save_config();
             }
 
             // ==================== App Drag & Drop ====================
@@ -294,12 +320,12 @@ impl SootMix {
                             }
                         }
 
-                        // Debug: show available ports
+                        // Show available ports for routing
                         let app_out_ports = self.state.pw_graph.output_ports_for_node(app_node_id);
                         let sink_in_ports = self.state.pw_graph.input_ports_for_node(sink_node_id);
-                        debug!("App {} output ports: {:?}", app_node_id,
+                        info!("App {} has {} output ports: {:?}", app_node_id, app_out_ports.len(),
                             app_out_ports.iter().map(|p| (p.id, &p.name)).collect::<Vec<_>>());
-                        debug!("Sink {} input ports: {:?}", sink_node_id,
+                        info!("Sink {} has {} input ports: {:?}", sink_node_id, sink_in_ports.len(),
                             sink_in_ports.iter().map(|p| (p.id, &p.name)).collect::<Vec<_>>());
 
                         // Find matching port pairs between app and sink
@@ -351,21 +377,18 @@ impl SootMix {
                 // Get the channel's sink node ID
                 let sink_node_id = self.state.channel(channel_id).and_then(|c| c.pw_sink_id);
 
-                // Find a default sink to reconnect to (any Audio/Sink that isn't ours)
+                // Find hardware sink to reconnect to
                 let our_sink_ids: Vec<u32> = self.state.channels.iter()
                     .filter_map(|c| c.pw_sink_id)
                     .collect();
-                let default_sink = self.state.pw_graph.nodes.values()
-                    .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                          && !our_sink_ids.contains(&n.id)
-                          && !n.name.starts_with("sootmix."));
+                let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
                 if let (Some(app_node_id), Some(sink_node_id)) = (app_node_id, sink_node_id) {
                     // FIRST: Connect to default sink (before destroying old links)
                     // This ensures there's never a gap where the app has no audio output
-                    if let Some(default_sink) = default_sink {
-                        info!("Reconnecting app {} to default sink {} ({})", app_node_id, default_sink.id, default_sink.name);
-                        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_sink.id);
+                    if let Some(default_id) = default_sink_id {
+                        info!("Reconnecting app {} to hardware sink {}", app_node_id, default_id);
+                        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_id);
                         for (output_port, input_port) in port_pairs {
                             self.send_pw_command(PwCommand::CreateLink {
                                 output_port,
@@ -373,7 +396,7 @@ impl SootMix {
                             });
                         }
                     } else {
-                        warn!("No default sink found to reconnect app");
+                        warn!("No hardware sink found to reconnect app");
                     }
 
                     // THEN: Destroy links from app to our sink
@@ -473,15 +496,11 @@ impl SootMix {
                     if pending_channel_id == channel_id {
                         info!("Re-routing {} apps to renamed sink {}", app_node_ids.len(), node_id);
 
-                        // Find default sink to disconnect from
+                        // Find hardware sink to disconnect from
                         let our_sink_ids: Vec<u32> = self.state.channels.iter()
                             .filter_map(|c| c.pw_sink_id)
                             .collect();
-                        let default_sink_id = self.state.pw_graph.nodes.values()
-                            .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                                  && !our_sink_ids.contains(&n.id)
-                                  && !n.name.starts_with("sootmix."))
-                            .map(|n| n.id);
+                        let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
                         for &app_node_id in app_node_ids.iter() {
                             // Connect to new sink
@@ -522,6 +541,14 @@ impl SootMix {
                 // Check for PipeWire events
                 self.poll_pw_events();
 
+                // Restore config after PipeWire discovery delay (~200ms)
+                if !self.state.startup_complete
+                    && self.pending_config.is_some()
+                    && self.startup_time.elapsed() > std::time::Duration::from_millis(200)
+                {
+                    self.restore_config();
+                }
+
                 // Retry pending re-routing if sink ports are now available
                 if let Some((channel_id, ref app_node_ids)) = self.state.pending_reroute.clone() {
                     if let Some(sink_node_id) = self.state.channel(channel_id).and_then(|c| c.pw_sink_id) {
@@ -529,15 +556,11 @@ impl SootMix {
                         let sink_ports = self.state.pw_graph.input_ports_for_node(sink_node_id);
 
                         if !sink_ports.is_empty() {
-                            // Find default sink to disconnect from
+                            // Find hardware sink to disconnect from
                             let our_sink_ids: Vec<u32> = self.state.channels.iter()
                                 .filter_map(|c| c.pw_sink_id)
                                 .collect();
-                            let default_sink_id = self.state.pw_graph.nodes.values()
-                                .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                                      && !our_sink_ids.contains(&n.id)
-                                      && !n.name.starts_with("sootmix."))
-                                .map(|n| n.id);
+                            let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
                             for &app_node_id in app_node_ids.iter() {
                                 // Connect to new sink
@@ -692,11 +715,11 @@ impl SootMix {
             .into()
     }
 
-    /// View the footer with add channel button.
+    /// View the footer with add channel buttons.
     fn view_footer(&self) -> Element<Message> {
         let add_button = button(text("+ New Channel").size(14))
             .padding([10, 20])
-            .style(|theme: &Theme, status| button::Style {
+            .style(|_theme: &Theme, _status| button::Style {
                 background: Some(Background::Color(PRIMARY)),
                 text_color: TEXT,
                 border: standard_border(),
@@ -817,23 +840,126 @@ impl SootMix {
             }
         }
     }
+
+    /// Save current mixer configuration to disk.
+    fn save_config(&self) {
+        if let Some(ref cm) = self.config_manager {
+            let config = MixerConfig {
+                master: crate::config::MasterConfig {
+                    volume_db: self.state.master_volume_db,
+                    muted: self.state.master_muted,
+                    output_device: self.state.output_device.clone(),
+                },
+                channels: self
+                    .state
+                    .channels
+                    .iter()
+                    .map(|c| SavedChannel {
+                        id: c.id,
+                        name: c.name.clone(),
+                        is_managed: c.is_managed,
+                        sink_name: c.sink_name.clone(),
+                        volume_db: c.volume_db,
+                        muted: c.muted,
+                        eq_enabled: c.eq_enabled,
+                        eq_preset: c.eq_preset.clone(),
+                        assigned_apps: c.assigned_apps.clone(),
+                    })
+                    .collect(),
+            };
+
+            if let Err(e) = cm.save_mixer_config(&config) {
+                error!("Failed to save mixer config: {}", e);
+            } else {
+                debug!("Saved mixer config: {} channels", config.channels.len());
+            }
+        }
+    }
+
+    /// Restore channels from saved configuration.
+    fn restore_config(&mut self) {
+        if let Some(config) = self.pending_config.take() {
+            info!("Restoring {} channels from config", config.channels.len());
+
+            // Restore master settings
+            self.state.master_volume_db = config.master.volume_db;
+            self.state.master_muted = config.master.muted;
+            self.state.output_device = config.master.output_device;
+
+            for saved in config.channels {
+                if saved.is_managed {
+                    // Managed channel - create new pw-loopback sink
+                    let mut channel = MixerChannel::new(&saved.name);
+                    channel.id = saved.id;
+                    channel.volume_db = saved.volume_db;
+                    channel.muted = saved.muted;
+                    channel.eq_enabled = saved.eq_enabled;
+                    channel.eq_preset = saved.eq_preset;
+                    channel.assigned_apps = saved.assigned_apps;
+
+                    let id = channel.id;
+                    let name = channel.name.clone();
+                    self.state.channels.push(channel);
+
+                    // Create the virtual sink
+                    self.send_pw_command(PwCommand::CreateVirtualSink {
+                        channel_id: id,
+                        name,
+                    });
+                }
+            }
+
+            self.state.startup_complete = true;
+        }
+    }
+}
+
+/// Find a hardware output sink (not virtual sinks).
+/// Prefers actual hardware devices over pw-loopback virtual sinks.
+fn find_hardware_sink(graph: &crate::state::PwGraphState, exclude_ids: &[u32]) -> Option<u32> {
+    use crate::audio::types::MediaClass;
+
+    // First, try to find actual hardware sinks (ALSA, Bluetooth, etc.)
+    let hardware_sink = graph.nodes.values()
+        .find(|n| {
+            n.media_class == MediaClass::AudioSink
+                && !exclude_ids.contains(&n.id)
+                && !n.name.starts_with("sootmix.")
+                && (n.name.starts_with("alsa_output")
+                    || n.name.starts_with("bluez_output")
+                    || n.name.contains("pci-")
+                    || n.name.contains("usb-"))
+        })
+        .map(|n| n.id);
+
+    if hardware_sink.is_some() {
+        return hardware_sink;
+    }
+
+    // Fallback: find any sink that looks like a real device (has "ALSA" or device-like description)
+    graph.nodes.values()
+        .find(|n| {
+            n.media_class == MediaClass::AudioSink
+                && !exclude_ids.contains(&n.id)
+                && !n.name.starts_with("sootmix.")
+                && !n.name.contains("Virtual Sink")
+                && !n.name.contains("virtual")
+                && !n.name.starts_with("LB-")
+        })
+        .map(|n| n.id)
 }
 
 impl Drop for SootMix {
     fn drop(&mut self) {
         info!("SootMix shutting down, reconnecting apps to default sink...");
 
-        // Find default sink (any Audio/Sink that isn't ours)
+        // Find hardware output sink (not virtual sinks)
         let our_sink_ids: Vec<u32> = self.state.channels.iter()
             .filter_map(|c| c.pw_sink_id)
             .collect();
-        let default_sink_id = self.state.pw_graph.nodes.values()
-            .find(|n| n.media_class == crate::audio::types::MediaClass::AudioSink
-                  && !our_sink_ids.contains(&n.id)
-                  && !n.name.starts_with("sootmix."))
-            .map(|n| n.id);
+        let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
-        // Reconnect all assigned apps to default sink before destroying
+        // Reconnect apps from all channels to default sink before destroying
         for channel in &self.state.channels {
             if let Some(sink_node_id) = channel.pw_sink_id {
                 for app_id in &channel.assigned_apps {
@@ -862,7 +988,7 @@ impl Drop for SootMix {
             }
         }
 
-        // Clean up virtual sinks
+        // Clean up managed virtual sinks (destroy_all_virtual_sinks only destroys sootmix.* sinks)
         crate::audio::virtual_sink::destroy_all_virtual_sinks();
 
         // Shutdown PipeWire thread

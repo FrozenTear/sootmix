@@ -6,7 +6,7 @@
 
 use std::process::Command;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 #[derive(Debug, Error)]
 pub enum VolumeError {
@@ -22,8 +22,8 @@ pub enum VolumeError {
 pub fn set_volume(node_id: u32, volume: f32) -> Result<(), VolumeError> {
     let volume_clamped = volume.max(0.0).min(1.5); // Allow up to 150%
 
-    debug!(
-        "Setting volume on node {} to {:.2}",
+    info!(
+        "wpctl set-volume {} {:.2}",
         node_id, volume_clamped
     );
 
@@ -34,13 +34,22 @@ pub fn set_volume(node_id: u32, volume: f32) -> Result<(), VolumeError> {
             &format!("{:.2}", volume_clamped),
         ])
         .output()
-        .map_err(|e| VolumeError::WpctlFailed(e.to_string()))?;
+        .map_err(|e| {
+            error!("Failed to execute wpctl: {}", e);
+            VolumeError::WpctlFailed(e.to_string())
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VolumeError::OperationFailed(stderr.to_string()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        error!("wpctl set-volume {} failed: stderr='{}', stdout='{}'", node_id, stderr.trim(), stdout.trim());
+        return Err(VolumeError::OperationFailed(format!(
+            "wpctl set-volume {} {:.2} failed: {}",
+            node_id, volume_clamped, stderr
+        )));
     }
 
+    info!("wpctl set-volume succeeded for node {}", node_id);
     Ok(())
 }
 
@@ -71,18 +80,23 @@ pub fn adjust_volume(node_id: u32, delta_percent: i32) -> Result<(), VolumeError
 pub fn set_mute(node_id: u32, muted: bool) -> Result<(), VolumeError> {
     let mute_value = if muted { "1" } else { "0" };
 
-    debug!("Setting mute on node {} to {}", node_id, muted);
+    info!("wpctl set-mute {} {}", node_id, mute_value);
 
     let output = Command::new("wpctl")
         .args(["set-mute", &node_id.to_string(), mute_value])
         .output()
-        .map_err(|e| VolumeError::WpctlFailed(e.to_string()))?;
+        .map_err(|e| {
+            error!("Failed to execute wpctl set-mute: {}", e);
+            VolumeError::WpctlFailed(e.to_string())
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        error!("wpctl set-mute {} failed: {}", node_id, stderr.trim());
         return Err(VolumeError::OperationFailed(stderr.to_string()));
     }
 
+    info!("wpctl set-mute succeeded for node {}", node_id);
     Ok(())
 }
 

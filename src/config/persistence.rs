@@ -4,7 +4,7 @@
 
 //! Configuration persistence (save/load).
 
-use crate::config::{AppConfig, EqPreset, GlobalPreset};
+use crate::config::{AppConfig, EqPreset, GlobalPreset, MixerConfig};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
@@ -80,6 +80,29 @@ impl ConfigManager {
     pub fn save_config(&self, config: &AppConfig) -> Result<(), ConfigError> {
         let content = config.to_toml()?;
         fs::write(self.config_path(), content)?;
+        Ok(())
+    }
+
+    /// Get the path to the mixer state file.
+    pub fn mixer_config_path(&self) -> PathBuf {
+        self.config_dir.join("mixer.toml")
+    }
+
+    /// Load the mixer configuration (channels, master settings).
+    pub fn load_mixer_config(&self) -> Result<MixerConfig, ConfigError> {
+        let path = self.mixer_config_path();
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            Ok(MixerConfig::from_toml(&content)?)
+        } else {
+            Ok(MixerConfig::default())
+        }
+    }
+
+    /// Save the mixer configuration.
+    pub fn save_mixer_config(&self, config: &MixerConfig) -> Result<(), ConfigError> {
+        let content = config.to_toml()?;
+        fs::write(self.mixer_config_path(), content)?;
         Ok(())
     }
 
