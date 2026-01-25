@@ -485,10 +485,12 @@ output_device = "alsa_output.pci-0000_00_1f.3.analog-stereo"
 
 ### Phase 2: Enhanced Features
 
-- [ ] VU meters with peak hold
-- [ ] Drag-and-drop app assignment
+- [x] VU meters with peak hold
+- [x] Drag-and-drop app assignment
+- [x] Auto-routing rules (pattern-based app routing)
 - [ ] Per-channel plugin chains
-- [ ] Snapshot recall (A/B comparison)
+- [x] Snapshot recall (A/B comparison)
+- [x] Channel routing persistence (auto-reconnect on restart)
 - [ ] MIDI controller mapping
 
 ### Phase 3: Advanced Features
