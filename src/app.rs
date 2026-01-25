@@ -4,7 +4,7 @@
 
 //! Iced Application implementation for SootMix.
 
-use crate::audio::{filter_chain, MeterManager, PwCommand, PwEvent, PwThread};
+use crate::audio::{filter_chain, MeterManager, PluginProcessorManager, PwCommand, PwEvent, PwThread};
 use crate::config::eq_preset::EqPreset;
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
@@ -41,6 +41,8 @@ pub struct SootMix {
     last_tick: Instant,
     /// Plugin manager for loading and managing audio effect plugins.
     plugin_manager: PluginManager,
+    /// Plugin audio processor for routing audio through plugin chains.
+    plugin_processor: PluginProcessorManager,
 }
 
 impl SootMix {
@@ -107,6 +109,7 @@ impl SootMix {
             meter_manager: MeterManager::new(),
             last_tick: now,
             plugin_manager,
+            plugin_processor: PluginProcessorManager::new(),
         };
 
         (app, Task::none())
@@ -906,6 +909,12 @@ impl SootMix {
                                 channel.name,
                                 channel.plugin_chain.len()
                             );
+
+                            // Update plugin processor with new chain
+                            let instances = channel.plugin_instances.clone();
+                            if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances) {
+                                warn!("Failed to update plugin processor: {}", e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -940,6 +949,12 @@ impl SootMix {
                             channel.name,
                             channel.plugin_chain.len()
                         );
+
+                        // Update plugin processor with new chain
+                        let instances = channel.plugin_instances.clone();
+                        if let Err(e) = self.plugin_processor.setup_channel(channel_id, instances) {
+                            warn!("Failed to update plugin processor: {}", e);
+                        }
                     } else {
                         warn!("Plugin instance {} not found in channel", instance_id);
                     }
