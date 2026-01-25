@@ -6,7 +6,8 @@
 
 use crate::audio::types::OutputDevice;
 use crate::message::Message;
-use crate::state::MixerChannel;
+use crate::state::{MeterDisplayState, MixerChannel};
+use crate::ui::meter::vu_meter;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
@@ -110,6 +111,9 @@ pub fn channel_strip<'a>(
         }
     });
 
+    // VU meter
+    let meter = vu_meter(&channel.meter_display, VOLUME_SLIDER_HEIGHT);
+
     // Volume display
     let volume_text = text(theme::format_db(volume_db))
         .size(12)
@@ -194,6 +198,14 @@ pub fn channel_strip<'a>(
         })
         .on_press(Message::ChannelDeleted(id));
 
+    // Slider and meter row
+    let slider_meter_row = row![
+        volume_slider,
+        Space::new().width(SPACING_SMALL),
+        meter,
+    ]
+    .align_y(Alignment::Center);
+
     // Assemble the channel strip
     let content = column![
         // Header row with name and delete
@@ -207,8 +219,8 @@ pub fn channel_strip<'a>(
         // EQ button
         eq_button,
         Space::new().height(SPACING),
-        // Volume slider
-        container(volume_slider)
+        // Volume slider with meter
+        container(slider_meter_row)
             .center_x(Fill),
         Space::new().height(SPACING_SMALL),
         // Volume display
@@ -275,6 +287,7 @@ pub fn master_strip<'a>(
     muted: bool,
     available_outputs: &'a [OutputDevice],
     selected_output: Option<&'a str>,
+    meter_display: &'a MeterDisplayState,
 ) -> Element<'a, Message> {
     // Title
     let title = text("Master")
@@ -307,6 +320,17 @@ pub fn master_strip<'a>(
                 },
             }
         });
+
+    // VU meter
+    let meter = vu_meter(meter_display, VOLUME_SLIDER_HEIGHT);
+
+    // Slider and meter row
+    let slider_meter_row = row![
+        volume_slider,
+        Space::new().width(SPACING_SMALL),
+        meter,
+    ]
+    .align_y(Alignment::Center);
 
     // Volume display
     let volume_text = text(theme::format_db(volume_db))
@@ -377,7 +401,7 @@ pub fn master_strip<'a>(
     let content = column![
         title,
         Space::new().height(SPACING),
-        container(volume_slider).center_x(Fill),
+        container(slider_meter_row).center_x(Fill),
         Space::new().height(SPACING_SMALL),
         volume_text,
         Space::new().height(SPACING_SMALL),

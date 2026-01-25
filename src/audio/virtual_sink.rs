@@ -146,17 +146,25 @@ fn find_node_by_name(name: &str) -> Result<u32, VirtualSinkError> {
             continue;
         }
 
-        // Get node.name from info.props
-        let node_name = obj
+        // Get props
+        let props = obj
             .get("info")
-            .and_then(|i| i.get("props"))
+            .and_then(|i| i.get("props"));
+
+        let node_name = props
             .and_then(|p| p.get("node.name"))
             .and_then(|n| n.as_str())
             .unwrap_or("");
 
-        if node_name == name {
+        // Must be an Audio/Sink, not Stream/Output/Audio
+        let media_class = props
+            .and_then(|p| p.get("media.class"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        if node_name == name && media_class == "Audio/Sink" {
             if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
-                debug!("Found node '{}' with ID {}", name, id);
+                debug!("Found sink node '{}' with ID {} (class={})", name, id, media_class);
                 return Ok(id as u32);
             }
         }

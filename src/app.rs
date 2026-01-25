@@ -4,18 +4,20 @@
 
 //! Iced Application implementation for SootMix.
 
-use crate::audio::{PwCommand, PwEvent, PwThread};
-use crate::config::{ConfigManager, MixerConfig, SavedChannel};
+use crate::audio::{MeterManager, PwCommand, PwEvent, PwThread};
+use crate::config::{ConfigManager, MixerConfig, RoutingRulesConfig, SavedChannel};
 use crate::message::Message;
-use crate::state::{db_to_linear, AppState, MixerChannel};
+use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel};
 use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{channel_strip, master_strip};
+use crate::ui::routing_rules_panel::routing_rules_panel;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Background, Element, Fill, Subscription, Task, Theme};
 use std::sync::mpsc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Main application state.
 pub struct SootMix {
@@ -31,12 +33,16 @@ pub struct SootMix {
     startup_time: Instant,
     /// Pending config to restore after discovery.
     pending_config: Option<MixerConfig>,
+    /// VU meter manager for audio level display.
+    meter_manager: MeterManager,
+    /// Last tick time for delta time calculation.
+    last_tick: Instant,
 }
 
 impl SootMix {
     /// Create a new application instance.
     pub fn new() -> (Self, Task<Message>) {
-        let state = AppState::new();
+        let mut state = AppState::new();
 
         // Initialize config manager and load saved config
         let config_manager = ConfigManager::new().ok();
@@ -53,6 +59,19 @@ impl SootMix {
             }
         });
 
+        // Load routing rules
+        if let Some(ref cm) = config_manager {
+            match cm.load_routing_rules() {
+                Ok(rules) => {
+                    info!("Loaded {} routing rules", rules.rules.len());
+                    state.routing_rules = rules;
+                }
+                Err(e) => {
+                    debug!("No routing rules or error loading: {}", e);
+                }
+            }
+        }
+
         // Create channel for PipeWire events
         let (event_tx, event_rx) = mpsc::channel();
 
@@ -68,13 +87,16 @@ impl SootMix {
             }
         };
 
+        let now = Instant::now();
         let app = Self {
             state,
             pw_thread,
             pw_event_rx: Some(event_rx),
             config_manager,
-            startup_time: Instant::now(),
+            startup_time: now,
             pending_config,
+            meter_manager: MeterManager::new(),
+            last_tick: now,
         };
 
         (app, Task::none())
@@ -424,7 +446,11 @@ impl SootMix {
                 // Apply to selected output device
                 if let Some(node_id) = self.get_output_device_node_id() {
                     let linear = db_to_linear(volume);
+                    debug!("Master volume: db={:.1}, linear={:.3}, node={}", volume, linear, node_id);
                     self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                } else {
+                    debug!("Master volume changed but no output device found. available={}, selected={:?}",
+                        self.state.available_outputs.len(), self.state.output_device);
                 }
             }
             Message::MasterVolumeReleased => {
@@ -481,6 +507,105 @@ impl SootMix {
                 self.state.settings_open = false;
             }
 
+            // ==================== Routing Rules ====================
+            Message::OpenRoutingRulesPanel => {
+                self.state.routing_rules_panel_open = true;
+            }
+            Message::CloseRoutingRulesPanel => {
+                self.state.routing_rules_panel_open = false;
+                self.state.editing_rule = None;
+            }
+            Message::ToggleRoutingRule(id) => {
+                self.state.routing_rules.toggle_rule(id);
+                self.save_routing_rules();
+            }
+            Message::DeleteRoutingRule(id) => {
+                self.state.routing_rules.remove_rule(id);
+                self.save_routing_rules();
+            }
+            Message::MoveRoutingRuleUp(id) => {
+                self.state.routing_rules.move_up(id);
+                self.save_routing_rules();
+            }
+            Message::MoveRoutingRuleDown(id) => {
+                self.state.routing_rules.move_down(id);
+                self.save_routing_rules();
+            }
+            Message::StartEditingRule(id) => {
+                if let Some(id) = id {
+                    if let Some(rule) = self.state.routing_rules.get_rule(id) {
+                        self.state.editing_rule = Some(EditingRule::from_rule(rule));
+                    }
+                } else {
+                    self.state.editing_rule = Some(EditingRule::default());
+                }
+            }
+            Message::CancelEditingRule => {
+                self.state.editing_rule = None;
+            }
+            Message::RuleNameChanged(name) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    editing.name = name;
+                }
+            }
+            Message::RulePatternChanged(pattern) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    editing.pattern = pattern;
+                }
+            }
+            Message::RuleMatchTypeChanged(match_type) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    editing.match_type_name = match_type;
+                }
+            }
+            Message::RuleMatchTargetChanged(target) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    editing.match_target = target;
+                }
+            }
+            Message::RuleTargetChannelChanged(channel) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    editing.target_channel = channel;
+                }
+            }
+            Message::RulePriorityChanged(priority_str) => {
+                if let Some(ref mut editing) = self.state.editing_rule {
+                    if let Ok(priority) = priority_str.parse::<u32>() {
+                        editing.priority = priority;
+                    }
+                }
+            }
+            Message::SaveRoutingRule => {
+                if let Some(editing) = self.state.editing_rule.take() {
+                    let rule = editing.to_rule();
+                    let is_update = editing.id.is_some();
+
+                    if is_update {
+                        // Update existing rule
+                        if let Some(existing) = self.state.routing_rules.get_rule_mut(rule.id) {
+                            *existing = rule;
+                        }
+                    } else {
+                        // Add new rule
+                        self.state.routing_rules.add_rule(rule);
+                    }
+                    self.state.routing_rules.sort_by_priority();
+                    self.save_routing_rules();
+                }
+            }
+            Message::CreateQuickRule(app_name, binary, target_channel) => {
+                // Create a simple contains rule for the app
+                let pattern = binary.as_deref().unwrap_or(&app_name);
+                let rule = crate::config::RoutingRule::new(
+                    format!("Auto: {}", &app_name),
+                    pattern,
+                    target_channel,
+                );
+                self.state.routing_rules.add_rule(rule);
+                self.save_routing_rules();
+                info!("Created quick routing rule for '{}'", app_name);
+            }
+
             // ==================== PipeWire Events ====================
             Message::PwConnected => {
                 info!("Connected to PipeWire");
@@ -495,6 +620,14 @@ impl SootMix {
                 self.state.pw_graph.nodes.insert(node.id, node);
                 self.state.update_available_apps();
                 self.state.update_available_outputs();
+
+                // Check for auto-routing after startup is complete
+                if self.state.startup_complete {
+                    let to_route = self.check_auto_routing();
+                    for (app_node_id, app_id, channel_id) in to_route {
+                        self.route_app_to_channel(app_node_id, app_id, channel_id);
+                    }
+                }
             }
             Message::PwNodeRemoved(id) => {
                 debug!("Node removed: {}", id);
@@ -570,6 +703,20 @@ impl SootMix {
 
             // ==================== Other ====================
             Message::Tick => {
+                // Calculate delta time for meter updates
+                let now = Instant::now();
+                let dt = now.duration_since(self.last_tick).as_secs_f32();
+                self.last_tick = now;
+
+                // Update VU meters
+                self.meter_manager.update_meters(
+                    &mut self.state.channels,
+                    &mut self.state.master_meter_display,
+                    self.state.master_volume_db,
+                    self.state.master_muted,
+                    dt,
+                );
+
                 // Check for PipeWire events
                 self.poll_pw_events();
 
@@ -579,6 +726,14 @@ impl SootMix {
                     && self.startup_time.elapsed() > std::time::Duration::from_millis(200)
                 {
                     self.restore_config();
+                }
+
+                // Check for auto-routing periodically after startup
+                if self.state.startup_complete {
+                    let to_route = self.check_auto_routing();
+                    for (app_node_id, app_id, channel_id) in to_route {
+                        self.route_app_to_channel(app_node_id, app_id, channel_id);
+                    }
                 }
 
                 // Retry pending re-routing if sink ports are now available
@@ -643,6 +798,20 @@ impl SootMix {
         // Apps panel
         let apps = apps_panel(&self.state.available_apps, &self.state.channels, self.state.dragging_app.as_ref());
 
+        // Routing rules panel (shown below apps when open)
+        let rules_panel: Element<Message> = if self.state.routing_rules_panel_open {
+            let channel_names: Vec<String> = self.state.channels.iter()
+                .map(|c| c.name.clone())
+                .collect();
+            routing_rules_panel(
+                &self.state.routing_rules,
+                self.state.editing_rule.as_ref(),
+                channel_names,
+            )
+        } else {
+            Space::new().height(0).into()
+        };
+
         // Main content
         let content = column![
             header,
@@ -651,6 +820,7 @@ impl SootMix {
             Space::new().height(SPACING),
             apps,
             Space::new().height(SPACING),
+            rules_panel,
             self.view_footer(),
         ]
         .padding(PADDING);
@@ -682,9 +852,22 @@ impl SootMix {
             .size(12)
             .color(TEXT_DIM);
 
+        let rules_count = self.state.routing_rules.rules.len();
+        let rules_button = button(
+            text(format!("Rules ({})", rules_count)).size(12)
+        )
+            .padding([6, 12])
+            .style(|_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(SURFACE_LIGHT)),
+                text_color: TEXT,
+                border: standard_border(),
+                ..button::Style::default()
+            })
+            .on_press(Message::OpenRoutingRulesPanel);
+
         let settings_button = button(text("Settings").size(12))
             .padding([6, 12])
-            .style(|theme: &Theme, status| button::Style {
+            .style(|_theme: &Theme, _status| button::Style {
                 background: Some(Background::Color(SURFACE_LIGHT)),
                 text_color: TEXT,
                 border: standard_border(),
@@ -699,6 +882,8 @@ impl SootMix {
             Space::new().width(Fill),
             preset_text,
             Space::new().width(SPACING),
+            rules_button,
+            Space::new().width(SPACING_SMALL),
             settings_button,
         ]
         .align_y(Alignment::Center)
@@ -735,6 +920,7 @@ impl SootMix {
             self.state.master_muted,
             &self.state.available_outputs,
             self.state.output_device.as_deref(),
+            &self.state.master_meter_display,
         ));
 
         let strips_row = row(strips)
@@ -886,6 +1072,97 @@ impl SootMix {
             PwEvent::ParamChanged { node_id, volume, muted } => {
                 // Handle control parameter feedback from PipeWire
                 debug!("Param changed on node {}: vol={:?}, mute={:?}", node_id, volume, muted);
+            }
+        }
+    }
+
+    /// Save routing rules to disk.
+    fn save_routing_rules(&self) {
+        if let Some(ref cm) = self.config_manager {
+            if let Err(e) = cm.save_routing_rules(&self.state.routing_rules) {
+                error!("Failed to save routing rules: {}", e);
+            } else {
+                debug!("Saved {} routing rules", self.state.routing_rules.rules.len());
+            }
+        }
+    }
+
+    /// Check for apps that should be auto-routed based on rules.
+    /// Returns a list of (app_node_id, app_identifier, channel_id) tuples to route.
+    fn check_auto_routing(&mut self) -> Vec<(u32, String, Uuid)> {
+        let mut to_route = Vec::new();
+
+        for app in &self.state.available_apps {
+            let app_id = app.identifier().to_string();
+
+            // Skip if already routed in this session
+            if self.state.auto_routed_apps.contains(&app_id) {
+                continue;
+            }
+
+            // Skip if already assigned to a channel
+            let already_assigned = self.state.channels.iter()
+                .any(|c| c.assigned_apps.contains(&app_id));
+            if already_assigned {
+                // Mark as routed so we don't check again
+                self.state.auto_routed_apps.insert(app_id);
+                continue;
+            }
+
+            // Check if any rule matches
+            if let Some(rule) = self.state.routing_rules.find_match(&app.name, app.binary.as_deref()) {
+                // Find the target channel
+                if let Some(channel) = self.state.channel_by_name(&rule.target_channel) {
+                    if channel.pw_sink_id.is_some() {
+                        info!("Auto-routing '{}' to channel '{}' (rule: {})",
+                            app.name, rule.target_channel, rule.name);
+                        to_route.push((app.node_id, app_id.clone(), channel.id));
+                        self.state.auto_routed_apps.insert(app_id);
+                    }
+                }
+            }
+        }
+
+        to_route
+    }
+
+    /// Route an app to a channel (extracted from DropAppOnChannel for reuse).
+    fn route_app_to_channel(&mut self, app_node_id: u32, app_id: String, channel_id: Uuid) {
+        // Get the channel's virtual sink node ID
+        let sink_node_id = self.state.channel(channel_id).and_then(|c| c.pw_sink_id);
+
+        if let Some(sink_node_id) = sink_node_id {
+            // First, disconnect the app from any existing sinks
+            let existing_links = self.state.pw_graph.links_from_node(app_node_id);
+            for link in existing_links {
+                // Don't destroy links to our own sinks
+                let is_our_sink = self.state.channels.iter()
+                    .any(|c| c.pw_sink_id == Some(link.input_node));
+                if !is_our_sink {
+                    debug!("Auto-routing: disconnecting app from node {}", link.input_node);
+                    self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+                }
+            }
+
+            // Find matching port pairs between app and sink
+            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_node_id);
+
+            if !port_pairs.is_empty() {
+                // Create links for each port pair
+                for (output_port, input_port) in &port_pairs {
+                    debug!("Auto-routing: creating link port {} -> port {}", output_port, input_port);
+                    self.send_pw_command(PwCommand::CreateLink {
+                        output_port: *output_port,
+                        input_port: *input_port,
+                    });
+                }
+
+                // Add app to channel's assigned apps list
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    if !channel.assigned_apps.contains(&app_id) {
+                        channel.assigned_apps.push(app_id);
+                    }
+                }
             }
         }
     }

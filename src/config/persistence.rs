@@ -4,7 +4,7 @@
 
 //! Configuration persistence (save/load).
 
-use crate::config::{AppConfig, EqPreset, GlobalPreset, MixerConfig};
+use crate::config::{AppConfig, EqPreset, GlobalPreset, MixerConfig, RoutingRulesConfig};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
@@ -103,6 +103,31 @@ impl ConfigManager {
     pub fn save_mixer_config(&self, config: &MixerConfig) -> Result<(), ConfigError> {
         let content = config.to_toml()?;
         fs::write(self.mixer_config_path(), content)?;
+        Ok(())
+    }
+
+    /// Get the path to the routing rules file.
+    pub fn routing_rules_path(&self) -> PathBuf {
+        self.config_dir.join("routing_rules.toml")
+    }
+
+    /// Load routing rules configuration.
+    pub fn load_routing_rules(&self) -> Result<RoutingRulesConfig, ConfigError> {
+        let path = self.routing_rules_path();
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            let mut config = RoutingRulesConfig::from_toml(&content)?;
+            config.sort_by_priority();
+            Ok(config)
+        } else {
+            Ok(RoutingRulesConfig::default())
+        }
+    }
+
+    /// Save routing rules configuration.
+    pub fn save_routing_rules(&self, config: &RoutingRulesConfig) -> Result<(), ConfigError> {
+        let content = config.to_toml()?;
+        fs::write(self.routing_rules_path(), content)?;
         Ok(())
     }
 

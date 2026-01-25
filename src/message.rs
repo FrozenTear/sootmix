@@ -79,6 +79,40 @@ pub enum Message {
     /// Close settings modal.
     CloseSettings,
 
+    // ==================== Routing Rules ====================
+    /// Open the routing rules panel.
+    OpenRoutingRulesPanel,
+    /// Close the routing rules panel.
+    CloseRoutingRulesPanel,
+    /// Toggle a routing rule's enabled state.
+    ToggleRoutingRule(Uuid),
+    /// Delete a routing rule.
+    DeleteRoutingRule(Uuid),
+    /// Move a routing rule up in priority.
+    MoveRoutingRuleUp(Uuid),
+    /// Move a routing rule down in priority.
+    MoveRoutingRuleDown(Uuid),
+    /// Start editing a routing rule (None for new rule).
+    StartEditingRule(Option<Uuid>),
+    /// Cancel editing a routing rule.
+    CancelEditingRule,
+    /// Update the rule name field.
+    RuleNameChanged(String),
+    /// Update the rule pattern field.
+    RulePatternChanged(String),
+    /// Update the rule match type.
+    RuleMatchTypeChanged(String),
+    /// Update the rule match target.
+    RuleMatchTargetChanged(crate::config::MatchTarget),
+    /// Update the rule target channel.
+    RuleTargetChannelChanged(String),
+    /// Update the rule priority.
+    RulePriorityChanged(String),
+    /// Save the current rule being edited.
+    SaveRoutingRule,
+    /// Create a quick rule from an app (app_name, binary, target_channel).
+    CreateQuickRule(String, Option<String>, String),
+
     // ==================== PipeWire Events (from PW thread) ====================
     /// PipeWire connection established.
     PwConnected,

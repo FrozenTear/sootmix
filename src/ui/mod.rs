@@ -6,6 +6,9 @@
 
 pub mod apps_panel;
 pub mod channel_strip;
+pub mod meter;
+pub mod routing_rules_panel;
 pub mod theme;
 
+pub use meter::{vu_meter, METER_WIDTH};
 pub use theme::THEME_PALETTE;

@@ -8,8 +8,10 @@ pub mod app_config;
 pub mod eq_preset;
 pub mod persistence;
 pub mod preset;
+pub mod routing_rules;
 
 pub use app_config::{AppConfig, MasterConfig, MixerConfig, SavedChannel};
 pub use eq_preset::EqPreset;
 pub use persistence::ConfigManager;
 pub use preset::GlobalPreset;
+pub use routing_rules::{MatchTarget, MatchType, RoutingRule, RoutingRulesConfig};

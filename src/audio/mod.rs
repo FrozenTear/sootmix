@@ -5,11 +5,13 @@
 //! Audio subsystem - PipeWire integration.
 
 pub mod control;
+pub mod meter;
 pub mod pipewire_thread;
 pub mod routing;
 pub mod types;
 pub mod virtual_sink;
 pub mod volume;
 
+pub use meter::MeterManager;
 pub use pipewire_thread::{PwCommand, PwEvent, PwThread};
 pub use types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
