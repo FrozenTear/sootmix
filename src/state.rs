@@ -10,6 +10,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+/// Which snapshot slot (A or B) for A/B comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSlot {
+    A,
+    B,
+}
+
+/// Snapshot of a single channel's audio-relevant state.
+#[derive(Debug, Clone)]
+pub struct ChannelSnapshot {
+    /// Channel ID to match when applying.
+    pub id: Uuid,
+    /// Volume in dB.
+    pub volume_db: f32,
+    /// Mute state.
+    pub muted: bool,
+    /// EQ enabled.
+    pub eq_enabled: bool,
+    /// EQ preset name.
+    pub eq_preset: String,
+}
+
+/// Snapshot of the entire mixer state for A/B comparison.
+#[derive(Debug, Clone)]
+pub struct MixerSnapshot {
+    /// Snapshots of each channel.
+    pub channels: Vec<ChannelSnapshot>,
+    /// Master volume in dB.
+    pub master_volume_db: f32,
+    /// Master mute state.
+    pub master_muted: bool,
+}
+
 /// VU meter display state for stereo audio levels.
 #[derive(Debug, Clone, Default)]
 pub struct MeterDisplayState {
@@ -445,6 +478,12 @@ pub struct AppState {
     pub routing_rules_panel_open: bool,
     /// Rule being edited (rule_id, field values for edit form).
     pub editing_rule: Option<EditingRule>,
+    /// Snapshot slot A for A/B comparison.
+    pub snapshot_a: Option<MixerSnapshot>,
+    /// Snapshot slot B for A/B comparison.
+    pub snapshot_b: Option<MixerSnapshot>,
+    /// Which snapshot is currently active (applied).
+    pub active_snapshot: Option<SnapshotSlot>,
 }
 
 impl Default for AppState {
@@ -477,7 +516,47 @@ impl AppState {
             auto_routed_apps: HashSet::new(),
             routing_rules_panel_open: false,
             editing_rule: None,
+            snapshot_a: None,
+            snapshot_b: None,
+            active_snapshot: None,
         }
+    }
+
+    /// Capture current mixer state as a snapshot.
+    pub fn capture_snapshot(&self) -> MixerSnapshot {
+        MixerSnapshot {
+            channels: self.channels.iter().map(|c| ChannelSnapshot {
+                id: c.id,
+                volume_db: c.volume_db,
+                muted: c.muted,
+                eq_enabled: c.eq_enabled,
+                eq_preset: c.eq_preset.clone(),
+            }).collect(),
+            master_volume_db: self.master_volume_db,
+            master_muted: self.master_muted,
+        }
+    }
+
+    /// Apply a snapshot to the current state. Returns channel IDs that were modified.
+    pub fn apply_snapshot(&mut self, snapshot: &MixerSnapshot) -> Vec<Uuid> {
+        let mut modified = Vec::new();
+
+        // Apply master settings
+        self.master_volume_db = snapshot.master_volume_db;
+        self.master_muted = snapshot.master_muted;
+
+        // Apply channel settings
+        for snap_channel in &snapshot.channels {
+            if let Some(channel) = self.channel_mut(snap_channel.id) {
+                channel.volume_db = snap_channel.volume_db;
+                channel.muted = snap_channel.muted;
+                channel.eq_enabled = snap_channel.eq_enabled;
+                channel.eq_preset = snap_channel.eq_preset.clone();
+                modified.push(channel.id);
+            }
+        }
+
+        modified
     }
 
     /// Find a channel by name.

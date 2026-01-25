@@ -15,10 +15,12 @@ use uuid::Uuid;
 
 /// Create a channel strip widget for a mixer channel.
 /// `editing` is Some((channel_id, current_text)) if this channel's name is being edited.
+/// `has_active_snapshot` indicates whether there's an active snapshot to save to.
 pub fn channel_strip<'a>(
     channel: &'a MixerChannel,
     dragging: Option<&'a (u32, String)>,
     editing: Option<&'a (Uuid, String)>,
+    has_active_snapshot: bool,
 ) -> Element<'a, Message> {
     let id = channel.id;
     let volume_db = channel.volume_db;
@@ -123,7 +125,7 @@ pub fn channel_strip<'a>(
     let mute_icon = if muted { "M" } else { "S" }; // M for muted, S for sound
     let mute_button = button(text(mute_icon).size(14))
         .padding([6, 10])
-        .style(move |theme: &Theme, status| {
+        .style(move |_theme: &Theme, _status| {
             let bg_color = if muted {
                 MUTED_COLOR
             } else {
@@ -137,6 +139,25 @@ pub fn channel_strip<'a>(
             }
         })
         .on_press(Message::ChannelMuteToggled(id));
+
+    // Save to snapshot button (checkmark) - only shown when there's an active snapshot
+    let save_button: Element<Message> = if has_active_snapshot {
+        button(text("✓").size(12))
+            .padding([4, 8])
+            .style(|_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(if is_hovered { SUCCESS } else { SURFACE_LIGHT })),
+                    text_color: if is_hovered { TEXT } else { SUCCESS },
+                    border: Border::default().rounded(BORDER_RADIUS_SMALL),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::SaveChannelToSnapshot(id))
+            .into()
+    } else {
+        Space::new().width(0).height(0).into()
+    };
 
     // Assigned apps list or drop indicator
     let apps_list: Element<Message> = if is_drop_target {
@@ -226,8 +247,13 @@ pub fn channel_strip<'a>(
         // Volume display
         volume_text,
         Space::new().height(SPACING_SMALL),
-        // Mute button
-        mute_button,
+        // Mute and save buttons row
+        row![
+            mute_button,
+            Space::new().width(SPACING_SMALL),
+            save_button,
+        ]
+        .align_y(Alignment::Center),
         Space::new().height(SPACING),
         // Apps list
         apps_list,

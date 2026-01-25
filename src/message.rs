@@ -6,6 +6,7 @@
 
 use crate::audio::types::{PwLink, PwNode, PwPort};
 use crate::config::eq_preset::EqPreset;
+use crate::state::SnapshotSlot;
 use uuid::Uuid;
 
 /// All messages in the application.
@@ -112,6 +113,16 @@ pub enum Message {
     SaveRoutingRule,
     /// Create a quick rule from an app (app_name, binary, target_channel).
     CreateQuickRule(String, Option<String>, String),
+
+    // ==================== Snapshot A/B Comparison ====================
+    /// Capture current mixer state to a snapshot slot.
+    CaptureSnapshot(SnapshotSlot),
+    /// Recall (apply) a snapshot from a slot.
+    RecallSnapshot(SnapshotSlot),
+    /// Clear a snapshot slot.
+    ClearSnapshot(SnapshotSlot),
+    /// Save a single channel's current state to the active snapshot.
+    SaveChannelToSnapshot(Uuid),
 
     // ==================== PipeWire Events (from PW thread) ====================
     /// PipeWire connection established.

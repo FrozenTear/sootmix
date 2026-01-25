@@ -7,7 +7,7 @@
 use crate::audio::{MeterManager, PwCommand, PwEvent, PwThread};
 use crate::config::{ConfigManager, MixerConfig, RoutingRulesConfig, SavedChannel};
 use crate::message::Message;
-use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel};
+use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel, SnapshotSlot};
 use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{channel_strip, master_strip};
 use crate::ui::routing_rules_panel::routing_rules_panel;
@@ -128,7 +128,7 @@ impl SootMix {
                 }
             }
             Message::ChannelVolumeReleased(_id) => {
-                // Could trigger save here
+                // Volume changes don't auto-save to snapshot - user must click the active slot to save
             }
             Message::ChannelMuteToggled(id) => {
                 let cmd = if let Some(channel) = self.state.channel_mut(id) {
@@ -606,6 +606,125 @@ impl SootMix {
                 info!("Created quick routing rule for '{}'", app_name);
             }
 
+            // ==================== Snapshot A/B Comparison ====================
+            Message::CaptureSnapshot(slot) => {
+                let snapshot = self.state.capture_snapshot();
+                info!(
+                    "Captured snapshot {:?}: master_db={:.1}, {} channels",
+                    slot, snapshot.master_volume_db, snapshot.channels.len()
+                );
+                for ch in &snapshot.channels {
+                    info!("  Channel {}: volume_db={:.1}, muted={}", ch.id, ch.volume_db, ch.muted);
+                }
+                match slot {
+                    SnapshotSlot::A => self.state.snapshot_a = Some(snapshot),
+                    SnapshotSlot::B => self.state.snapshot_b = Some(snapshot),
+                }
+                self.state.active_snapshot = Some(slot);
+            }
+            Message::RecallSnapshot(slot) => {
+                let snapshot = match slot {
+                    SnapshotSlot::A => self.state.snapshot_a.clone(),
+                    SnapshotSlot::B => self.state.snapshot_b.clone(),
+                };
+                if let Some(snapshot) = snapshot {
+                    info!(
+                        "Recalling snapshot {:?}: master_db={:.1}, {} channels",
+                        slot, snapshot.master_volume_db, snapshot.channels.len()
+                    );
+                    for ch in &snapshot.channels {
+                        info!("  Channel {}: volume_db={:.1}", ch.id, ch.volume_db);
+                    }
+
+                    let modified = self.state.apply_snapshot(&snapshot);
+                    info!("Applied snapshot, modified {} channels", modified.len());
+
+                    // Send PipeWire commands for changed channels
+                    for channel_id in modified {
+                        if let Some(channel) = self.state.channel(channel_id) {
+                            if let Some(node_id) = channel.pw_sink_id {
+                                let linear_vol = channel.volume_linear();
+                                debug!(
+                                    "Setting channel {} volume: db={:.1}, linear={:.3}",
+                                    channel.name, channel.volume_db, linear_vol
+                                );
+                                self.send_pw_command(PwCommand::SetVolume {
+                                    node_id,
+                                    volume: linear_vol,
+                                });
+                                self.send_pw_command(PwCommand::SetMute {
+                                    node_id,
+                                    muted: channel.muted,
+                                });
+                            }
+                        }
+                    }
+
+                    // Apply master volume/mute
+                    if let Some(node_id) = self.get_output_device_node_id() {
+                        let linear = db_to_linear(self.state.master_volume_db);
+                        debug!(
+                            "Setting master volume: db={:.1}, linear={:.3}",
+                            self.state.master_volume_db, linear
+                        );
+                        self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                        self.send_pw_command(PwCommand::SetMute {
+                            node_id,
+                            muted: self.state.master_muted,
+                        });
+                    }
+
+                    self.state.active_snapshot = Some(slot);
+                }
+            }
+            Message::ClearSnapshot(slot) => {
+                info!("Clearing snapshot {:?}", slot);
+                match slot {
+                    SnapshotSlot::A => self.state.snapshot_a = None,
+                    SnapshotSlot::B => self.state.snapshot_b = None,
+                }
+                if self.state.active_snapshot == Some(slot) {
+                    self.state.active_snapshot = None;
+                }
+            }
+            Message::SaveChannelToSnapshot(channel_id) => {
+                // Save just this channel's current state to the active snapshot
+                if let Some(slot) = self.state.active_snapshot {
+                    // First, capture the channel data we need
+                    let channel_data = self.state.channel(channel_id).map(|channel| {
+                        (
+                            channel.name.clone(),
+                            crate::state::ChannelSnapshot {
+                                id: channel.id,
+                                volume_db: channel.volume_db,
+                                muted: channel.muted,
+                                eq_enabled: channel.eq_enabled,
+                                eq_preset: channel.eq_preset.clone(),
+                            },
+                        )
+                    });
+
+                    if let Some((channel_name, channel_snapshot)) = channel_data {
+                        // Get the snapshot to update
+                        let snapshot = match slot {
+                            SnapshotSlot::A => &mut self.state.snapshot_a,
+                            SnapshotSlot::B => &mut self.state.snapshot_b,
+                        };
+
+                        if let Some(ref mut snap) = snapshot {
+                            // Find and update the channel in the snapshot, or add it
+                            if let Some(existing) = snap.channels.iter_mut().find(|c| c.id == channel_id) {
+                                *existing = channel_snapshot;
+                                info!("Updated channel {} in snapshot {:?}", channel_name, slot);
+                            } else {
+                                snap.channels.push(channel_snapshot);
+                                info!("Added channel {} to snapshot {:?}", channel_name, slot);
+                            }
+                        }
+                    }
+                }
+            }
+
             // ==================== PipeWire Events ====================
             Message::PwConnected => {
                 info!("Connected to PipeWire");
@@ -722,10 +841,15 @@ impl SootMix {
 
                 // Restore config after PipeWire discovery delay (~200ms)
                 if !self.state.startup_complete
-                    && self.pending_config.is_some()
                     && self.startup_time.elapsed() > std::time::Duration::from_millis(200)
                 {
-                    self.restore_config();
+                    if self.pending_config.is_some() {
+                        self.restore_config();
+                    } else {
+                        // No saved config - just mark startup complete and init snapshot
+                        self.state.startup_complete = true;
+                        self.initialize_default_snapshot();
+                    }
                 }
 
                 // Check for auto-routing periodically after startup
@@ -852,6 +976,11 @@ impl SootMix {
             .size(12)
             .color(TEXT_DIM);
 
+        // A/B Snapshot buttons and Save button
+        let snapshot_a_button = self.snapshot_button(SnapshotSlot::A);
+        let snapshot_b_button = self.snapshot_button(SnapshotSlot::B);
+        let snapshot_save_button = self.snapshot_save_button();
+
         let rules_count = self.state.routing_rules.rules.len();
         let rules_button = button(
             text(format!("Rules ({})", rules_count)).size(12)
@@ -882,6 +1011,12 @@ impl SootMix {
             Space::new().width(Fill),
             preset_text,
             Space::new().width(SPACING),
+            snapshot_a_button,
+            Space::new().width(SPACING_SMALL),
+            snapshot_b_button,
+            Space::new().width(SPACING_SMALL),
+            snapshot_save_button,
+            Space::new().width(SPACING),
             rules_button,
             Space::new().width(SPACING_SMALL),
             settings_button,
@@ -890,17 +1025,115 @@ impl SootMix {
         .into()
     }
 
+    /// Create a snapshot button (A or B) with appropriate styling based on state.
+    /// Behavior:
+    /// - Empty slot: click to capture current state
+    /// - Filled slot (not active): click to recall
+    /// - Filled slot (active): no action (use Save button to update)
+    fn snapshot_button(&self, slot: SnapshotSlot) -> Element<Message> {
+        let label = match slot {
+            SnapshotSlot::A => "A",
+            SnapshotSlot::B => "B",
+        };
+
+        let has_snapshot = match slot {
+            SnapshotSlot::A => self.state.snapshot_a.is_some(),
+            SnapshotSlot::B => self.state.snapshot_b.is_some(),
+        };
+
+        let is_active = self.state.active_snapshot == Some(slot);
+
+        // Style based on state
+        let (bg_color, text_color, border_color) = if is_active {
+            // Active snapshot: highlighted
+            (PRIMARY, TEXT, PRIMARY)
+        } else if has_snapshot {
+            // Filled but not active: normal
+            (SURFACE_LIGHT, TEXT, SURFACE_LIGHT)
+        } else {
+            // Empty slot: dim
+            (SURFACE, TEXT_DIM, SURFACE)
+        };
+
+        let btn = button(text(label).size(12))
+            .padding([6, 10])
+            .style(move |_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(bg_color)),
+                text_color,
+                border: iced::Border {
+                    color: border_color,
+                    width: if is_active { 2.0 } else { 1.0 },
+                    radius: 4.0.into(),
+                },
+                ..button::Style::default()
+            });
+
+        // Determine action based on state:
+        // - Empty slot: capture
+        // - Filled and not active: recall
+        // - Filled and active: no action
+        if is_active {
+            btn.into() // No on_press - button is disabled when active
+        } else if has_snapshot {
+            btn.on_press(Message::RecallSnapshot(slot)).into()
+        } else {
+            btn.on_press(Message::CaptureSnapshot(slot)).into()
+        }
+    }
+
+    /// Create the "Save All" button for saving entire mixer state to active snapshot.
+    fn snapshot_save_button(&self) -> Element<Message> {
+        let has_active = self.state.active_snapshot.is_some();
+
+        let btn = button(text("Save").size(11))
+            .padding([5, 8])
+            .style(move |_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let bg = if !has_active {
+                    SURFACE
+                } else if is_hovered {
+                    SUCCESS
+                } else {
+                    SURFACE_LIGHT
+                };
+                let txt = if !has_active {
+                    TEXT_DIM
+                } else if is_hovered {
+                    TEXT
+                } else {
+                    SUCCESS
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: txt,
+                    border: iced::Border {
+                        color: if has_active { SUCCESS } else { SURFACE },
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            });
+
+        if let Some(slot) = self.state.active_snapshot {
+            btn.on_press(Message::CaptureSnapshot(slot)).into()
+        } else {
+            btn.into() // Disabled when no active snapshot
+        }
+    }
+
     /// View the channel strips area.
     fn view_channel_strips(&self) -> Element<Message> {
         let dragging = self.state.dragging_app.as_ref();
         let editing = self.state.editing_channel.as_ref();
+        let has_active_snapshot = self.state.active_snapshot.is_some();
 
         // Build channel strip widgets
         let mut strips: Vec<Element<Message>> = self
             .state
             .channels
             .iter()
-            .map(|c| channel_strip(c, dragging, editing))
+            .map(|c| channel_strip(c, dragging, editing, has_active_snapshot))
             .collect();
 
         // Add separator before master
@@ -998,6 +1231,19 @@ impl SootMix {
                 .filter_map(|c| c.pw_sink_id)
                 .collect();
             find_hardware_sink(&self.state.pw_graph, &our_sink_ids)
+        }
+    }
+
+    /// Initialize snapshot A with current state if not already set.
+    fn initialize_default_snapshot(&mut self) {
+        if self.state.snapshot_a.is_none() && self.state.active_snapshot.is_none() {
+            let snapshot = self.state.capture_snapshot();
+            info!(
+                "Initializing snapshot A: master_db={:.1}, {} channels",
+                snapshot.master_volume_db, snapshot.channels.len()
+            );
+            self.state.snapshot_a = Some(snapshot);
+            self.state.active_snapshot = Some(SnapshotSlot::A);
         }
     }
 
@@ -1266,6 +1512,9 @@ impl SootMix {
             }
 
             self.state.startup_complete = true;
+
+            // Initialize snapshot A with the restored state
+            self.initialize_default_snapshot();
         }
     }
 }
