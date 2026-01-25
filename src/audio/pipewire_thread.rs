@@ -57,6 +57,8 @@ pub enum PwCommand {
         q: f32,
         gain: f32,
     },
+    /// Set the default audio output sink.
+    SetDefaultSink { node_id: u32 },
     /// Shutdown the PipeWire thread.
     Shutdown,
 }
@@ -565,6 +567,38 @@ fn handle_command(
             );
             // TODO: Implement EQ control
             warn!("EQ control not yet implemented");
+        }
+
+        PwCommand::SetDefaultSink { node_id } => {
+            info!("Setting default sink to node {}", node_id);
+            // Use wpctl to set default sink (simpler than native API for metadata)
+            let output = std::process::Command::new("wpctl")
+                .args(["set-default", &node_id.to_string()])
+                .output();
+
+            match output {
+                Ok(result) => {
+                    if result.status.success() {
+                        info!("Successfully set default sink to node {}", node_id);
+                    } else {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        warn!("wpctl set-default failed: {}", stderr);
+                        let event_tx = state.borrow().event_tx.clone();
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to set default sink: {}",
+                            stderr
+                        )));
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to run wpctl: {}", e);
+                    let event_tx = state.borrow().event_tx.clone();
+                    let _ = event_tx.send(PwEvent::Error(format!(
+                        "Failed to set default sink: {}",
+                        e
+                    )));
+                }
+            }
         }
     }
 }

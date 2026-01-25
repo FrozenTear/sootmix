@@ -4,10 +4,11 @@
 
 //! Channel strip UI component.
 
+use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::state::MixerChannel;
 use crate::ui::theme::{self, *};
-use iced::widget::{button, column, container, row, slider, text, text_input, vertical_slider, Space};
+use iced::widget::{button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
 
@@ -269,7 +270,12 @@ pub fn channel_strip<'a>(
 }
 
 /// Create a master channel strip widget.
-pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) -> Element<'_, Message> {
+pub fn master_strip<'a>(
+    volume_db: f32,
+    muted: bool,
+    available_outputs: &'a [OutputDevice],
+    selected_output: Option<&'a str>,
+) -> Element<'a, Message> {
     // Title
     let title = text("Master")
         .size(14)
@@ -280,7 +286,7 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
         .step(0.5)
         .height(VOLUME_SLIDER_HEIGHT)
         .on_release(Message::MasterVolumeReleased)
-        .style(move |theme: &Theme, status| {
+        .style(move |_theme: &Theme, _status| {
             slider::Style {
                 rail: slider::Rail {
                     backgrounds: (
@@ -311,7 +317,7 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
     let mute_icon = if muted { "M" } else { "S" };
     let mute_button = button(text(mute_icon).size(14))
         .padding([6, 10])
-        .style(move |theme: &Theme, status| {
+        .style(move |_theme: &Theme, _status| {
             let bg_color = if muted {
                 MUTED_COLOR
             } else {
@@ -326,13 +332,46 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
         })
         .on_press(Message::MasterMuteToggled);
 
-    // Output device display
-    let output_text = text(format!(
-        "Output:\n{}",
-        truncate_string(output_device.unwrap_or("Default"), 12)
-    ))
-    .size(10)
-    .color(TEXT_DIM);
+    // Output device picker
+    let output_options: Vec<String> = available_outputs
+        .iter()
+        .map(|d| d.description.clone())
+        .collect();
+
+    let output_picker: Element<'a, Message> = if output_options.is_empty() {
+        text("No outputs")
+            .size(10)
+            .color(TEXT_DIM)
+            .into()
+    } else {
+        let selected = selected_output.map(|s| s.to_string());
+        column![
+            text("Output").size(10).color(TEXT_DIM),
+            pick_list(
+                output_options,
+                selected,
+                Message::OutputDeviceChanged,
+            )
+            .placeholder("Select...")
+            .text_size(11)
+            .padding([4, 8])
+            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
+            .style(|_theme: &Theme, _status| {
+                pick_list::Style {
+                    text_color: TEXT,
+                    placeholder_color: TEXT_DIM,
+                    handle_color: TEXT_DIM,
+                    background: Background::Color(SURFACE_LIGHT),
+                    border: Border::default()
+                        .rounded(BORDER_RADIUS_SMALL)
+                        .color(SURFACE_LIGHT)
+                        .width(1.0),
+                }
+            }),
+        ]
+        .spacing(2)
+        .into()
+    };
 
     // Assemble
     let content = column![
@@ -344,7 +383,7 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
         Space::new().height(SPACING_SMALL),
         mute_button,
         Space::new().height(SPACING),
-        output_text,
+        output_picker,
     ]
     .align_x(Alignment::Center)
     .padding(PADDING)
@@ -352,7 +391,7 @@ pub fn master_strip(volume_db: f32, muted: bool, output_device: Option<&str>) ->
 
     container(content)
         .width(CHANNEL_STRIP_WIDTH)
-        .style(|theme: &Theme| {
+        .style(|_theme: &Theme| {
             container::Style {
                 background: Some(Background::Color(SURFACE)),
                 border: Border::default()

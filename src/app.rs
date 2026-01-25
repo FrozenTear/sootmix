@@ -7,7 +7,7 @@
 use crate::audio::{PwCommand, PwEvent, PwThread};
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
-use crate::state::{AppState, MixerChannel};
+use crate::state::{db_to_linear, AppState, MixerChannel};
 use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{channel_strip, master_strip};
 use crate::ui::theme::{self, *};
@@ -421,16 +421,48 @@ impl SootMix {
             // ==================== Master Actions ====================
             Message::MasterVolumeChanged(volume) => {
                 self.state.master_volume_db = volume;
-                // TODO: Apply to actual output
+                // Apply to selected output device
+                if let Some(node_id) = self.get_output_device_node_id() {
+                    let linear = db_to_linear(volume);
+                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                }
             }
             Message::MasterVolumeReleased => {
                 debug!("Master volume released");
+                self.save_config();
             }
             Message::MasterMuteToggled => {
                 self.state.master_muted = !self.state.master_muted;
+                if let Some(node_id) = self.get_output_device_node_id() {
+                    self.send_pw_command(PwCommand::SetMute {
+                        node_id,
+                        muted: self.state.master_muted,
+                    });
+                }
+                self.save_config();
             }
-            Message::OutputDeviceChanged(device) => {
-                self.state.output_device = Some(device);
+            Message::OutputDeviceChanged(device_name) => {
+                info!("Output device changed to: {}", device_name);
+                self.state.output_device = Some(device_name.clone());
+
+                // Find the node_id for this device
+                if let Some(device) = self.state.available_outputs.iter()
+                    .find(|d| d.description == device_name || d.name == device_name)
+                {
+                    let node_id = device.node_id;
+
+                    // Set as default sink (pw-loopbacks will automatically route here)
+                    self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+
+                    // Apply current master volume/mute to new device
+                    let linear = db_to_linear(self.state.master_volume_db);
+                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                    if self.state.master_muted {
+                        self.send_pw_command(PwCommand::SetMute { node_id, muted: true });
+                    }
+                }
+
+                self.save_config();
             }
 
             // ==================== EQ Panel ====================
@@ -701,6 +733,7 @@ impl SootMix {
         strips.push(master_strip(
             self.state.master_volume_db,
             self.state.master_muted,
+            &self.state.available_outputs,
             self.state.output_device.as_deref(),
         ));
 
@@ -763,6 +796,22 @@ impl SootMix {
             if let Err(e) = thread.send(cmd) {
                 error!("Failed to send command to PipeWire thread: {}", e);
             }
+        }
+    }
+
+    /// Get the node ID of the selected output device (or find default hardware sink).
+    fn get_output_device_node_id(&self) -> Option<u32> {
+        // If user selected a device, find its node_id
+        if let Some(ref device_name) = self.state.output_device {
+            self.state.available_outputs.iter()
+                .find(|d| d.description == *device_name || d.name == *device_name)
+                .map(|d| d.node_id)
+        } else {
+            // Use hardware sink finder as fallback
+            let our_sink_ids: Vec<u32> = self.state.channels.iter()
+                .filter_map(|c| c.pw_sink_id)
+                .collect();
+            find_hardware_sink(&self.state.pw_graph, &our_sink_ids)
         }
     }
 
@@ -884,7 +933,35 @@ impl SootMix {
             // Restore master settings
             self.state.master_volume_db = config.master.volume_db;
             self.state.master_muted = config.master.muted;
-            self.state.output_device = config.master.output_device;
+            self.state.output_device = config.master.output_device.clone();
+
+            // Apply master volume/mute/device to output
+            if let Some(ref device_name) = config.master.output_device {
+                // Find the device and set it as default with proper volume/mute
+                if let Some(device) = self.state.available_outputs.iter()
+                    .find(|d| d.description == *device_name || d.name == *device_name)
+                {
+                    let node_id = device.node_id;
+                    info!("Restoring output device: {} (node {})", device_name, node_id);
+
+                    // Set as default sink
+                    self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+
+                    // Apply volume and mute
+                    let linear = db_to_linear(config.master.volume_db);
+                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                    if config.master.muted {
+                        self.send_pw_command(PwCommand::SetMute { node_id, muted: true });
+                    }
+                }
+            } else if let Some(node_id) = self.get_output_device_node_id() {
+                // No saved device, but apply volume/mute to default
+                let linear = db_to_linear(config.master.volume_db);
+                self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                if config.master.muted {
+                    self.send_pw_command(PwCommand::SetMute { node_id, muted: true });
+                }
+            }
 
             for saved in config.channels {
                 if saved.is_managed {
