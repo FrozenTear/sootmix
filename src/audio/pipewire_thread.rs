@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -122,6 +123,9 @@ struct CreatedLink {
     proxy: Link,
 }
 
+/// Minimum interval between CLI fallback commands per node.
+const CLI_THROTTLE_MS: u64 = 50;
+
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -138,6 +142,8 @@ struct PwThreadState {
     created_links: HashMap<(u32, u32), CreatedLink>,
     /// Event sender for notifying UI.
     event_tx: Rc<mpsc::Sender<PwEvent>>,
+    /// Last CLI command time per node (for throttling fallback).
+    cli_last_cmd: HashMap<u32, Instant>,
 }
 
 impl PwThreadState {
@@ -150,7 +156,23 @@ impl PwThreadState {
             bound_nodes: HashMap::new(),
             created_links: HashMap::new(),
             event_tx,
+            cli_last_cmd: HashMap::new(),
         }
+    }
+
+    /// Check if CLI fallback should be throttled for this node.
+    /// Returns true if enough time has passed and updates the timestamp.
+    fn should_run_cli(&mut self, node_id: u32) -> bool {
+        let now = Instant::now();
+        let throttle = Duration::from_millis(CLI_THROTTLE_MS);
+
+        if let Some(last) = self.cli_last_cmd.get(&node_id) {
+            if now.duration_since(*last) < throttle {
+                return false;
+            }
+        }
+        self.cli_last_cmd.insert(node_id, now);
+        true
     }
 
     /// Get node ID for a port.
@@ -488,38 +510,42 @@ fn handle_command(
         }
 
         PwCommand::SetVolume { node_id, volume } => {
-            info!("PW cmd: SetVolume node={} volume={:.3}", node_id, volume);
+            trace!("PW cmd: SetVolume node={} volume={:.3}", node_id, volume);
 
             // Try native API first if node is bound
             let result = state.borrow().set_node_volume(node_id, volume);
             match result {
                 Ok(()) => {
-                    info!("Native volume control succeeded for node {}", node_id);
+                    trace!("Native volume control succeeded for node {}", node_id);
                 }
                 Err(e) => {
-                    // Node not bound or native failed, use CLI fallback
-                    info!("Native volume failed ({}), using CLI fallback", e);
-                    if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
-                        error!("CLI volume control also failed: {}", e2);
+                    // Node not bound or native failed, use throttled CLI fallback
+                    if state.borrow_mut().should_run_cli(node_id) {
+                        debug!("Native volume failed ({}), using CLI fallback", e);
+                        if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                            error!("CLI volume control also failed: {}", e2);
+                        }
                     }
                 }
             }
         }
 
         PwCommand::SetMute { node_id, muted } => {
-            info!("PW cmd: SetMute node={} muted={}", node_id, muted);
+            trace!("PW cmd: SetMute node={} muted={}", node_id, muted);
 
             // Try native API first if node is bound
             let result = state.borrow().set_node_mute(node_id, muted);
             match result {
                 Ok(()) => {
-                    info!("Native mute control succeeded for node {}", node_id);
+                    trace!("Native mute control succeeded for node {}", node_id);
                 }
                 Err(e) => {
-                    // Node not bound or native failed, use CLI fallback
-                    info!("Native mute failed ({}), using CLI fallback", e);
-                    if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
-                        error!("CLI mute control also failed: {}", e2);
+                    // Node not bound or native failed, use throttled CLI fallback
+                    if state.borrow_mut().should_run_cli(node_id) {
+                        debug!("Native mute failed ({}), using CLI fallback", e);
+                        if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
+                            error!("CLI mute control also failed: {}", e2);
+                        }
                     }
                 }
             }
@@ -530,7 +556,7 @@ fn handle_command(
             volume,
             muted,
         } => {
-            debug!(
+            trace!(
                 "Setting volume+mute on node {}: vol={:.3}, mute={}",
                 node_id, volume, muted
             );
@@ -542,13 +568,15 @@ fn handle_command(
                     trace!("Native volume+mute control succeeded for node {}", node_id);
                 }
                 Err(e) => {
-                    // Node not bound or native failed, use CLI fallback
-                    debug!("Native volume+mute failed ({}), using CLI fallback", e);
-                    if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
-                        warn!("CLI volume control failed: {}", e2);
-                    }
-                    if let Err(e3) = crate::audio::volume::set_mute(node_id, muted) {
-                        warn!("CLI mute control failed: {}", e3);
+                    // Node not bound or native failed, use throttled CLI fallback
+                    if state.borrow_mut().should_run_cli(node_id) {
+                        debug!("Native volume+mute failed ({}), using CLI fallback", e);
+                        if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                            warn!("CLI volume control failed: {}", e2);
+                        }
+                        if let Err(e3) = crate::audio::volume::set_mute(node_id, muted) {
+                            warn!("CLI mute control failed: {}", e3);
+                        }
                     }
                 }
             }
