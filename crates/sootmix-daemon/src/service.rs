@@ -12,8 +12,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// D-Bus signal events that need to be emitted.
+#[derive(Debug, Clone)]
+pub enum SignalEvent {
+    AppDiscovered(AppInfo),
+    AppRemoved(String),
+    OutputsChanged,
+}
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -380,6 +389,8 @@ pub struct DaemonService {
     pw_thread: Option<PwThread>,
     pw_event_rx: Option<mpsc::Receiver<PwEvent>>,
     config_manager: ConfigManager,
+    /// Sender for D-Bus signal events.
+    signal_tx: Option<tokio_mpsc::UnboundedSender<SignalEvent>>,
 }
 
 // Manual impl of Send for DaemonService
@@ -397,6 +408,49 @@ impl DaemonService {
             pw_thread: None,
             pw_event_rx: None,
             config_manager,
+            signal_tx: None,
+        }
+    }
+
+    /// Set the signal sender for D-Bus signal events.
+    pub fn set_signal_sender(&mut self, tx: tokio_mpsc::UnboundedSender<SignalEvent>) {
+        self.signal_tx = Some(tx);
+    }
+
+    /// Send a signal event to be emitted via D-Bus.
+    fn emit_signal(&self, event: SignalEvent) {
+        if let Some(ref tx) = self.signal_tx {
+            if let Err(e) = tx.send(event) {
+                warn!("Failed to send signal event: {}", e);
+            }
+        }
+    }
+
+    /// Update available apps and emit D-Bus signals for changes.
+    fn update_apps_and_emit_signals(&mut self) {
+        // Capture old app node IDs
+        let old_app_ids: HashSet<u32> = self.state.apps.iter().map(|a| a.node_id).collect();
+
+        // Update the app list
+        self.state.update_available_apps();
+
+        // Find new and removed apps
+        let new_app_ids: HashSet<u32> = self.state.apps.iter().map(|a| a.node_id).collect();
+
+        // Emit signals for newly discovered apps
+        for app in &self.state.apps {
+            if !old_app_ids.contains(&app.node_id) {
+                debug!("Emitting AppDiscovered signal for: {} (node {})", app.name, app.node_id);
+                self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
+            }
+        }
+
+        // Emit signals for removed apps
+        for old_id in &old_app_ids {
+            if !new_app_ids.contains(old_id) {
+                debug!("Emitting AppRemoved signal for node {}", old_id);
+                self.emit_signal(SignalEvent::AppRemoved(old_id.to_string()));
+            }
         }
     }
 
@@ -501,15 +555,7 @@ impl DaemonService {
         self.state.refresh_counter += 1;
         if self.state.refresh_counter >= 20 {
             self.state.refresh_counter = 0;
-            let old_count = self.state.apps.len();
-            self.state.update_available_apps();
-            if self.state.apps.len() != old_count {
-                debug!(
-                    "Periodic refresh: app count changed from {} to {}",
-                    old_count,
-                    self.state.apps.len()
-                );
-            }
+            self.update_apps_and_emit_signals();
         }
     }
 
@@ -527,14 +573,14 @@ impl DaemonService {
                 let node_id = node.id;
                 let node_name = node.name.clone();
                 self.state.pw_graph.nodes.insert(node.id, node);
-                self.state.update_available_apps();
+                self.update_apps_and_emit_signals();
 
                 // Auto-route apps that match saved assignments
                 self.try_auto_route_app(node_id, &node_name);
             }
             PwEvent::NodeRemoved(id) => {
                 self.state.pw_graph.nodes.remove(&id);
-                self.state.update_available_apps();
+                self.update_apps_and_emit_signals();
 
                 // Check if this was a channel's sink or loopback output and clear stale IDs
                 for channel in &mut self.state.channels {
@@ -556,7 +602,7 @@ impl DaemonService {
             }
             PwEvent::NodeChanged(node) => {
                 self.state.pw_graph.nodes.insert(node.id, node);
-                self.state.update_available_apps();
+                self.update_apps_and_emit_signals();
             }
             PwEvent::PortAdded(port) => {
                 let port_node_id = port.node_id;
@@ -565,7 +611,7 @@ impl DaemonService {
                 // Port arrival is a good signal that a node is fully initialized.
                 // Refresh app list to catch nodes that were added with incomplete properties.
                 let old_app_count = self.state.apps.len();
-                self.state.update_available_apps();
+                self.update_apps_and_emit_signals();
                 if self.state.apps.len() > old_app_count {
                     debug!(
                         "Found {} new app(s) after port added for node {}",

@@ -13,10 +13,12 @@ mod dbus;
 mod service;
 
 use dbus::DaemonDbusService;
+use service::SignalEvent;
 use sootmix_ipc::{DBUS_NAME, DBUS_PATH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
+use tokio::sync::mpsc as tokio_mpsc;
+use tracing::{debug, error, info, warn};
 use zbus::connection::Builder;
 
 #[tokio::main]
@@ -43,9 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         routing_rules.rules.len()
     );
 
+    // Create signal channel for D-Bus signal events
+    let (signal_tx, signal_rx) = tokio_mpsc::unbounded_channel::<SignalEvent>();
+
     // Create the daemon service
     let mut daemon_service =
         service::DaemonService::new(mixer_config, routing_rules, config_manager);
+    daemon_service.set_signal_sender(signal_tx);
 
     // Start PipeWire thread
     if let Err(e) = daemon_service.start_pipewire() {
@@ -71,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dbus_service = DaemonDbusService::new(service.clone());
 
     // Build D-Bus connection
-    let _connection = Builder::session()?
+    let connection = Builder::session()?
         .name(DBUS_NAME)?
         .serve_at(DBUS_PATH, dbus_service)?
         .build()
@@ -95,6 +101,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn task to emit D-Bus signals from the signal channel
+    let shutdown_flag_signals = shutdown_flag.clone();
+    let signal_task = tokio::spawn(async move {
+        let mut signal_rx = signal_rx;
+        loop {
+            tokio::select! {
+                Some(event) = signal_rx.recv() => {
+                    let object_server = connection.object_server();
+                    let iface_ref = match object_server.interface::<_, DaemonDbusService>(DBUS_PATH).await {
+                        Ok(iface) => iface,
+                        Err(e) => {
+                            warn!("Failed to get D-Bus interface for signal: {}", e);
+                            continue;
+                        }
+                    };
+                    let ctx = iface_ref.signal_context();
+                    match event {
+                        SignalEvent::AppDiscovered(app) => {
+                            debug!("Emitting D-Bus AppDiscovered signal: {}", app.name);
+                            if let Err(e) = dbus::emit_app_discovered(ctx, app).await {
+                                warn!("Failed to emit AppDiscovered signal: {}", e);
+                            }
+                        }
+                        SignalEvent::AppRemoved(app_id) => {
+                            debug!("Emitting D-Bus AppRemoved signal: {}", app_id);
+                            if let Err(e) = dbus::emit_app_removed(ctx, &app_id).await {
+                                warn!("Failed to emit AppRemoved signal: {}", e);
+                            }
+                        }
+                        SignalEvent::OutputsChanged => {
+                            debug!("Emitting D-Bus OutputsChanged signal");
+                            if let Err(e) = dbus::emit_outputs_changed(ctx).await {
+                                warn!("Failed to emit OutputsChanged signal: {}", e);
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    if shutdown_flag_signals.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     // Handle shutdown signals
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -108,11 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Signal the event task to stop
+    // Signal the tasks to stop
     shutdown_flag.store(true, Ordering::Relaxed);
 
-    // Wait for event task to finish (with timeout)
+    // Wait for tasks to finish (with timeout)
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), event_task).await;
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), signal_task).await;
 
     // Cleanup
     if let Ok(mut svc) = service.lock() {

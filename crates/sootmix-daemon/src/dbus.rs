@@ -579,3 +579,53 @@ impl DaemonDbusService {
         channel: ChannelInfo,
     ) -> zbus::Result<()>;
 }
+
+// ==================== Public Signal Emission Helpers ====================
+// These functions allow emitting D-Bus signals from outside the interface methods.
+
+const INTERFACE_NAME: &str = "com.sootmix.Daemon";
+
+/// Emit AppDiscovered signal.
+pub async fn emit_app_discovered(
+    ctx: &zbus::SignalContext<'_>,
+    app: AppInfo,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "AppDiscovered",
+            &(app,),
+        )
+        .await
+}
+
+/// Emit AppRemoved signal.
+pub async fn emit_app_removed(
+    ctx: &zbus::SignalContext<'_>,
+    app_id: &str,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "AppRemoved",
+            &(app_id,),
+        )
+        .await
+}
+
+/// Emit OutputsChanged signal.
+pub async fn emit_outputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "OutputsChanged",
+            &(),
+        )
+        .await
+}
