@@ -26,117 +26,272 @@ impl DaemonDbusService {
     // ==================== Channel Management ====================
 
     /// Create a new mixer channel.
-    async fn create_channel(&self, name: &str) -> zbus::fdo::Result<String> {
+    async fn create_channel(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        name: &str,
+    ) -> zbus::fdo::Result<String> {
         debug!("D-Bus: create_channel({})", name);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.create_channel(name)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let (channel_id, channel_info) = {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            let id = service.create_channel(name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get the channel info to emit in the signal
+            let info = service.state.channels.iter()
+                .find(|c| c.id.to_string() == id)
+                .map(|c| c.to_channel_info());
+            (id, info)
+        };
+
+        // Emit signal after releasing the lock
+        if let Some(info) = channel_info {
+            let _ = Self::channel_added(&ctx, info).await;
+        }
+
+        Ok(channel_id)
     }
 
     /// Delete a mixer channel.
-    async fn delete_channel(&self, channel_id: &str) -> zbus::fdo::Result<()> {
+    async fn delete_channel(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        channel_id: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: delete_channel({})", channel_id);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.delete_channel(channel_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let id_string = channel_id.to_string();
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.delete_channel(channel_id)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::channel_removed(&ctx, &id_string).await;
+        Ok(())
     }
 
     /// Rename a mixer channel.
-    async fn rename_channel(&self, channel_id: &str, name: &str) -> zbus::fdo::Result<()> {
+    async fn rename_channel(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        channel_id: &str,
+        name: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: rename_channel({}, {})", channel_id, name);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.rename_channel(channel_id, name)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let channel_info = {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.rename_channel(channel_id, name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get updated channel info
+            service.state.channels.iter()
+                .find(|c| c.id.to_string() == channel_id)
+                .map(|c| c.to_channel_info())
+        };
+
+        // Emit signal after releasing the lock
+        if let Some(info) = channel_info {
+            let _ = Self::channel_updated(&ctx, info).await;
+        }
+        Ok(())
     }
 
     // ==================== Volume/Mute ====================
 
     /// Set channel volume in dB.
-    async fn set_channel_volume(&self, channel_id: &str, volume_db: f64) -> zbus::fdo::Result<()> {
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_channel_volume(channel_id, volume_db)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    async fn set_channel_volume(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        channel_id: &str,
+        volume_db: f64,
+    ) -> zbus::fdo::Result<()> {
+        let id_string = channel_id.to_string();
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_channel_volume(channel_id, volume_db)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::volume_changed(&ctx, &id_string, volume_db).await;
+        Ok(())
     }
 
     /// Set channel mute state.
-    async fn set_channel_mute(&self, channel_id: &str, muted: bool) -> zbus::fdo::Result<()> {
+    async fn set_channel_mute(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        channel_id: &str,
+        muted: bool,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_channel_mute({}, {})", channel_id, muted);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_channel_mute(channel_id, muted)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let id_string = channel_id.to_string();
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_channel_mute(channel_id, muted)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::mute_changed(&ctx, &id_string, muted).await;
+        Ok(())
     }
 
     /// Set master volume in dB.
-    async fn set_master_volume(&self, volume_db: f64) -> zbus::fdo::Result<()> {
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_master_volume(volume_db)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    async fn set_master_volume(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        volume_db: f64,
+    ) -> zbus::fdo::Result<()> {
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_master_volume(volume_db)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::master_volume_changed(&ctx, volume_db).await;
+        Ok(())
     }
 
     /// Set master mute state.
-    async fn set_master_mute(&self, muted: bool) -> zbus::fdo::Result<()> {
+    async fn set_master_mute(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        muted: bool,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_master_mute({})", muted);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_master_mute(muted)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_master_mute(muted)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::master_mute_changed(&ctx, muted).await;
+        Ok(())
     }
 
     // ==================== App Routing ====================
 
     /// Assign an app to a channel.
-    async fn assign_app(&self, app_id: &str, channel_id: &str) -> zbus::fdo::Result<()> {
+    async fn assign_app(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        app_id: &str,
+        channel_id: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: assign_app({}, {})", app_id, channel_id);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.assign_app(app_id, channel_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let (app_id_string, channel_id_string, channel_info) = {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.assign_app(app_id, channel_id)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get updated channel info
+            let info = service.state.channels.iter()
+                .find(|c| c.id.to_string() == channel_id)
+                .map(|c| c.to_channel_info());
+            (app_id.to_string(), channel_id.to_string(), info)
+        };
+
+        // Emit signals after releasing the lock
+        let _ = Self::app_routed(&ctx, &app_id_string, &channel_id_string).await;
+        if let Some(info) = channel_info {
+            let _ = Self::channel_updated(&ctx, info).await;
+        }
+        Ok(())
     }
 
     /// Unassign an app from a channel.
-    async fn unassign_app(&self, app_id: &str, channel_id: &str) -> zbus::fdo::Result<()> {
+    async fn unassign_app(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        app_id: &str,
+        channel_id: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: unassign_app({}, {})", app_id, channel_id);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.unassign_app(app_id, channel_id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let (app_id_string, channel_id_string, channel_info) = {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.unassign_app(app_id, channel_id)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get updated channel info
+            let info = service.state.channels.iter()
+                .find(|c| c.id.to_string() == channel_id)
+                .map(|c| c.to_channel_info());
+            (app_id.to_string(), channel_id.to_string(), info)
+        };
+
+        // Emit signals after releasing the lock
+        let _ = Self::app_unrouted(&ctx, &app_id_string, &channel_id_string).await;
+        if let Some(info) = channel_info {
+            let _ = Self::channel_updated(&ctx, info).await;
+        }
+        Ok(())
     }
 
     // ==================== Output Routing ====================
 
     /// Set the output device for a channel.
-    async fn set_channel_output(&self, channel_id: &str, device_name: &str) -> zbus::fdo::Result<()> {
+    async fn set_channel_output(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        channel_id: &str,
+        device_name: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_channel_output({}, {})", channel_id, device_name);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_channel_output(channel_id, device_name)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        let channel_info = {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_channel_output(channel_id, device_name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get updated channel info
+            service.state.channels.iter()
+                .find(|c| c.id.to_string() == channel_id)
+                .map(|c| c.to_channel_info())
+        };
+
+        // Emit signal after releasing the lock
+        if let Some(info) = channel_info {
+            let _ = Self::channel_updated(&ctx, info).await;
+        }
+        Ok(())
     }
 
     /// Set the master output device.
-    async fn set_master_output(&self, device_name: &str) -> zbus::fdo::Result<()> {
+    async fn set_master_output(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        device_name: &str,
+    ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_master_output({})", device_name);
-        let mut service = self.service.lock()
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        service.process_pw_events();
-        service.set_master_output(device_name)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+        {
+            let mut service = self.service.lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service.set_master_output(device_name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+
+        // Emit signal after releasing the lock
+        let _ = Self::outputs_changed(&ctx).await;
+        Ok(())
     }
 
     // ==================== EQ ====================
