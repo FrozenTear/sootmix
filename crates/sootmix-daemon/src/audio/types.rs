@@ -135,24 +135,32 @@ impl PortDirection {
 }
 
 /// Audio channel position.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Audio channel position.
+/// Ordered by standard channel layout for consistent pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AudioChannel {
     FrontLeft,
     FrontRight,
     FrontCenter,
-    Mono,
+    LowFrequency,
     RearLeft,
     RearRight,
-    LowFrequency,
+    Mono,
     Unknown,
 }
 
 impl AudioChannel {
     pub fn from_str(s: &str) -> Self {
         let s_lower = s.to_lowercase();
-        if s_lower.contains("fl") || s_lower.contains("front_left") || s_lower.contains("playback_fl") {
+        if s_lower.contains("fl")
+            || s_lower.contains("front_left")
+            || s_lower.contains("playback_fl")
+        {
             Self::FrontLeft
-        } else if s_lower.contains("fr") || s_lower.contains("front_right") || s_lower.contains("playback_fr") {
+        } else if s_lower.contains("fr")
+            || s_lower.contains("front_right")
+            || s_lower.contains("playback_fr")
+        {
             Self::FrontRight
         } else if s_lower.contains("fc") || s_lower.contains("front_center") {
             Self::FrontCenter
@@ -167,6 +175,19 @@ impl AudioChannel {
         } else {
             Self::Unknown
         }
+    }
+
+    /// Check if two channels are compatible for linking.
+    /// Allows matching same channels or mono to stereo mappings.
+    pub fn is_compatible(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        // Mono can connect to left channel
+        matches!(
+            (self, other),
+            (Self::Mono, Self::FrontLeft) | (Self::FrontLeft, Self::Mono)
+        )
     }
 }
 
