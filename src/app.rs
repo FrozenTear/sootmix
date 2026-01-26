@@ -258,15 +258,19 @@ impl SootMix {
                             info!("Disabling EQ for channel '{}'", name);
 
                             // Remove routing through EQ, connect loopback directly to master
-                            filter_chain::unroute_eq(
+                            if let Err(e) = filter_chain::unroute_eq(
                                 &loopback_output_name,
                                 &eq_sink_name,
                                 &eq_output_name,
                                 &master_sink_name,
-                            ).ok();
+                            ) {
+                                warn!("Failed to unroute EQ for channel '{}': {}", name, e);
+                            }
 
                             // Destroy the EQ filter
-                            filter_chain::destroy_eq_filter(id).ok();
+                            if let Err(e) = filter_chain::destroy_eq_filter(id) {
+                                warn!("Failed to destroy EQ filter for channel '{}': {}", name, e);
+                            }
                         }
                         if let Some(channel) = self.state.channel_mut(id) {
                             channel.eq_enabled = false;
@@ -1976,7 +1980,9 @@ impl SootMix {
             if let Some((sink_node_id, assigned_apps, is_managed, eq_node_id)) = channel_info {
                 // Destroy EQ filter if it exists
                 if eq_node_id.is_some() {
-                    filter_chain::destroy_eq_filter(channel_id).ok();
+                    if let Err(e) = filter_chain::destroy_eq_filter(channel_id) {
+                        warn!("Failed to destroy EQ filter during channel deletion: {}", e);
+                    }
                 }
 
                 // Find hardware output sink (not virtual sinks)

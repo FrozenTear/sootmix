@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Error)]
 pub enum VirtualSinkError {
@@ -25,8 +25,8 @@ pub enum VirtualSinkError {
 /// Track running pw-loopback processes for cleanup.
 static LOOPBACK_PROCESSES: Mutex<Option<HashMap<u32, Child>>> = Mutex::new(None);
 
-fn get_processes() -> std::sync::MutexGuard<'static, Option<HashMap<u32, Child>>> {
-    LOOPBACK_PROCESSES.lock().unwrap()
+fn get_processes() -> parking_lot::MutexGuard<'static, Option<HashMap<u32, Child>>> {
+    LOOPBACK_PROCESSES.lock()
 }
 
 fn ensure_processes_map() {
@@ -108,11 +108,9 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     let pid = child.id();
     debug!("pw-loopback spawned with PID: {}", pid);
 
-    // Give it a moment to register with PipeWire
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Find the sink node ID by querying pw-dump
-    let sink_node_id = find_node_by_name(&sink_node_name)?;
+    // Poll for node registration instead of blocking sleep.
+    // Retry with exponential backoff: 20ms, 40ms, 80ms, 160ms (total max ~300ms)
+    let sink_node_id = poll_for_node(&sink_node_name, 4, 20)?;
 
     // Find the loopback output node ID
     // Note: pw-loopback adds "output." prefix to the --name value
@@ -193,6 +191,55 @@ pub fn destroy_all_virtual_sinks() {
             let _ = child.wait();
         }
     }
+}
+
+/// Poll for a node to appear with exponential backoff.
+///
+/// This is more efficient than a single long sleep, as the node often
+/// registers quickly and we can return early.
+///
+/// # Arguments
+/// * `name` - The node name to search for
+/// * `max_retries` - Maximum number of retries
+/// * `initial_delay_ms` - Initial delay in milliseconds (doubles each retry)
+fn poll_for_node(name: &str, max_retries: u32, initial_delay_ms: u64) -> Result<u32, VirtualSinkError> {
+    poll_for_node_with_class(name, "Audio/Sink", max_retries, initial_delay_ms)
+}
+
+/// Poll for a node with specific media class to appear with exponential backoff.
+fn poll_for_node_with_class(
+    name: &str,
+    media_class: &str,
+    max_retries: u32,
+    initial_delay_ms: u64,
+) -> Result<u32, VirtualSinkError> {
+    use std::time::Duration;
+
+    let mut delay_ms = initial_delay_ms;
+    for attempt in 0..max_retries {
+        // Small initial delay to let PipeWire register the node
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            delay_ms *= 2; // Exponential backoff
+        } else {
+            // First attempt: minimal delay
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        match find_node_by_name_and_class(name, media_class) {
+            Ok(node_id) => {
+                debug!("Found node '{}' (class={}) on attempt {}", name, media_class, attempt + 1);
+                return Ok(node_id);
+            }
+            Err(_) if attempt < max_retries - 1 => {
+                trace!("Node '{}' not found yet, retrying in {}ms...", name, delay_ms);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(VirtualSinkError::NodeNotFound)
 }
 
 /// Find a node ID by its node.name property using pw-dump.
@@ -330,11 +377,8 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
     let pid = child.id();
     debug!("pw-loopback (source) spawned with PID: {}", pid);
 
-    // Give it a moment to register with PipeWire
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Find the source node ID (Audio/Source)
-    let source_node_id = find_node_by_name_and_class(&source_name, "Audio/Source")?;
+    // Poll for node registration with exponential backoff
+    let source_node_id = poll_for_node_with_class(&source_name, "Audio/Source", 4, 20)?;
 
     // Find the capture stream node ID (for routing if needed)
     // Note: The capture stream auto-connects via node.passive=true, so we may not need this

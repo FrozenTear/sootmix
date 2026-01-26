@@ -100,8 +100,8 @@ impl PluginProcessingContext {
 
         // Try to acquire the lock - if contended, skip updates this block
         let mut instances = match self.plugin_instances.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return 0,
+            Some(guard) => guard,
+            None => return 0,
         };
 
         // Drain all pending updates
@@ -133,8 +133,8 @@ impl PluginProcessingContext {
 
         // Try to acquire lock
         let mut instances = match self.plugin_instances.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
+            Some(guard) => guard,
+            None => {
                 // Lock contended, passthrough
                 Self::copy_passthrough(inputs, outputs);
                 return false;

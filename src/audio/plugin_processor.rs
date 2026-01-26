@@ -205,8 +205,8 @@ impl PluginProcessorManager {
 
         // Try to acquire lock - RT-safe: don't block if contended
         let mut instances_guard = match instances.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
+            Some(guard) => guard,
+            None => {
                 // Lock contended, passthrough to avoid blocking audio thread
                 for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
                     output.copy_from_slice(input);

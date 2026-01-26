@@ -12,7 +12,8 @@ use super::vst3::Vst3PluginLoader;
 use sootmix_plugin_api::{ActivationContext, PluginBox, PluginInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -370,7 +371,7 @@ impl PluginManager {
     /// Scan for available plugins.
     pub fn scan(&mut self) -> usize {
         let mut count = {
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = self.registry.write();
             registry.scan()
         };
 
@@ -379,7 +380,7 @@ impl PluginManager {
         if let Some(ref mut lv2_loader) = self.lv2_loader {
             let lv2_count = lv2_loader.scan();
             // Add LV2 plugins to registry
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = self.registry.write();
             for meta in lv2_loader.plugins() {
                 let plugin_meta = PluginMetadata {
                     // For LV2, path stores the URI which is used for loading
@@ -407,7 +408,7 @@ impl PluginManager {
         {
             let vst3_count = self.vst3_loader.scan();
             // Add VST3 plugins to registry
-            let mut registry = self.registry.write().unwrap();
+            let mut registry = self.registry.write();
             for meta in self.vst3_loader.plugins() {
                 let plugin_meta = PluginMetadata {
                     path: meta.bundle_path.clone(),
@@ -434,7 +435,7 @@ impl PluginManager {
 
     /// Add a custom search path.
     pub fn add_search_path(&self, path: impl Into<PathBuf>) {
-        let mut registry = self.registry.write().unwrap();
+        let mut registry = self.registry.write();
         registry.add_search_path(path);
     }
 
@@ -445,14 +446,14 @@ impl PluginManager {
 
     /// List available plugins.
     pub fn list_plugins(&self, filter: &PluginFilter) -> Vec<PluginMetadata> {
-        let registry = self.registry.read().unwrap();
+        let registry = self.registry.read();
         registry.list(filter).into_iter().cloned().collect()
     }
 
     /// Load and instantiate a plugin.
     pub fn load(&mut self, plugin_id: &str) -> PluginResult<Uuid> {
         let metadata = {
-            let registry = self.registry.read().unwrap();
+            let registry = self.registry.read();
             registry
                 .get(plugin_id)
                 .cloned()
@@ -509,7 +510,7 @@ impl PluginManager {
         instance.activate(self.sample_rate, self.block_size);
 
         let id = instance.id;
-        self.instances.lock().unwrap().insert(id, instance);
+        self.instances.lock().insert(id, instance);
 
         info!("Loaded plugin: {} (id={})", path.display(), id);
         Ok(id)
@@ -529,7 +530,7 @@ impl PluginManager {
 
     /// Unload a plugin instance.
     pub fn unload(&mut self, id: Uuid) -> bool {
-        let mut instances = self.instances.lock().unwrap();
+        let mut instances = self.instances.lock();
         if let Some(mut instance) = instances.remove(&id) {
             instance.deactivate();
             info!("Unloaded plugin: {}", id);
@@ -544,31 +545,31 @@ impl PluginManager {
     /// This acquires a lock on the instances map. For RT-safe access,
     /// use `shared_instances()` with `try_lock()` instead.
     pub fn get_info(&self, id: Uuid) -> Option<PluginInfo> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.get(&id).map(|i| i.info())
     }
 
     /// Get parameter count for a plugin instance.
     pub fn get_parameter_count(&self, id: Uuid) -> Option<u32> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.get(&id).map(|i| i.parameter_count())
     }
 
     /// Get parameter info for a plugin instance.
     pub fn get_parameter_info(&self, id: Uuid, index: u32) -> Option<sootmix_plugin_api::ParameterInfo> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.get(&id).and_then(|i| i.parameter_info(index))
     }
 
     /// Get parameter value for a plugin instance.
     pub fn get_parameter(&self, id: Uuid, index: u32) -> Option<f32> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.get(&id).map(|i| i.get_parameter(index))
     }
 
     /// Get all parameter info for a plugin instance.
     pub fn get_parameters(&self, id: Uuid) -> Vec<sootmix_plugin_api::ParameterInfo> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances
             .get(&id)
             .map(|i| {
@@ -585,7 +586,7 @@ impl PluginManager {
     /// This acquires a lock. For RT-safe parameter updates, use
     /// the parameter ring buffer and apply updates in the audio callback.
     pub fn set_parameter(&self, id: Uuid, index: u32, value: f32) {
-        let mut instances = self.instances.lock().unwrap();
+        let mut instances = self.instances.lock();
         if let Some(instance) = instances.get_mut(&id) {
             instance.set_parameter(index, value);
         }
@@ -598,7 +599,7 @@ impl PluginManager {
     where
         F: FnOnce(&PluginInstance) -> R,
     {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.get(&id).map(f)
     }
 
@@ -607,19 +608,19 @@ impl PluginManager {
     where
         F: FnOnce(&mut PluginInstance) -> R,
     {
-        let mut instances = self.instances.lock().unwrap();
+        let mut instances = self.instances.lock();
         instances.get_mut(&id).map(f)
     }
 
     /// Get all active plugin instance IDs.
     pub fn active_instance_ids(&self) -> Vec<Uuid> {
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock();
         instances.keys().copied().collect()
     }
 
     /// Unload all plugin instances.
     pub fn unload_all(&mut self) {
-        let mut instances = self.instances.lock().unwrap();
+        let mut instances = self.instances.lock();
         for (_, mut instance) in instances.drain() {
             instance.deactivate();
         }

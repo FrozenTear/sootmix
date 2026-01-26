@@ -239,6 +239,75 @@ struct PendingMeterLink {
     meter_name: String,
 }
 
+/// Default sample rate when PipeWire settings unavailable.
+const DEFAULT_SAMPLE_RATE: f32 = 48000.0;
+/// Default block size when PipeWire settings unavailable.
+const DEFAULT_BLOCK_SIZE: usize = 512;
+
+/// Query PipeWire for the current sample rate and quantum (block size).
+///
+/// Uses `pw-metadata` to query the default clock settings. Falls back to
+/// defaults if the query fails.
+fn query_pipewire_audio_settings() -> (f32, usize) {
+    use std::process::Command;
+
+    // Query sample rate from pw-metadata
+    let sample_rate = Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.rate"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Output format: "Found \"settings\" metadata 0\nvalue:'48000' type:'Spa:Int'"
+                stdout
+                    .lines()
+                    .find(|line| line.contains("value:"))
+                    .and_then(|line| {
+                        line.split("value:'")
+                            .nth(1)
+                            .and_then(|s| s.split('\'').next())
+                            .and_then(|s| s.parse::<f32>().ok())
+                    })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            debug!("Could not query PipeWire sample rate, using default: {}", DEFAULT_SAMPLE_RATE);
+            DEFAULT_SAMPLE_RATE
+        });
+
+    // Query quantum (block size) from pw-metadata
+    let block_size = Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.quantum"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .find(|line| line.contains("value:"))
+                    .and_then(|line| {
+                        line.split("value:'")
+                            .nth(1)
+                            .and_then(|s| s.split('\'').next())
+                            .and_then(|s| s.parse::<usize>().ok())
+                    })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            debug!("Could not query PipeWire quantum, using default: {}", DEFAULT_BLOCK_SIZE);
+            DEFAULT_BLOCK_SIZE
+        });
+
+    info!("PipeWire audio settings: sample_rate={}, block_size={}", sample_rate, block_size);
+    (sample_rate, block_size)
+}
+
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -265,10 +334,17 @@ struct PwThreadState {
     event_tx: Rc<mpsc::Sender<PwEvent>>,
     /// Last CLI command time per node (for throttling fallback).
     cli_last_cmd: HashMap<u32, Instant>,
+    /// PipeWire sample rate (queried on init, defaults to 48000).
+    sample_rate: f32,
+    /// PipeWire block size (quantum, defaults to 512).
+    block_size: usize,
 }
 
 impl PwThreadState {
     fn new(event_tx: Rc<mpsc::Sender<PwEvent>>) -> Self {
+        // Query PipeWire sample rate from pw-metadata
+        let (sample_rate, block_size) = query_pipewire_audio_settings();
+
         Self {
             nodes: HashMap::new(),
             ports: HashMap::new(),
@@ -282,6 +358,8 @@ impl PwThreadState {
             shared_plugin_instances: None,
             event_tx,
             cli_last_cmd: HashMap::new(),
+            sample_rate,
+            block_size,
         }
     }
 
@@ -800,6 +878,8 @@ fn handle_command(
             );
 
             let event_tx = state.borrow().event_tx.clone();
+            let sample_rate = state.borrow().sample_rate;
+            let block_size = state.borrow().block_size;
 
             // Check if we have shared plugin instances
             let shared_instances = match &state.borrow().shared_plugin_instances {
@@ -824,8 +904,8 @@ fn handle_command(
                 shared_instances,
                 plugin_chain,
                 param_reader,
-                48000.0,  // Default sample rate, should come from system
-                512,      // Default block size
+                sample_rate,
+                block_size,
                 meter_levels,
             ) {
                 Ok(streams) => {

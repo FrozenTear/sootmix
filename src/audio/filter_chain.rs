@@ -8,7 +8,7 @@ use crate::config::eq_preset::EqPreset;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -42,8 +42,8 @@ struct FilterChainInstance {
 /// Track running filter-chain processes for cleanup.
 static FILTER_PROCESSES: Mutex<Option<HashMap<Uuid, FilterChainInstance>>> = Mutex::new(None);
 
-fn get_processes() -> std::sync::MutexGuard<'static, Option<HashMap<Uuid, FilterChainInstance>>> {
-    FILTER_PROCESSES.lock().unwrap()
+fn get_processes() -> parking_lot::MutexGuard<'static, Option<HashMap<Uuid, FilterChainInstance>>> {
+    FILTER_PROCESSES.lock()
 }
 
 fn ensure_processes_map() {
