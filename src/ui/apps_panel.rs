@@ -12,6 +12,7 @@ use crate::state::{AppInfo, MixerChannel};
 use crate::ui::theme::*;
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Theme};
+use std::collections::HashMap;
 
 /// Create the apps panel showing available audio applications.
 pub fn apps_panel<'a>(
@@ -24,10 +25,17 @@ pub fn apps_panel<'a>(
     // === HEADER ===
     let title = text("Audio Apps").size(TEXT_BODY).color(TEXT);
 
+    // Count unique apps (deduplicated)
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for app in apps {
+        seen_ids.insert(app.identifier());
+    }
+    let unique_count = seen_ids.len();
+
     let status_text = if is_dragging {
         text("Select a channel").size(TEXT_SMALL).color(PRIMARY)
     } else {
-        text(format!("{} active", apps.len()))
+        text(format!("{} active", unique_count))
             .size(TEXT_SMALL)
             .color(TEXT_DIM)
     };
@@ -35,9 +43,27 @@ pub fn apps_panel<'a>(
     let header = row![title, Space::new().width(SPACING_SM), status_text,].align_y(Alignment::Center);
 
     // === APP ITEMS ===
-    let app_items: Vec<Element<Message>> = apps
+    // Deduplicate apps by identifier - group all streams from the same app together
+    let mut app_groups: HashMap<&str, (Vec<&AppInfo>, usize)> = HashMap::new();
+    for app in apps {
+        let id = app.identifier();
+        app_groups
+            .entry(id)
+            .or_insert_with(|| (Vec::new(), 0))
+            .0
+            .push(app);
+        app_groups.get_mut(id).unwrap().1 += 1;
+    }
+
+    // Convert to sorted list (by first occurrence order, roughly)
+    let mut deduplicated: Vec<_> = app_groups.into_iter().collect();
+    deduplicated.sort_by_key(|(_, (apps, _))| apps.first().map(|a| a.node_id).unwrap_or(0));
+
+    let app_items: Vec<Element<Message>> = deduplicated
         .iter()
-        .map(|app| app_item(app, channels, dragging))
+        .filter_map(|(_, (apps, stream_count))| {
+            apps.first().map(|app| app_item(app, *stream_count, channels, dragging))
+        })
         .collect();
 
     let apps_content: Element<Message> = if app_items.is_empty() {
@@ -105,11 +131,13 @@ pub fn apps_panel<'a>(
 /// Create a single app item widget.
 fn app_item<'a>(
     app: &'a AppInfo,
+    stream_count: usize,
     channels: &'a [MixerChannel],
     dragging: Option<&(u32, String)>,
 ) -> Element<'a, Message> {
     let app_id = app.identifier().to_string();
     let node_id = app.node_id;
+    let _ = stream_count; // Reserved for future use (showing stream count badge)
 
     // Check if this app is currently being dragged
     let is_being_dragged = dragging.map(|(_, id)| id == &app_id).unwrap_or(false);
