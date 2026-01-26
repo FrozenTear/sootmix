@@ -44,11 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create the daemon service
-    let mut daemon_service = service::DaemonService::new(
-        mixer_config,
-        routing_rules,
-        config_manager,
-    );
+    let mut daemon_service =
+        service::DaemonService::new(mixer_config, routing_rules, config_manager);
 
     // Start PipeWire thread
     if let Err(e) = daemon_service.start_pipewire() {
@@ -115,10 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_flag.store(true, Ordering::Relaxed);
 
     // Wait for event task to finish (with timeout)
-    let _ = tokio::time::timeout(
-        tokio::time::Duration::from_secs(2),
-        event_task
-    ).await;
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), event_task).await;
 
     // Cleanup
     if let Ok(mut svc) = service.lock() {

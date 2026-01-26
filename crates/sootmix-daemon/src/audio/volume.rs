@@ -23,7 +23,11 @@ pub fn set_volume(node_id: u32, volume: f32) -> Result<(), VolumeError> {
     info!("wpctl set-volume {} {:.2}", node_id, volume_clamped);
 
     let output = Command::new("wpctl")
-        .args(["set-volume", &node_id.to_string(), &format!("{:.2}", volume_clamped)])
+        .args([
+            "set-volume",
+            &node_id.to_string(),
+            &format!("{:.2}", volume_clamped),
+        ])
         .output()
         .map_err(|e| {
             error!("Failed to execute wpctl: {}", e);
@@ -100,7 +104,11 @@ pub fn set_default_sink_volume(volume: f32) -> Result<(), VolumeError> {
     debug!("Setting default sink volume to {:.2}", volume_clamped);
 
     let output = Command::new("wpctl")
-        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.2}", volume_clamped)])
+        .args([
+            "set-volume",
+            "@DEFAULT_AUDIO_SINK@",
+            &format!("{:.2}", volume_clamped),
+        ])
         .output()
         .map_err(|e| VolumeError::WpctlFailed(e.to_string()))?;
 

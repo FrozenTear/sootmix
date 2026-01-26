@@ -43,7 +43,10 @@ pub struct VirtualSinkResult {
 }
 
 /// Create a virtual sink using pw-loopback.
-pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<VirtualSinkResult, VirtualSinkError> {
+pub fn create_virtual_sink_full(
+    name: &str,
+    description: &str,
+) -> Result<VirtualSinkResult, VirtualSinkError> {
     ensure_processes_map();
 
     let safe_name: String = name
@@ -55,12 +58,18 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
 
     // Check if a node with this name already exists and destroy it first
     if let Ok(existing_id) = find_node_by_name(&sink_node_name) {
-        warn!("Found existing orphaned node '{}' (id={}), destroying it first", sink_node_name, existing_id);
+        warn!(
+            "Found existing orphaned node '{}' (id={}), destroying it first",
+            sink_node_name, existing_id
+        );
 
         // Remove from process tracking map before destroying
         if let Some(ref mut map) = *get_processes() {
             if let Some(mut child) = map.remove(&existing_id) {
-                info!("Killing orphaned pw-loopback process for node {}", existing_id);
+                info!(
+                    "Killing orphaned pw-loopback process for node {}",
+                    existing_id
+                );
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -71,7 +80,9 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
             .output();
         // Also destroy the output node if it exists
         let full_loopback_name = format!("output.{}", loopback_node_name);
-        if let Ok(output_id) = find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio") {
+        if let Ok(output_id) =
+            find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio")
+        {
             // Remove output node from process tracking as well (in case it was tracked separately)
             if let Some(ref mut map) = *get_processes() {
                 if let Some(mut child) = map.remove(&output_id) {
@@ -91,9 +102,13 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
         sink_node_name, description
     );
 
-    let playback_props = "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR]".to_string();
+    let playback_props =
+        "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR]".to_string();
 
-    info!("Creating virtual sink: {} (description: {})", sink_node_name, description);
+    info!(
+        "Creating virtual sink: {} (description: {})",
+        sink_node_name, description
+    );
 
     let child = Command::new("pw-loopback")
         .arg("--name")
@@ -111,14 +126,17 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
 
     let sink_node_id = find_node_by_name(&sink_node_name)?;
     let full_loopback_name = format!("output.{}", loopback_node_name);
-    let loopback_output_node_id = find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio").ok();
+    let loopback_output_node_id =
+        find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio").ok();
 
     if let Some(ref mut map) = *get_processes() {
         map.insert(sink_node_id, child);
     }
 
-    info!("Created virtual sink '{}' with sink_id={}, loopback_output_id={:?}",
-          sink_node_name, sink_node_id, loopback_output_node_id);
+    info!(
+        "Created virtual sink '{}' with sink_id={}, loopback_output_id={:?}",
+        sink_node_name, sink_node_id, loopback_output_node_id
+    );
 
     Ok(VirtualSinkResult {
         sink_node_id,
@@ -127,8 +145,14 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
 }
 
 /// Update the description of an existing node.
-pub fn update_node_description(node_id: u32, new_description: &str) -> Result<(), VirtualSinkError> {
-    info!("Updating node {} description to '{}'", node_id, new_description);
+pub fn update_node_description(
+    node_id: u32,
+    new_description: &str,
+) -> Result<(), VirtualSinkError> {
+    info!(
+        "Updating node {} description to '{}'",
+        node_id, new_description
+    );
 
     let props_json = format!(
         "{{ params = [ \"node.description\" \"{}\" ] }}",
@@ -143,7 +167,8 @@ pub fn update_node_description(node_id: u32, new_description: &str) -> Result<()
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(VirtualSinkError::PwDumpFailed(format!(
-            "pw-cli set-param failed: {}", stderr.trim()
+            "pw-cli set-param failed: {}",
+            stderr.trim()
         )));
     }
 
@@ -161,7 +186,10 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
         }
     }
 
-    warn!("No tracked process for node {}, attempting pw-cli destroy", node_id);
+    warn!(
+        "No tracked process for node {}, attempting pw-cli destroy",
+        node_id
+    );
     let _ = Command::new("pw-cli")
         .args(["destroy", &node_id.to_string()])
         .output();
@@ -178,7 +206,11 @@ pub fn destroy_all_virtual_sinks() {
     // First, kill all tracked pw-loopback processes
     if let Some(ref mut map) = *get_processes() {
         for (node_id, mut child) in map.drain() {
-            debug!("Killing pw-loopback for sink node {} (pid: {:?})", node_id, child.id());
+            debug!(
+                "Killing pw-loopback for sink node {} (pid: {:?})",
+                node_id,
+                child.id()
+            );
             if let Err(e) = child.kill() {
                 // Process may already be dead if PipeWire restarted
                 debug!("Process kill returned error (may be already dead): {}", e);
@@ -234,7 +266,10 @@ pub fn cleanup_orphaned_nodes() {
         }
 
         let props = obj.get("info").and_then(|i| i.get("props"));
-        let node_name = props.and_then(|p| p.get("node.name")).and_then(|n| n.as_str()).unwrap_or("");
+        let node_name = props
+            .and_then(|p| p.get("node.name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
 
         // Check if this is a sootmix node (either sink or output)
         if node_name.starts_with("sootmix.") || node_name.starts_with("output.sootmix.") {
@@ -249,7 +284,10 @@ pub fn cleanup_orphaned_nodes() {
         return;
     }
 
-    info!("Found {} orphaned sootmix nodes, cleaning up...", orphaned_ids.len());
+    info!(
+        "Found {} orphaned sootmix nodes, cleaning up...",
+        orphaned_ids.len()
+    );
     for id in orphaned_ids {
         debug!("Destroying orphaned node {}", id);
         let _ = Command::new("pw-cli")
@@ -278,8 +316,8 @@ fn find_node_by_name_and_class(name: &str, target_class: &str) -> Result<u32, Vi
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-    let objects: Vec<serde_json::Value> = serde_json::from_str(&json_str)
-        .map_err(|_| VirtualSinkError::InvalidJson)?;
+    let objects: Vec<serde_json::Value> =
+        serde_json::from_str(&json_str).map_err(|_| VirtualSinkError::InvalidJson)?;
 
     for obj in objects {
         let obj_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -288,12 +326,21 @@ fn find_node_by_name_and_class(name: &str, target_class: &str) -> Result<u32, Vi
         }
 
         let props = obj.get("info").and_then(|i| i.get("props"));
-        let node_name = props.and_then(|p| p.get("node.name")).and_then(|n| n.as_str()).unwrap_or("");
-        let media_class = props.and_then(|p| p.get("media.class")).and_then(|c| c.as_str()).unwrap_or("");
+        let node_name = props
+            .and_then(|p| p.get("node.name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        let media_class = props
+            .and_then(|p| p.get("media.class"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
 
         if node_name == name && media_class == target_class {
             if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
-                debug!("Found node '{}' with ID {} (class={})", name, id, media_class);
+                debug!(
+                    "Found node '{}' with ID {} (class={})",
+                    name, id, media_class
+                );
                 return Ok(id as u32);
             }
         }
@@ -341,7 +388,8 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
 
     let source_name = format!("sootmix.recording.{}", safe_name);
 
-    let capture_props = "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string();
+    let capture_props =
+        "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string();
     let playback_props = format!(
         "media.class=Audio/Source node.name={} node.description=\"SootMix Recording - {}\" audio.position=[FL FR]",
         source_name, name
@@ -367,7 +415,10 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
         map.insert(source_node_id, child);
     }
 
-    info!("Created virtual source '{}' with source_id={}", name, source_node_id);
+    info!(
+        "Created virtual source '{}' with source_id={}",
+        name, source_node_id
+    );
 
     Ok(VirtualSourceResult {
         source_node_id,
