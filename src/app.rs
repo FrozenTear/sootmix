@@ -1057,14 +1057,15 @@ impl SootMix {
             }
 
             Message::TrayShowWindow => {
-                info!("Tray: Show window requested");
                 if self.main_window_id.is_some() {
                     // Window is open, just focus it
+                    info!("Tray: Focusing existing window");
                     return iced::window::oldest().and_then(|id| {
                         iced::window::gain_focus(id)
                     });
                 } else {
                     // Window is closed, need to open a new one
+                    info!("Tray: Opening new window");
                     let (id, open_task) = iced::window::open(iced::window::Settings {
                         size: iced::Size::new(900.0, 600.0),
                         platform_specific: iced::window::settings::PlatformSpecific {
@@ -2547,17 +2548,25 @@ impl SootMix {
         let rx = self.tray_rx.as_ref()?;
 
         // Process all pending tray messages
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                TrayMessage::ShowWindow => {
-                    return Some(Task::done(Message::TrayShowWindow));
+        match rx.try_recv() {
+            Ok(msg) => {
+                debug!("Received tray message: {:?}", msg);
+                match msg {
+                    TrayMessage::ShowWindow => {
+                        return Some(Task::done(Message::TrayShowWindow));
+                    }
+                    TrayMessage::ToggleMuteAll => {
+                        return Some(Task::done(Message::TrayToggleMuteAll));
+                    }
+                    TrayMessage::Quit => {
+                        return Some(Task::done(Message::TrayQuit));
+                    }
                 }
-                TrayMessage::ToggleMuteAll => {
-                    return Some(Task::done(Message::TrayToggleMuteAll));
-                }
-                TrayMessage::Quit => {
-                    return Some(Task::done(Message::TrayQuit));
-                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                warn!("Tray message channel disconnected");
+                self.tray_rx = None;
             }
         }
 

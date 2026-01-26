@@ -40,8 +40,8 @@ impl Tray for SootMixTray {
     }
 
     fn icon_name(&self) -> String {
-        // Use a standard audio icon, or we could bundle our own
-        "audio-volume-high".to_string()
+        // Use our installed icon from the hicolor theme
+        "sootmix".to_string()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
