@@ -573,10 +573,16 @@ impl DaemonService {
                         port_node_id
                     );
                     // Try auto-routing newly discovered apps
-                    for app in &self.state.apps {
-                        if app.node_id == port_node_id {
-                            self.try_auto_route_app(app.node_id, &app.name.clone());
-                        }
+                    // Collect app info first to avoid borrow conflict with try_auto_route_app
+                    let apps_to_route: Vec<_> = self
+                        .state
+                        .apps
+                        .iter()
+                        .filter(|app| app.node_id == port_node_id)
+                        .map(|app| (app.node_id, app.name.clone()))
+                        .collect();
+                    for (node_id, name) in apps_to_route {
+                        self.try_auto_route_app(node_id, &name);
                     }
                 }
 

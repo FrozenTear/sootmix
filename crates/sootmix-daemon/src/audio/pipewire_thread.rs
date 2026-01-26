@@ -941,8 +941,6 @@ fn build_channel_volumes_pod(volumes: &[f32]) -> Result<Vec<u8>, Box<dyn std::er
     use libspa::pod::Value;
     use std::io::Cursor;
 
-    let channel_volumes: Vec<Value> = volumes.iter().map(|&v| Value::Float(v)).collect();
-
     let props = Value::Object(libspa::pod::Object {
         type_: libspa::sys::SPA_TYPE_OBJECT_Props,
         id: libspa::sys::SPA_PARAM_Props,
