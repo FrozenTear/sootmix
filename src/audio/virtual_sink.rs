@@ -68,8 +68,11 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     // Node name for the loopback output (playback side)
     let loopback_name = format!("sootmix.{}.output", safe_name);
 
+    // Set high priority.session so WirePlumber prefers our virtual sinks over hardware outputs.
+    // This prevents WirePlumber from auto-linking apps directly to hardware, bypassing our mixer.
+    // Default hardware sinks typically have priority ~1000-1500.
     let capture_props = format!(
-        "media.class=Audio/Sink node.name=sootmix.{} node.description=\"{}\" audio.position=[FL FR]",
+        "media.class=Audio/Sink node.name=sootmix.{} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
         safe_name, description
     );
 
@@ -103,7 +106,9 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     let sink_node_id = find_node_by_name(&format!("sootmix.{}", safe_name))?;
 
     // Find the loopback output node ID
-    let loopback_output_node_id = find_node_by_name_and_class(&loopback_name, "Stream/Output/Audio").ok();
+    // Note: pw-loopback adds "output." prefix to the --name value
+    let full_loopback_name = format!("output.{}", loopback_name);
+    let loopback_output_node_id = find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio").ok();
 
     // Track the process
     if let Some(ref mut map) = *get_processes() {

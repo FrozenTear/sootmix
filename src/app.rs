@@ -206,7 +206,8 @@ impl SootMix {
             Message::ChannelVolumeChanged(id, volume) => {
                 if let Some(channel) = self.state.channel_mut(id) {
                     channel.volume_db = volume;
-                    if let Some(node_id) = channel.pw_sink_id {
+                    // Volume control goes to the loopback output (Stream/Output/Audio), not the sink
+                    if let Some(node_id) = channel.pw_loopback_output_id {
                         let linear_vol = channel.volume_linear();
                         debug!(
                             "Volume change: channel={}, node_id={}, db={:.1}, linear={:.3}",
@@ -225,7 +226,8 @@ impl SootMix {
             Message::ChannelMuteToggled(id) => {
                 let cmd = if let Some(channel) = self.state.channel_mut(id) {
                     channel.muted = !channel.muted;
-                    channel.pw_sink_id.map(|node_id| PwCommand::SetMute {
+                    // Mute control goes to the loopback output (Stream/Output/Audio), not the sink
+                    channel.pw_loopback_output_id.map(|node_id| PwCommand::SetMute {
                         node_id,
                         muted: channel.muted,
                     })
@@ -250,7 +252,8 @@ impl SootMix {
                         .collect();
 
                     // Node names used for routing
-                    let loopback_output_name = format!("sootmix.{}.output", safe_name);
+                    // Note: pw-loopback adds "output." prefix to the --name value
+                    let loopback_output_name = format!("output.sootmix.{}.output", safe_name);
                     let eq_sink_name = format!("sootmix.eq.{}", safe_name);
                     let eq_output_name = format!("sootmix.eq.{}.output", safe_name);
 
@@ -632,7 +635,8 @@ impl SootMix {
                             .chars()
                             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                             .collect();
-                        let loopback_output_name = format!("sootmix.{}.output", safe_name);
+                        // Note: pw-loopback adds "output." prefix to the --name value
+                        let loopback_output_name = format!("output.sootmix.{}.output", safe_name);
 
                         if let Some(loopback_node) = self.state.pw_graph.nodes.values()
                             .find(|n| n.name == loopback_output_name)
@@ -888,9 +892,10 @@ impl SootMix {
                     info!("Applied snapshot, modified {} channels", modified.len());
 
                     // Send PipeWire commands for changed channels
+                    // Volume/mute control goes to the loopback output (Stream/Output/Audio)
                     for channel_id in modified {
                         if let Some(channel) = self.state.channel(channel_id) {
-                            if let Some(node_id) = channel.pw_sink_id {
+                            if let Some(node_id) = channel.pw_loopback_output_id {
                                 let linear_vol = channel.volume_linear();
                                 debug!(
                                     "Setting channel {} volume: db={:.1}, linear={:.3}",
@@ -1028,10 +1033,13 @@ impl SootMix {
 
                                 // Send command to PipeWire thread
                                 if let Some(ref pw) = self.pw_thread {
+                                    let meter_levels = self.state.channel(channel_id)
+                                        .and_then(|c| c.meter_levels.clone());
                                     let _ = pw.send(PwCommand::CreatePluginFilter {
                                         channel_id,
                                         channel_name,
                                         plugin_chain: instances,
+                                        meter_levels,
                                     });
                                 }
                             } else {
@@ -2318,33 +2326,38 @@ impl SootMix {
             PwEvent::LinkRemoved(id) => {
                 self.state.pw_graph.links.remove(&id);
             }
-            PwEvent::VirtualSinkCreated { channel_id, node_id } => {
-                info!("PwEvent: VirtualSinkCreated channel={} node={}", channel_id, node_id);
+            PwEvent::VirtualSinkCreated { channel_id, node_id, loopback_output_node_id } => {
+                info!("PwEvent: VirtualSinkCreated channel={} node={} loopback_output={:?}",
+                    channel_id, node_id, loopback_output_node_id);
 
                 // Get assigned apps and channel info before mutating
-                let (assigned_apps, channel_name, output_device_name) = self.state.channel(channel_id)
+                let (assigned_apps, _channel_name, output_device_name) = self.state.channel(channel_id)
                     .map(|c| (c.assigned_apps.clone(), c.name.clone(), c.output_device_name.clone()))
                     .unwrap_or_default();
 
-                // Try to find the loopback output node by name
-                let safe_name: String = channel_name
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                    .collect();
-                let loopback_output_name = format!("sootmix.{}.output", safe_name);
-                let loopback_output_id = self.state.pw_graph.nodes.values()
-                    .find(|n| n.name == loopback_output_name)
-                    .map(|n| n.id);
+                // Get current volume settings before mutating
+                let (volume_db, muted) = self.state.channel(channel_id)
+                    .map(|c| (c.volume_db, c.muted))
+                    .unwrap_or((0.0, false));
 
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.pw_sink_id = Some(node_id);
-                    channel.pw_loopback_output_id = loopback_output_id;
+                    channel.pw_loopback_output_id = loopback_output_node_id;
                     info!("Updated channel '{}' pw_sink_id={}, loopback_output_id={:?}",
-                          channel.name, node_id, loopback_output_id);
+                          channel.name, node_id, loopback_output_node_id);
+                }
+
+                // Apply initial volume/mute to the loopback output node
+                if let Some(loopback_id) = loopback_output_node_id {
+                    let linear = db_to_linear(volume_db);
+                    debug!("Applying initial volume to loopback output {}: db={:.1}, linear={:.3}",
+                           loopback_id, volume_db, linear);
+                    self.send_pw_command(PwCommand::SetVolume { node_id: loopback_id, volume: linear });
+                    self.send_pw_command(PwCommand::SetMute { node_id: loopback_id, muted });
                 }
 
                 // Route to saved output device if configured
-                if let Some(loopback_id) = loopback_output_id {
+                if let Some(loopback_id) = loopback_output_node_id {
                     let target_device_id = output_device_name.as_ref().and_then(|name| {
                         self.state.available_outputs.iter()
                             .find(|d| d.description == *name || d.name == *name)
@@ -2499,13 +2512,16 @@ impl SootMix {
     /// Check for apps that should be auto-routed based on rules.
     /// Returns a list of (app_node_id, app_identifier, channel_id) tuples to route.
     fn check_auto_routing(&mut self) -> Vec<(u32, String, Uuid)> {
+        use crate::config::routing_rules::AppGrouping;
+
         let mut to_route = Vec::new();
+        let group_by_app = self.state.routing_rules.app_grouping == AppGrouping::GroupByApp;
 
         for app in &self.state.available_apps {
             let app_id = app.identifier().to_string();
 
-            // Skip if already routed in this session
-            if self.state.auto_routed_apps.contains(&app_id) {
+            // Skip if this node was already routed in this session
+            if self.state.auto_routed_apps.contains(&app.node_id) {
                 continue;
             }
 
@@ -2521,10 +2537,26 @@ impl SootMix {
                     .any(|l| l.output_node == app.node_id && l.input_node == sink_id);
 
                 if !is_connected {
-                    info!("Reconnecting saved app '{}' to its assigned channel", app_id);
-                    to_route.push((app.node_id, app_id.clone(), channel_id));
+                    if group_by_app {
+                        // Route all nodes with the same identifier
+                        info!("Reconnecting saved app '{}' (all streams) to its assigned channel", app_id);
+                        let matching_nodes: Vec<_> = self.state.available_apps.iter()
+                            .filter(|a| a.identifier() == app_id && !self.state.auto_routed_apps.contains(&a.node_id))
+                            .map(|a| a.node_id)
+                            .collect();
+                        for node_id in matching_nodes {
+                            to_route.push((node_id, app_id.clone(), channel_id));
+                            self.state.auto_routed_apps.insert(node_id);
+                        }
+                    } else {
+                        info!("Reconnecting saved app '{}' (node {}) to its assigned channel", app_id, app.node_id);
+                        to_route.push((app.node_id, app_id.clone(), channel_id));
+                        self.state.auto_routed_apps.insert(app.node_id);
+                    }
+                } else {
+                    // Already connected, just mark as routed
+                    self.state.auto_routed_apps.insert(app.node_id);
                 }
-                self.state.auto_routed_apps.insert(app_id);
                 continue;
             } else if assigned_channel.is_some() {
                 // Assigned but sink not ready yet
@@ -2536,10 +2568,26 @@ impl SootMix {
                 // Find the target channel
                 if let Some(channel) = self.state.channel_by_name(&rule.target_channel) {
                     if channel.pw_sink_id.is_some() {
-                        info!("Auto-routing '{}' to channel '{}' (rule: {})",
-                            app.name, rule.target_channel, rule.name);
-                        to_route.push((app.node_id, app_id.clone(), channel.id));
-                        self.state.auto_routed_apps.insert(app_id);
+                        let channel_id = channel.id;
+
+                        if group_by_app {
+                            // Route all nodes with the same identifier
+                            info!("Auto-routing '{}' (all streams) to channel '{}' (rule: {})",
+                                app.name, rule.target_channel, rule.name);
+                            let matching_nodes: Vec<_> = self.state.available_apps.iter()
+                                .filter(|a| a.identifier() == app_id && !self.state.auto_routed_apps.contains(&a.node_id))
+                                .map(|a| a.node_id)
+                                .collect();
+                            for node_id in matching_nodes {
+                                to_route.push((node_id, app_id.clone(), channel_id));
+                                self.state.auto_routed_apps.insert(node_id);
+                            }
+                        } else {
+                            info!("Auto-routing '{}' (node {}) to channel '{}' (rule: {})",
+                                app.name, app.node_id, rule.target_channel, rule.name);
+                            to_route.push((app.node_id, app_id.clone(), channel_id));
+                            self.state.auto_routed_apps.insert(app.node_id);
+                        }
                     }
                 }
             }

@@ -100,6 +100,47 @@ impl fmt::Display for MatchTarget {
     }
 }
 
+/// How to handle multiple audio streams from the same application.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub enum AppGrouping {
+    /// Route all nodes with the same app identifier together (default).
+    /// When an app matches a rule, all its audio streams go to the same channel.
+    #[default]
+    GroupByApp,
+    /// Route each node individually.
+    /// Each audio stream can potentially be routed to different channels.
+    Individual,
+}
+
+impl AppGrouping {
+    /// Get all variants for UI selection.
+    pub fn all() -> &'static [AppGrouping] {
+        &[AppGrouping::GroupByApp, AppGrouping::Individual]
+    }
+
+    /// Get display name.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            AppGrouping::GroupByApp => "Group by App",
+            AppGrouping::Individual => "Individual Streams",
+        }
+    }
+
+    /// Get description for UI tooltip.
+    pub fn description(&self) -> &'static str {
+        match self {
+            AppGrouping::GroupByApp => "Route all audio streams from the same app together",
+            AppGrouping::Individual => "Route each audio stream independently",
+        }
+    }
+}
+
+impl fmt::Display for AppGrouping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
 /// A routing rule that automatically routes matching apps to a channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
@@ -157,12 +198,18 @@ impl RoutingRule {
 pub struct RoutingRulesConfig {
     /// List of routing rules, ordered by priority.
     pub rules: Vec<RoutingRule>,
+    /// How to handle multiple audio streams from the same app.
+    #[serde(default)]
+    pub app_grouping: AppGrouping,
 }
 
 impl RoutingRulesConfig {
     /// Create an empty config.
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            app_grouping: AppGrouping::default(),
+        }
     }
 
     /// Parse from TOML string.

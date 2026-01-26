@@ -174,6 +174,10 @@ pub struct MixerChannel {
     /// This is the Stream/Output/Audio node created by pw-loopback for routing.
     #[serde(skip)]
     pub pw_loopback_output_id: Option<u32>,
+    /// Atomic meter levels for real-time audio metering (not serialized).
+    /// Shared with the audio processing thread for lock-free level updates.
+    #[serde(skip)]
+    pub meter_levels: Option<std::sync::Arc<crate::audio::meter_stream::AtomicMeterLevels>>,
 }
 
 fn default_is_managed() -> bool {
@@ -183,6 +187,9 @@ fn default_is_managed() -> bool {
 impl MixerChannel {
     /// Create a new channel.
     pub fn new(name: impl Into<String>) -> Self {
+        use crate::audio::meter_stream::AtomicMeterLevels;
+        use std::sync::Arc;
+
         let name = name.into();
         Self {
             id: Uuid::new_v4(),
@@ -202,6 +209,7 @@ impl MixerChannel {
             output_device_id: None,
             output_device_name: None,
             pw_loopback_output_id: None,
+            meter_levels: Some(Arc::new(AtomicMeterLevels::new())),
         }
     }
 
@@ -496,9 +504,9 @@ pub struct AppState {
     pub master_meter_display: MeterDisplayState,
     /// Auto-routing rules configuration.
     pub routing_rules: RoutingRulesConfig,
-    /// Apps that have been auto-routed in this session (to avoid re-routing).
-    /// Key is the app identifier (binary name or app name).
-    pub auto_routed_apps: HashSet<String>,
+    /// Node IDs that have been auto-routed in this session (to avoid re-routing).
+    /// Tracks by node ID so each audio stream is only routed once.
+    pub auto_routed_apps: HashSet<u32>,
     /// Whether the routing rules panel is open.
     pub routing_rules_panel_open: bool,
     /// Rule being edited (rule_id, field values for edit form).
