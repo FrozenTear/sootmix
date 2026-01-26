@@ -921,8 +921,12 @@ impl DaemonService {
             .pw_sink_id
             .ok_or_else(|| ServiceError::ChannelNotFound("No sink for channel".to_string()))?;
 
-        // Connect to our sink FIRST, then disconnect from old sinks
-        // This ensures the app always has an audio path and doesn't pause playback
+        // Set the stream's target to our sink - this tells WirePlumber to stop
+        // auto-managing this stream and prevents it from recreating links to default sink
+        if let Err(e) = crate::audio::routing::set_stream_target(app_node_id, sink_node_id) {
+            warn!("Failed to set stream target: {}", e);
+        }
+
         let our_sinks: Vec<u32> = self
             .state
             .channels
@@ -930,19 +934,7 @@ impl DaemonService {
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
-        // Create links to our sink FIRST
-        let port_pairs = self
-            .state
-            .pw_graph
-            .find_port_pairs(app_node_id, sink_node_id);
-        for (output_port, input_port) in port_pairs {
-            self.send_pw_command(PwCommand::CreateLink {
-                output_port,
-                input_port,
-            });
-        }
-
-        // Then disconnect from non-sootmix sinks
+        // Destroy links to non-sootmix sinks FIRST
         let links_to_destroy: Vec<u32> = self
             .state
             .pw_graph
@@ -954,6 +946,18 @@ impl DaemonService {
 
         for link_id in links_to_destroy {
             self.send_pw_command(PwCommand::DestroyLink { link_id });
+        }
+
+        // Then create links to our sink
+        let port_pairs = self
+            .state
+            .pw_graph
+            .find_port_pairs(app_node_id, sink_node_id);
+        for (output_port, input_port) in port_pairs {
+            self.send_pw_command(PwCommand::CreateLink {
+                output_port,
+                input_port,
+            });
         }
 
         // Add to assigned apps list
@@ -996,6 +1000,11 @@ impl DaemonService {
             .find(|c| c.id == channel_uuid)
             .map(|c| c.pw_sink_id)
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        // Clear the stream's target so WirePlumber can manage it again
+        if let Err(e) = crate::audio::routing::clear_stream_target(app_node_id) {
+            warn!("Failed to clear stream target: {}", e);
+        }
 
         // Find hardware sink to reconnect to
         let outputs = self.state.get_outputs();
@@ -1175,8 +1184,12 @@ impl DaemonService {
             app_identifier, node_id, channel_id
         );
 
-        // Route the app: connect to our sink FIRST, then disconnect from default sinks
-        // This ensures the app always has an audio path and doesn't pause playback
+        // Set the stream's target to our sink - this tells WirePlumber to stop
+        // auto-managing this stream and prevents it from recreating links to default sink
+        if let Err(e) = crate::audio::routing::set_stream_target(node_id, sink_id) {
+            warn!("Failed to set stream target for auto-route: {}", e);
+        }
+
         let our_sinks: Vec<u32> = self
             .state
             .channels
@@ -1184,16 +1197,7 @@ impl DaemonService {
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
-        // Create links to our sink FIRST
-        let port_pairs = self.state.pw_graph.find_port_pairs(node_id, sink_id);
-        for (output_port, input_port) in port_pairs {
-            self.send_pw_command(PwCommand::CreateLink {
-                output_port,
-                input_port,
-            });
-        }
-
-        // Then destroy links to non-sootmix sinks
+        // Destroy links to non-sootmix sinks FIRST
         let links_to_destroy: Vec<u32> = self
             .state
             .pw_graph
@@ -1205,6 +1209,15 @@ impl DaemonService {
 
         for link_id in links_to_destroy {
             self.send_pw_command(PwCommand::DestroyLink { link_id });
+        }
+
+        // Then create links to our sink
+        let port_pairs = self.state.pw_graph.find_port_pairs(node_id, sink_id);
+        for (output_port, input_port) in port_pairs {
+            self.send_pw_command(PwCommand::CreateLink {
+                output_port,
+                input_port,
+            });
         }
     }
 
@@ -1250,7 +1263,6 @@ impl DaemonService {
             .collect();
 
         for (app_node_id, app_identifier) in apps_to_route {
-            // Create links to our sink FIRST (so app always has an audio path)
             let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_id);
 
             if port_pairs.is_empty() {
@@ -1263,14 +1275,12 @@ impl DaemonService {
 
             info!("Auto-routing app '{}' to channel", app_identifier);
 
-            for (output_port, input_port) in port_pairs {
-                self.send_pw_command(PwCommand::CreateLink {
-                    output_port,
-                    input_port,
-                });
+            // Set the stream's target to our sink - prevents WirePlumber from recreating links
+            if let Err(e) = crate::audio::routing::set_stream_target(app_node_id, sink_id) {
+                warn!("Failed to set stream target: {}", e);
             }
 
-            // Then destroy links to non-sootmix sinks
+            // Destroy links to non-sootmix sinks FIRST
             let links_to_destroy: Vec<u32> = self
                 .state
                 .pw_graph
@@ -1282,6 +1292,14 @@ impl DaemonService {
 
             for link_id in links_to_destroy {
                 self.send_pw_command(PwCommand::DestroyLink { link_id });
+            }
+
+            // Then create links to our sink
+            for (output_port, input_port) in port_pairs {
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port,
+                    input_port,
+                });
             }
         }
 
