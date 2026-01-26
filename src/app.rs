@@ -332,67 +332,46 @@ impl SootMix {
                 if !new_name.is_empty() {
                     // Get current channel info
                     let channel_info = self.state.channel(id).map(|c| {
-                        (c.pw_sink_id, c.assigned_apps.clone(), c.name.clone())
+                        (c.pw_sink_id, c.name.clone(), c.assigned_apps.clone())
                     });
 
-                    if let Some((old_sink_id, assigned_apps, old_name)) = channel_info {
-                        // Only do full rename if name actually changed
+                    if let Some((sink_node_id, old_name, assigned_apps)) = channel_info {
+                        // Only update if name actually changed
                         if new_name != old_name {
-                            // Collect app node IDs for re-routing later
-                            let app_node_ids: Vec<u32> = assigned_apps.iter()
-                                .filter_map(|app_id| {
-                                    self.state.available_apps.iter()
-                                        .find(|a| a.identifier() == *app_id)
-                                        .map(|a| a.node_id)
-                                })
-                                .collect();
+                            // Check if any apps are currently routed to this channel
+                            let has_routed_apps = !assigned_apps.is_empty() &&
+                                assigned_apps.iter().any(|app_id| {
+                                    self.state.available_apps.iter().any(|a| a.identifier() == *app_id)
+                                });
 
-                            // Find hardware sink for temporary routing
-                            let our_sink_ids: Vec<u32> = self.state.channels.iter()
-                                .filter_map(|c| c.pw_sink_id)
-                                .collect();
-                            let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
-
-                            // Temporarily route apps to default sink
-                            if let Some(old_sink) = old_sink_id {
-                                for &app_node_id in &app_node_ids {
-                                    // Connect to default first
-                                    if let Some(default_id) = default_sink_id {
-                                        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_id);
-                                        for (output_port, input_port) in port_pairs {
-                                            self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
-                                        }
-                                    }
-                                    // Then disconnect from old sink
-                                    let links_to_destroy: Vec<u32> = self.state.pw_graph.links
-                                        .values()
-                                        .filter(|l| l.output_node == app_node_id && l.input_node == old_sink)
-                                        .map(|l| l.id)
-                                        .collect();
-                                    for link_id in links_to_destroy {
-                                        self.send_pw_command(PwCommand::DestroyLink { link_id });
-                                    }
+                            if has_routed_apps {
+                                // Apps are routed - only update description (seamless, no audio glitch)
+                                info!("Renaming channel to '{}' (description only, apps routed)", new_name);
+                                if let Some(node_id) = sink_node_id {
+                                    self.send_pw_command(PwCommand::UpdateSinkDescription {
+                                        node_id,
+                                        description: new_name.clone(),
+                                    });
                                 }
-
-                                // Destroy old sink
-                                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: old_sink });
+                            } else {
+                                // No apps routed - full rename (recreate sink with new node.name)
+                                info!("Renaming channel to '{}' (full rename, no apps routed)", new_name);
+                                if let Some(node_id) = sink_node_id {
+                                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                                }
+                                self.send_pw_command(PwCommand::CreateVirtualSink {
+                                    channel_id: id,
+                                    name: new_name.clone(),
+                                });
                             }
 
-                            // Store apps for re-routing when new sink is created
-                            if !app_node_ids.is_empty() {
-                                self.state.pending_reroute = Some((id, app_node_ids));
+                            // Update UI name
+                            if let Some(channel) = self.state.channel_mut(id) {
+                                channel.name = new_name;
                             }
 
-                            // Create new sink with new name
-                            self.send_pw_command(PwCommand::CreateVirtualSink {
-                                channel_id: id,
-                                name: new_name.clone(),
-                            });
-                        }
-
-                        // Update UI name
-                        if let Some(channel) = self.state.channel_mut(id) {
-                            channel.name = new_name;
+                            // Save config with new name
+                            self.save_config();
                         }
                     }
                 }
@@ -472,7 +451,7 @@ impl SootMix {
                 let name = channel.name.clone();
                 self.state.channels.push(channel);
 
-                // Create virtual sink
+                // Create virtual sink (uses channel name for node.name, readable in Helvum)
                 self.send_pw_command(PwCommand::CreateVirtualSink {
                     channel_id: id,
                     name,
@@ -2418,37 +2397,52 @@ impl SootMix {
                 }
 
                 // Check if there are apps waiting to be re-routed to this channel (from rename)
+                // Note: Don't clear pending_reroute here - ports may not be discovered yet.
+                // The retry logic in PortAdded will handle it once ports are available.
                 if let Some((pending_channel_id, ref app_node_ids)) = self.state.pending_reroute.clone() {
                     if pending_channel_id == channel_id {
-                        info!("Re-routing {} apps to renamed sink {}", app_node_ids.len(), node_id);
+                        // Check if sink has ports yet
+                        let sink_ports = self.state.pw_graph.input_ports_for_node(node_id);
+                        if sink_ports.is_empty() {
+                            debug!("Sink {} ports not ready yet, will retry re-routing in PortAdded", node_id);
+                        } else {
+                            info!("Re-routing {} apps to renamed sink {}", app_node_ids.len(), node_id);
 
-                        let our_sink_ids: Vec<u32> = self.state.channels.iter()
-                            .filter_map(|c| c.pw_sink_id)
-                            .collect();
-                        let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
+                            let our_sink_ids: Vec<u32> = self.state.channels.iter()
+                                .filter_map(|c| c.pw_sink_id)
+                                .collect();
+                            let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
 
-                        for &app_node_id in app_node_ids.iter() {
-                            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, node_id);
-                            for (output_port, input_port) in &port_pairs {
-                                self.send_pw_command(PwCommand::CreateLink {
-                                    output_port: *output_port,
-                                    input_port: *input_port,
-                                });
-                            }
+                            let mut any_routed = false;
+                            for &app_node_id in app_node_ids.iter() {
+                                let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, node_id);
+                                if !port_pairs.is_empty() {
+                                    any_routed = true;
+                                    for (output_port, input_port) in &port_pairs {
+                                        self.send_pw_command(PwCommand::CreateLink {
+                                            output_port: *output_port,
+                                            input_port: *input_port,
+                                        });
+                                    }
 
-                            if let Some(default_id) = default_sink_id {
-                                let links_to_destroy: Vec<u32> = self.state.pw_graph.links
-                                    .values()
-                                    .filter(|l| l.output_node == app_node_id && l.input_node == default_id)
-                                    .map(|l| l.id)
-                                    .collect();
-                                for link_id in links_to_destroy {
-                                    self.send_pw_command(PwCommand::DestroyLink { link_id });
+                                    if let Some(default_id) = default_sink_id {
+                                        let links_to_destroy: Vec<u32> = self.state.pw_graph.links
+                                            .values()
+                                            .filter(|l| l.output_node == app_node_id && l.input_node == default_id)
+                                            .map(|l| l.id)
+                                            .collect();
+                                        for link_id in links_to_destroy {
+                                            self.send_pw_command(PwCommand::DestroyLink { link_id });
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        self.state.pending_reroute = None;
+                            // Only clear if we actually routed something
+                            if any_routed {
+                                self.state.pending_reroute = None;
+                            }
+                        }
                     }
                 }
             }
@@ -2764,7 +2758,7 @@ impl SootMix {
                         self.state.channel(id).map(|c| c.plugin_instances.len()).unwrap_or(0)
                     );
 
-                    // Create the virtual sink
+                    // Create the virtual sink (uses channel name for node.name, readable in Helvum)
                     self.send_pw_command(PwCommand::CreateVirtualSink {
                         channel_id: id,
                         name,

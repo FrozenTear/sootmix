@@ -47,6 +47,9 @@ pub struct VirtualSinkResult {
 
 /// Create a virtual sink using pw-loopback.
 ///
+/// Uses the channel name for node.name (readable in tools like Helvum).
+/// The name is sanitized to be safe for PipeWire properties.
+///
 /// Returns the node ID of the created sink and optionally the loopback output node ID.
 pub fn create_virtual_sink(name: &str, description: &str) -> Result<u32, VirtualSinkError> {
     let result = create_virtual_sink_full(name, description)?;
@@ -55,41 +58,42 @@ pub fn create_virtual_sink(name: &str, description: &str) -> Result<u32, Virtual
 
 /// Create a virtual sink using pw-loopback.
 ///
+/// Uses the channel name for node.name (readable in tools like Helvum).
+/// The name is sanitized to be safe for PipeWire properties.
+///
 /// Returns both the sink node ID and the loopback output node ID.
 pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<VirtualSinkResult, VirtualSinkError> {
     ensure_processes_map();
 
-    // Sanitize name for use in properties
-    let safe_name = name
+    // Sanitize name for use in node.name (readable in Helvum etc.)
+    let safe_name: String = name
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .collect::<String>();
-
-    // Node name for the loopback output (playback side)
-    let loopback_name = format!("sootmix.{}.output", safe_name);
+        .collect();
+    let sink_node_name = format!("sootmix.{}", safe_name);
+    let loopback_node_name = format!("sootmix.{}.output", safe_name);
 
     // Set high priority.session so WirePlumber prefers our virtual sinks over hardware outputs.
     // This prevents WirePlumber from auto-linking apps directly to hardware, bypassing our mixer.
     // Default hardware sinks typically have priority ~1000-1500.
     let capture_props = format!(
-        "media.class=Audio/Sink node.name=sootmix.{} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
-        safe_name, description
+        "media.class=Audio/Sink node.name={} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
+        sink_node_name, description
     );
 
     let playback_props = format!(
         "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR]"
     );
 
-    info!("Creating virtual sink: {}", name);
+    info!("Creating virtual sink: {} (description: {})", sink_node_name, description);
     debug!("capture_props: {}", capture_props);
     debug!("playback_props: {}", playback_props);
-    debug!("loopback_name: {}", loopback_name);
 
     // Spawn pw-loopback as a background process
     // --name sets the node name for the loopback output (playback side)
     let child = Command::new("pw-loopback")
         .arg("--name")
-        .arg(&loopback_name)
+        .arg(&loopback_node_name)
         .arg("--capture-props")
         .arg(&capture_props)
         .arg("--playback-props")
@@ -103,11 +107,11 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Find the sink node ID by querying pw-dump
-    let sink_node_id = find_node_by_name(&format!("sootmix.{}", safe_name))?;
+    let sink_node_id = find_node_by_name(&sink_node_name)?;
 
     // Find the loopback output node ID
     // Note: pw-loopback adds "output." prefix to the --name value
-    let full_loopback_name = format!("output.{}", loopback_name);
+    let full_loopback_name = format!("output.{}", loopback_node_name);
     let loopback_output_node_id = find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio").ok();
 
     // Track the process
@@ -116,12 +120,40 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     }
 
     info!("Created virtual sink '{}' with sink_id={}, loopback_output_id={:?}",
-          name, sink_node_id, loopback_output_node_id);
+          sink_node_name, sink_node_id, loopback_output_node_id);
 
     Ok(VirtualSinkResult {
         sink_node_id,
         loopback_output_node_id,
     })
+}
+
+/// Update the description of an existing node using pw-cli.
+///
+/// This allows renaming a channel without recreating the virtual sink,
+/// avoiding any audio interruption.
+pub fn update_node_description(node_id: u32, new_description: &str) -> Result<(), VirtualSinkError> {
+    info!("Updating node {} description to '{}'", node_id, new_description);
+
+    // Use pw-cli to set the node.description property
+    // Format: pw-cli set-param <node_id> Props '{ params = [ "node.description" "<value>" ] }'
+    let props_json = format!(
+        "{{ params = [ \"node.description\" \"{}\" ] }}",
+        new_description.replace('"', "\\\"")
+    );
+
+    let output = Command::new("pw-cli")
+        .args(["set-param", &node_id.to_string(), "Props", &props_json])
+        .output()
+        .map_err(|e| VirtualSinkError::PwDumpFailed(format!("Failed to run pw-cli: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("pw-cli set-param failed: {}", stderr);
+        // Don't fail - the description update is cosmetic
+    }
+
+    Ok(())
 }
 
 /// Destroy a virtual sink by killing its pw-loopback process.

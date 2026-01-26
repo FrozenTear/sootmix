@@ -9,10 +9,12 @@
 //! are not Send/Sync.
 
 use crate::audio::control::{build_channel_volumes_pod, build_mute_pod, build_volume_mute_pod};
+use crate::audio::meter_stream::{AtomicMeterLevels, MeterStreamManager};
 use crate::audio::plugin_stream::PluginFilterStreams;
 use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use crate::plugins::SharedPluginInstances;
 use crate::realtime::{PluginParamUpdate, RingBuffer, RingBufferWriter};
+use std::sync::Arc;
 use pipewire::link::Link;
 use pipewire::node::{Node, NodeListener};
 use pipewire::properties::properties;
@@ -32,9 +34,13 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub enum PwCommand {
     /// Create a virtual sink for a channel.
+    /// Uses channel name for node.name (readable in Helvum), description for display.
     CreateVirtualSink { channel_id: Uuid, name: String },
     /// Destroy a virtual sink.
     DestroyVirtualSink { node_id: u32 },
+    /// Update the display name (node.description) of a virtual sink.
+    /// This allows renaming without recreating the sink (no audio interruption).
+    UpdateSinkDescription { node_id: u32, description: String },
     /// Bind to an existing node for control (used for adopted sinks).
     BindNode { node_id: u32 },
     /// Unbind from a node (release proxy).
@@ -73,6 +79,8 @@ pub enum PwCommand {
         channel_name: String,
         /// Plugin instance IDs in processing order.
         plugin_chain: Vec<Uuid>,
+        /// Atomic meter levels for real-time metering.
+        meter_levels: Option<std::sync::Arc<crate::audio::meter_stream::AtomicMeterLevels>>,
     },
     /// Destroy a plugin filter stream.
     DestroyPluginFilter { channel_id: Uuid },
@@ -117,6 +125,20 @@ pub enum PwCommand {
         /// Node ID of the Audio/Source to destroy.
         node_id: u32,
     },
+    /// Create a meter capture stream for a channel's virtual sink.
+    ///
+    /// This creates a lightweight PipeWire stream that connects to the
+    /// virtual sink's monitor ports to capture audio levels in real-time.
+    CreateMeterStream {
+        channel_id: Uuid,
+        channel_name: String,
+        /// The virtual sink node ID to meter.
+        sink_node_id: u32,
+        /// Atomic levels to store peaks (shared with UI).
+        meter_levels: Arc<AtomicMeterLevels>,
+    },
+    /// Destroy a meter capture stream.
+    DestroyMeterStream { channel_id: Uuid },
     /// Shutdown the PipeWire thread.
     Shutdown,
 }
@@ -143,7 +165,7 @@ pub enum PwEvent {
     /// Link removed.
     LinkRemoved(u32),
     /// Virtual sink created successfully.
-    VirtualSinkCreated { channel_id: Uuid, node_id: u32 },
+    VirtualSinkCreated { channel_id: Uuid, node_id: u32, loopback_output_node_id: Option<u32> },
     /// Virtual sink destroyed.
     VirtualSinkDestroyed { node_id: u32 },
     /// Recording source created successfully.
@@ -203,6 +225,20 @@ struct PluginFilterInfo {
     param_writer: RingBufferWriter<crate::realtime::PluginParamUpdate>,
 }
 
+/// Pending meter stream link creation info.
+/// Stored when a meter stream is created, and links are created when ports are discovered.
+#[derive(Clone)]
+struct PendingMeterLink {
+    /// The sink node ID to capture from (for monitor ports).
+    sink_node_id: u32,
+    /// The sink node name.
+    sink_name: String,
+    /// The meter stream node ID.
+    meter_node_id: u32,
+    /// The meter stream node name.
+    meter_name: String,
+}
+
 /// State tracked within the PipeWire thread.
 struct PwThreadState {
     /// Basic node info indexed by node ID.
@@ -219,6 +255,10 @@ struct PwThreadState {
     created_links: HashMap<(u32, u32), CreatedLink>,
     /// Plugin filter streams by channel ID.
     plugin_filters: HashMap<Uuid, PluginFilterInfo>,
+    /// Meter capture streams by channel ID.
+    meter_streams: MeterStreamManager,
+    /// Pending meter links to create when ports are discovered.
+    pending_meter_links: Vec<PendingMeterLink>,
     /// Shared plugin instances for RT audio processing.
     shared_plugin_instances: Option<SharedPluginInstances>,
     /// Event sender for notifying UI.
@@ -237,6 +277,8 @@ impl PwThreadState {
             bound_nodes: HashMap::new(),
             created_links: HashMap::new(),
             plugin_filters: HashMap::new(),
+            meter_streams: MeterStreamManager::new(),
+            pending_meter_links: Vec::new(),
             shared_plugin_instances: None,
             event_tx,
             cli_last_cmd: HashMap::new(),
@@ -274,11 +316,15 @@ impl PwThreadState {
     ///
     /// Virtual sinks are created with pw-loopback which creates two nodes:
     /// - `sootmix.{name}` - Audio/Sink (apps connect here)
-    /// - `sootmix.{name}.output` - Stream/Output/Audio (loopback output)
+    /// - `output.sootmix.{name}.output` - Stream/Output/Audio (loopback output)
+    ///
+    /// Note: PipeWire's pw-loopback adds an "output." prefix to the --name value
+    /// when creating the output node.
     ///
     /// This returns the output node ID for routing through plugin filters.
     fn get_loopback_output_node(&self, channel_name: &str) -> Option<u32> {
-        let output_name = format!("sootmix.{}.output", channel_name);
+        // PipeWire names loopback outputs: output.sootmix.{name}.output
+        let output_name = format!("output.sootmix.{}.output", channel_name);
         self.find_node_by_name(&output_name)
     }
 
@@ -468,15 +514,18 @@ fn handle_command(
         }
 
         PwCommand::CreateVirtualSink { channel_id, name } => {
-            debug!("Creating virtual sink: {} for channel {}", name, channel_id);
+            debug!("Creating virtual sink: '{}' for channel {}", name, channel_id);
             let event_tx = state.borrow().event_tx.clone();
-            match crate::audio::virtual_sink::create_virtual_sink(&name, &name) {
-                Ok(node_id) => {
+            match crate::audio::virtual_sink::create_virtual_sink_full(&name, &name) {
+                Ok(result) => {
+                    let node_id = result.sink_node_id;
+                    let loopback_output_node_id = result.loopback_output_node_id;
                     state.borrow_mut().virtual_sinks.insert(channel_id, node_id);
                     // Note: Node will be auto-bound when it appears in registry listener
                     let _ = event_tx.send(PwEvent::VirtualSinkCreated {
                         channel_id,
                         node_id,
+                        loopback_output_node_id,
                     });
                 }
                 Err(e) => {
@@ -485,6 +534,13 @@ fn handle_command(
                         e
                     )));
                 }
+            }
+        }
+
+        PwCommand::UpdateSinkDescription { node_id, description } => {
+            debug!("Updating sink {} description to '{}'", node_id, description);
+            if let Err(e) = crate::audio::virtual_sink::update_node_description(node_id, &description) {
+                warn!("Failed to update sink description: {}", e);
             }
         }
 
@@ -735,6 +791,7 @@ fn handle_command(
             channel_id,
             channel_name,
             plugin_chain,
+            meter_levels,
         } => {
             info!(
                 "Creating plugin filter for channel '{}' with {} plugins",
@@ -759,7 +816,7 @@ fn handle_command(
             // Create ring buffer for parameter updates
             let (param_writer, param_reader) = RingBuffer::<PluginParamUpdate>::new(256).split();
 
-            // Create the plugin filter streams
+            // Create the plugin filter streams with meter levels
             match PluginFilterStreams::new(
                 core,
                 channel_id,
@@ -769,6 +826,7 @@ fn handle_command(
                 param_reader,
                 48000.0,  // Default sample rate, should come from system
                 512,      // Default block size
+                meter_levels,
             ) {
                 Ok(streams) => {
                     let capture_node_id = streams.capture_node_id();
@@ -786,7 +844,7 @@ fn handle_command(
 
                     if loopback_output_id.is_none() {
                         debug!(
-                            "Loopback output node 'sootmix.{}.output' not found yet, will auto-connect",
+                            "Loopback output node 'output.sootmix.{}.output' not found yet, will auto-connect",
                             safe_name
                         );
                     }
@@ -930,7 +988,7 @@ fn handle_command(
 
             if let Some(target_id) = target_node_id {
                 // Find port pairs and create links
-                let port_pairs: Vec<(u32, u32)> = {
+                let (port_pairs, out_port_count, in_port_count): (Vec<(u32, u32)>, usize, usize) = {
                     let s = state.borrow();
                     // Get output ports of loopback output node
                     let out_ports: Vec<_> = s.ports
@@ -943,6 +1001,9 @@ fn handle_command(
                         .values()
                         .filter(|p| p.node_id == target_id && p.direction == PortDirection::Input)
                         .collect();
+
+                    let out_count = out_ports.len();
+                    let in_count = in_ports.len();
 
                     // Match by channel name patterns (FL/FR)
                     let mut pairs = Vec::new();
@@ -963,13 +1024,25 @@ fn handle_command(
 
                     // Fallback: pair in order if no matches
                     if pairs.is_empty() && !out_ports.is_empty() && !in_ports.is_empty() {
+                        debug!("No channel name matches, pairing ports in order");
                         for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()) {
                             pairs.push((out_port.id, in_port.id));
                         }
                     }
 
-                    pairs
+                    (pairs, out_count, in_count)
                 };
+
+                // Log if no ports were found (race condition indicator)
+                if port_pairs.is_empty() {
+                    warn!(
+                        "No port pairs found for routing: loopback node {} has {} output ports, target {} has {} input ports",
+                        loopback_output_node, out_port_count, target_id, in_port_count
+                    );
+                    if out_port_count == 0 {
+                        warn!("Loopback output ports not yet discovered - this is a timing issue");
+                    }
+                }
 
                 // Create the links
                 for (output_port, input_port) in port_pairs {
@@ -1016,6 +1089,71 @@ fn handle_command(
                 warn!("Failed to destroy recording source {}: {}", node_id, e);
             }
             let _ = event_tx.send(PwEvent::RecordingSourceDestroyed { node_id });
+        }
+
+        PwCommand::CreateMeterStream {
+            channel_id,
+            channel_name,
+            sink_node_id,
+            meter_levels,
+        } => {
+            // Skip if meter stream already exists for this channel
+            if state.borrow().meter_streams.has_stream(channel_id) {
+                debug!("Meter stream already exists for channel '{}', skipping", channel_name);
+                return;
+            }
+
+            // Get the target node name from state
+            let target_node_name = state.borrow().nodes.get(&sink_node_id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| format!("node_{}", sink_node_id));
+
+            info!(
+                "Creating meter stream for channel '{}' (target node {} = '{}')",
+                channel_name, sink_node_id, target_node_name
+            );
+
+            // Create the meter stream with target.object property
+            let result = state.borrow_mut().meter_streams.create_stream(
+                core,
+                channel_id,
+                &channel_name,
+                &target_node_name,
+                meter_levels,
+            );
+
+            match result {
+                Ok(()) => {
+                    // Connect the meter stream
+                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id, sink_node_id);
+                    if let Err(e) = connect_result {
+                        warn!("Failed to connect meter stream for channel '{}': {:?}", channel_name, e);
+                    } else {
+                        info!("Meter stream created and connected for channel '{}'", channel_name);
+
+                        // WirePlumber doesn't auto-link meter streams to monitor ports.
+                        // We need to create the links manually when ports are discovered.
+                        // The meter stream node ID isn't available yet (it's assigned after connecting),
+                        // so we store the meter name pattern and look it up when the node is discovered.
+                        let meter_name = format!("sootmix.meter.{}", channel_name);
+                        state.borrow_mut().pending_meter_links.push(PendingMeterLink {
+                            sink_node_id,
+                            sink_name: target_node_name.clone(),
+                            meter_node_id: 0, // Will be filled when node is discovered
+                            meter_name,
+                        });
+                        debug!("Queued pending meter link for discovery: sink {} -> meter 'sootmix.meter.{}'", sink_node_id, channel_name);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create meter stream for channel '{}': {:?}", channel_name, e);
+                }
+            }
+        }
+
+        PwCommand::DestroyMeterStream { channel_id } => {
+            info!("Destroying meter stream for channel {}", channel_id);
+            state.borrow_mut().meter_streams.destroy_stream(channel_id);
         }
     }
 }
@@ -1132,6 +1270,21 @@ fn setup_registry_listener(
                         }
                     }
 
+                    // Check if this is a meter stream node and update pending meter links
+                    if node.name.starts_with("sootmix.meter.") {
+                        let meter_name = node.name.clone();
+                        let meter_node_id = node.id;
+                        let mut state_mut = state_add.borrow_mut();
+                        for pending in state_mut.pending_meter_links.iter_mut() {
+                            if pending.meter_name == meter_name && pending.meter_node_id == 0 {
+                                pending.meter_node_id = meter_node_id;
+                                debug!("Updated pending meter link with node ID: sink {} -> meter {} (node {})",
+                                    pending.sink_node_id, pending.meter_name, meter_node_id);
+                                break;
+                            }
+                        }
+                    }
+
                     state_add.borrow_mut().nodes.insert(global.id, node.clone());
                     let _ = event_tx_add.send(PwEvent::NodeAdded(node));
                 }
@@ -1155,7 +1308,10 @@ fn setup_registry_listener(
                     );
 
                     state_add.borrow_mut().ports.insert(global.id, port.clone());
-                    let _ = event_tx_add.send(PwEvent::PortAdded(port));
+                    let _ = event_tx_add.send(PwEvent::PortAdded(port.clone()));
+
+                    // Check if this port belongs to a meter stream that needs links
+                    process_pending_meter_links(&state_add, &port);
                 }
                 ObjectType::Link => {
                     let mut link = PwLink::new(global.id);
@@ -1206,4 +1362,92 @@ fn setup_registry_listener(
             }
         })
         .register()
+}
+
+/// Process pending meter links when a new port is discovered.
+///
+/// This function checks if we now have all the ports needed to link a meter stream
+/// to a sink's monitor ports, and creates the links if so.
+fn process_pending_meter_links(state: &Rc<RefCell<PwThreadState>>, added_port: &PwPort) {
+    // Quick check: is this port from a meter stream or a sink we care about?
+    let pending_links: Vec<PendingMeterLink> = {
+        let state_ref = state.borrow();
+        state_ref.pending_meter_links.clone()
+    };
+
+    if pending_links.is_empty() {
+        return;
+    }
+
+    // Check if this port belongs to any of our pending meter links
+    let port_node_id = added_port.node_id;
+    let relevant = pending_links.iter().any(|pl| {
+        pl.meter_node_id == port_node_id || pl.sink_node_id == port_node_id
+    });
+
+    if !relevant {
+        return;
+    }
+
+    debug!("Checking pending meter links after port {} added to node {}", added_port.id, port_node_id);
+
+    // Collect port info for all pending links
+    let mut completed_indices = Vec::new();
+
+    for (index, pending) in pending_links.iter().enumerate() {
+        // Skip entries where meter node hasn't been discovered yet
+        if pending.meter_node_id == 0 {
+            continue;
+        }
+
+        // Find sink monitor FL port (we only need one link for interleaved stereo)
+        let sink_monitor_fl = {
+            let state_ref = state.borrow();
+            state_ref.ports.values()
+                .find(|p| {
+                    p.node_id == pending.sink_node_id
+                        && p.direction == PortDirection::Output
+                        && p.name.starts_with("monitor_")
+                        && (p.name.contains("FL") || p.name.ends_with("_0"))
+                })
+                .map(|p| p.id)
+        };
+
+        // Find the single meter stream input port
+        // pw_stream creates only ONE port regardless of channel count - multi-channel
+        // data is handled as interleaved samples in the buffer, not separate ports
+        let meter_input_port = {
+            let state_ref = state.borrow();
+            state_ref.ports.values()
+                .find(|p| p.node_id == pending.meter_node_id && p.direction == PortDirection::Input)
+                .map(|p| p.id)
+        };
+
+        // Create a single link from monitor_FL to the meter input
+        // The meter stream receives interleaved stereo data through this single link
+        if let (Some(monitor_fl), Some(input_port)) = (sink_monitor_fl, meter_input_port) {
+            info!(
+                "Creating meter link: sink {} (monitor_FL port {}) -> meter {} (input port {})",
+                pending.sink_name, monitor_fl,
+                pending.meter_name, input_port
+            );
+
+            if let Err(e) = crate::audio::routing::create_link(monitor_fl, input_port) {
+                warn!("Failed to create meter link: {:?}", e);
+            } else {
+                debug!("Created meter link: {} -> {}", monitor_fl, input_port);
+            }
+
+            completed_indices.push(index);
+        }
+    }
+
+    // Remove completed pending links
+    if !completed_indices.is_empty() {
+        let mut state_mut = state.borrow_mut();
+        // Remove in reverse order to preserve indices
+        for index in completed_indices.into_iter().rev() {
+            state_mut.pending_meter_links.remove(index);
+        }
+    }
 }
