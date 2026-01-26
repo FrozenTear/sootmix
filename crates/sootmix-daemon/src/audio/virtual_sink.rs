@@ -171,10 +171,13 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
 
 /// Destroy all virtual sinks (cleanup on exit).
 pub fn destroy_all_virtual_sinks() {
+    info!("Destroying all virtual sinks");
     if let Some(ref mut map) = *get_processes() {
         for (node_id, mut child) in map.drain() {
-            info!("Cleaning up virtual sink {}", node_id);
-            let _ = child.kill();
+            debug!("Killing pw-loopback for sink node {} (pid: {:?})", node_id, child.id());
+            if let Err(e) = child.kill() {
+                warn!("Failed to kill pw-loopback for node {}: {}", node_id, e);
+            }
             let _ = child.wait();
         }
     }

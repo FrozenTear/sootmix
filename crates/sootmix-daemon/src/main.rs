@@ -14,6 +14,7 @@ mod service;
 
 use dbus::DaemonDbusService;
 use sootmix_ipc::{DBUS_NAME, DBUS_PATH};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 use zbus::connection::Builder;
@@ -58,6 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for startup discovery to complete
     daemon_service.wait_for_discovery();
 
+    // Clean up orphaned sootmix nodes from previous runs before restoring channels
+    crate::audio::virtual_sink::cleanup_orphaned_nodes();
+
     // Restore channels from config
     if let Err(e) = daemon_service.restore_channels() {
         error!("Failed to restore channels: {}", e);
@@ -79,10 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("D-Bus service registered at {}", DBUS_NAME);
     info!("SootMix Daemon ready");
 
+    // Shutdown flag for graceful termination
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
     // Spawn event processing task
     let service_events = service.clone();
-    tokio::spawn(async move {
-        loop {
+    let shutdown_flag_events = shutdown_flag.clone();
+    let event_task = tokio::spawn(async move {
+        while !shutdown_flag_events.load(Ordering::Relaxed) {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             if let Ok(mut svc) = service_events.lock() {
                 svc.process_pw_events();
@@ -102,6 +110,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Received SIGINT, shutting down...");
         }
     }
+
+    // Signal the event task to stop
+    shutdown_flag.store(true, Ordering::Relaxed);
+
+    // Wait for event task to finish (with timeout)
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        event_task
+    ).await;
 
     // Cleanup
     if let Ok(mut svc) = service.lock() {
