@@ -80,6 +80,13 @@ struct CreatedLink {
 
 const CLI_THROTTLE_MS: u64 = 50;
 
+/// Pending CLI command that was throttled
+#[derive(Clone)]
+enum PendingCliCmd {
+    Volume(f32),
+    Mute(bool),
+}
+
 struct PwThreadState {
     nodes: HashMap<u32, PwNode>,
     ports: HashMap<u32, PwPort>,
@@ -89,6 +96,8 @@ struct PwThreadState {
     created_links: HashMap<(u32, u32), CreatedLink>,
     event_tx: Rc<mpsc::Sender<PwEvent>>,
     cli_last_cmd: HashMap<u32, Instant>,
+    /// Pending CLI commands that were throttled - stores the latest value to apply
+    pending_cli_cmds: HashMap<u32, PendingCliCmd>,
 }
 
 impl PwThreadState {
@@ -102,20 +111,52 @@ impl PwThreadState {
             created_links: HashMap::new(),
             event_tx,
             cli_last_cmd: HashMap::new(),
+            pending_cli_cmds: HashMap::new(),
         }
     }
 
-    fn should_run_cli(&mut self, node_id: u32) -> bool {
+    /// Check if CLI command should run now, or if it should be deferred.
+    /// Returns true if the command can run immediately.
+    /// If throttled, the pending command is stored and will be retrieved later.
+    fn should_run_cli(&mut self, node_id: u32, cmd: PendingCliCmd) -> bool {
         let now = Instant::now();
         let throttle = Duration::from_millis(CLI_THROTTLE_MS);
 
         if let Some(last) = self.cli_last_cmd.get(&node_id) {
             if now.duration_since(*last) < throttle {
+                // Throttled - store the latest pending command
+                self.pending_cli_cmds.insert(node_id, cmd);
                 return false;
             }
         }
         self.cli_last_cmd.insert(node_id, now);
+        // Clear any pending command since we're executing now
+        self.pending_cli_cmds.remove(&node_id);
         true
+    }
+
+    /// Check if throttle period has passed for any pending commands
+    fn get_ready_pending_cmds(&mut self) -> Vec<(u32, PendingCliCmd)> {
+        let now = Instant::now();
+        let throttle = Duration::from_millis(CLI_THROTTLE_MS);
+
+        let ready: Vec<u32> = self.pending_cli_cmds.keys()
+            .filter(|&node_id| {
+                self.cli_last_cmd.get(node_id)
+                    .map(|last| now.duration_since(*last) >= throttle)
+                    .unwrap_or(true)
+            })
+            .copied()
+            .collect();
+
+        ready.iter()
+            .filter_map(|&node_id| {
+                self.pending_cli_cmds.remove(&node_id).map(|cmd| {
+                    self.cli_last_cmd.insert(node_id, now);
+                    (node_id, cmd)
+                })
+            })
+            .collect()
     }
 
     fn get_node_for_port(&self, port_id: u32) -> Option<u32> {
@@ -237,12 +278,47 @@ fn run_pipewire_loop(
 
     let _registry_listener = setup_registry_listener(&registry, state.clone(), event_tx.clone());
 
+    // Set up a timer to process pending CLI commands that were throttled
+    let state_timer = state.clone();
+    let timer = main_loop.loop_().add_timer(move |_| {
+        process_pending_cli_commands(&state_timer);
+    });
+    // Fire every 60ms (slightly longer than CLI_THROTTLE_MS) to process any pending commands
+    if timer.update_timer(
+        Some(Duration::from_millis(CLI_THROTTLE_MS + 10)),
+        Some(Duration::from_millis(CLI_THROTTLE_MS + 10)),
+    ).into_result().is_err() {
+        warn!("Failed to set CLI throttle timer interval");
+    }
+
     main_loop.run();
 
     info!("PipeWire thread shutting down");
     let _ = event_tx.send(PwEvent::Disconnected);
 
     Ok(())
+}
+
+/// Process any pending CLI commands that were throttled but are now ready to execute
+fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
+    let ready_cmds = state.borrow_mut().get_ready_pending_cmds();
+
+    for (node_id, cmd) in ready_cmds {
+        match cmd {
+            PendingCliCmd::Volume(volume) => {
+                trace!("Processing pending volume command: node={} volume={:.3}", node_id, volume);
+                if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
+                    error!("Pending CLI volume control failed for node {}: {}", node_id, e);
+                }
+            }
+            PendingCliCmd::Mute(muted) => {
+                trace!("Processing pending mute command: node={} muted={}", node_id, muted);
+                if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
+                    error!("Pending CLI mute control failed for node {}: {}", node_id, e);
+                }
+            }
+        }
+    }
 }
 
 fn handle_command(
@@ -381,7 +457,7 @@ fn handle_command(
             trace!("PW cmd: SetVolume node={} volume={:.3}", node_id, volume);
             let result = state.borrow().set_node_volume(node_id, volume);
             if let Err(e) = result {
-                if state.borrow_mut().should_run_cli(node_id) {
+                if state.borrow_mut().should_run_cli(node_id, PendingCliCmd::Volume(volume)) {
                     debug!("Native volume failed ({}), using CLI fallback", e);
                     if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
                         error!("CLI volume control also failed: {}", e2);
@@ -394,7 +470,7 @@ fn handle_command(
             trace!("PW cmd: SetMute node={} muted={}", node_id, muted);
             let result = state.borrow().set_node_mute(node_id, muted);
             if let Err(e) = result {
-                if state.borrow_mut().should_run_cli(node_id) {
+                if state.borrow_mut().should_run_cli(node_id, PendingCliCmd::Mute(muted)) {
                     debug!("Native mute failed ({}), using CLI fallback", e);
                     if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
                         error!("CLI mute control also failed: {}", e2);
@@ -649,6 +725,10 @@ fn setup_registry_listener(
 
                     debug!("Link added: id={}, {}:{} -> {}:{}", link.id, link.output_node, link.output_port, link.input_node, link.input_port);
 
+                    // Clean up created_links entry now that the link exists in PipeWire registry
+                    // This prevents unbounded growth of the created_links map
+                    state_add.borrow_mut().created_links.remove(&(link.output_port, link.input_port));
+
                     state_add.borrow_mut().links.insert(global.id, link.clone());
                     let _ = event_tx_add.send(PwEvent::LinkAdded(link));
                 }
@@ -661,6 +741,11 @@ fn setup_registry_listener(
 
             if state.nodes.remove(&id).is_some() {
                 debug!("Node removed: {}", id);
+                // Clean up virtual_sinks map if this was a virtual sink node
+                state.virtual_sinks.retain(|_, &mut sink_id| sink_id != id);
+                // Clean up any pending CLI commands for this node
+                state.pending_cli_cmds.remove(&id);
+                state.cli_last_cmd.remove(&id);
                 let _ = event_tx_remove.send(PwEvent::NodeRemoved(id));
             } else if state.ports.remove(&id).is_some() {
                 debug!("Port removed: {}", id);

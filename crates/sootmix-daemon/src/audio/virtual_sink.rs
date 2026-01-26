@@ -53,6 +53,39 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     let sink_node_name = format!("sootmix.{}", safe_name);
     let loopback_node_name = format!("sootmix.{}.output", safe_name);
 
+    // Check if a node with this name already exists and destroy it first
+    if let Ok(existing_id) = find_node_by_name(&sink_node_name) {
+        warn!("Found existing orphaned node '{}' (id={}), destroying it first", sink_node_name, existing_id);
+
+        // Remove from process tracking map before destroying
+        if let Some(ref mut map) = *get_processes() {
+            if let Some(mut child) = map.remove(&existing_id) {
+                info!("Killing orphaned pw-loopback process for node {}", existing_id);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+
+        let _ = Command::new("pw-cli")
+            .args(["destroy", &existing_id.to_string()])
+            .output();
+        // Also destroy the output node if it exists
+        let full_loopback_name = format!("output.{}", loopback_node_name);
+        if let Ok(output_id) = find_node_by_name_and_class(&full_loopback_name, "Stream/Output/Audio") {
+            // Remove output node from process tracking as well (in case it was tracked separately)
+            if let Some(ref mut map) = *get_processes() {
+                if let Some(mut child) = map.remove(&output_id) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            let _ = Command::new("pw-cli")
+                .args(["destroy", &output_id.to_string()])
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     let capture_props = format!(
         "media.class=Audio/Sink node.name={} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
         sink_node_name, description
@@ -109,7 +142,9 @@ pub fn update_node_description(node_id: u32, new_description: &str) -> Result<()
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("pw-cli set-param failed: {}", stderr);
+        return Err(VirtualSinkError::PwDumpFailed(format!(
+            "pw-cli set-param failed: {}", stderr.trim()
+        )));
     }
 
     Ok(())
@@ -143,6 +178,70 @@ pub fn destroy_all_virtual_sinks() {
             let _ = child.wait();
         }
     }
+}
+
+/// Clean up orphaned sootmix nodes from previous runs.
+/// This should be called on daemon startup before creating new channels.
+pub fn cleanup_orphaned_nodes() {
+    info!("Scanning for orphaned sootmix nodes...");
+
+    let output = match Command::new("pw-dump").output() {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("Failed to run pw-dump for orphan cleanup: {}", e);
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        warn!("pw-dump failed during orphan cleanup");
+        return;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let objects: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
+        Ok(o) => o,
+        Err(_) => {
+            warn!("Failed to parse pw-dump JSON for orphan cleanup");
+            return;
+        }
+    };
+
+    let mut orphaned_ids: Vec<u32> = Vec::new();
+
+    for obj in objects {
+        let obj_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if obj_type != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        let props = obj.get("info").and_then(|i| i.get("props"));
+        let node_name = props.and_then(|p| p.get("node.name")).and_then(|n| n.as_str()).unwrap_or("");
+
+        // Check if this is a sootmix node (either sink or output)
+        if node_name.starts_with("sootmix.") || node_name.starts_with("output.sootmix.") {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
+                orphaned_ids.push(id as u32);
+            }
+        }
+    }
+
+    if orphaned_ids.is_empty() {
+        info!("No orphaned sootmix nodes found");
+        return;
+    }
+
+    info!("Found {} orphaned sootmix nodes, cleaning up...", orphaned_ids.len());
+    for id in orphaned_ids {
+        debug!("Destroying orphaned node {}", id);
+        let _ = Command::new("pw-cli")
+            .args(["destroy", &id.to_string()])
+            .output();
+    }
+
+    // Give PipeWire time to process the destructions
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    info!("Orphan cleanup complete");
 }
 
 fn find_node_by_name(name: &str) -> Result<u32, VirtualSinkError> {

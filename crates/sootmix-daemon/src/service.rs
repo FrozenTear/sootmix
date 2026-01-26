@@ -411,6 +411,18 @@ impl DaemonService {
             PwEvent::NodeRemoved(id) => {
                 self.state.pw_graph.nodes.remove(&id);
                 self.state.update_available_apps();
+
+                // Check if this was a channel's sink or loopback output and clear stale IDs
+                for channel in &mut self.state.channels {
+                    if channel.pw_sink_id == Some(id) {
+                        warn!("Channel '{}' sink node {} was removed externally", channel.name, id);
+                        channel.pw_sink_id = None;
+                        channel.pw_loopback_output_id = None;
+                    } else if channel.pw_loopback_output_id == Some(id) {
+                        warn!("Channel '{}' loopback output node {} was removed externally", channel.name, id);
+                        channel.pw_loopback_output_id = None;
+                    }
+                }
             }
             PwEvent::NodeChanged(node) => {
                 self.state.pw_graph.nodes.insert(node.id, node);
