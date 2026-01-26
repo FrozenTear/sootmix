@@ -6,6 +6,7 @@
 
 use crate::audio::types::{PwLink, PwNode, PwPort};
 use crate::config::eq_preset::EqPreset;
+use crate::daemon_client::DaemonEvent;
 use crate::state::SnapshotSlot;
 use uuid::Uuid;
 
@@ -228,4 +229,8 @@ pub enum Message {
     TrayToggleMuteAll,
     /// Quit application (from tray).
     TrayQuit,
+
+    // ==================== Daemon Events (from D-Bus) ====================
+    /// Event received from the SootMix daemon.
+    Daemon(DaemonEvent),
 }

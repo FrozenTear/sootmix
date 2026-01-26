@@ -7,6 +7,7 @@
 use crate::audio::{filter_chain, MeterManager, PluginFilterManager, PluginProcessorManager, PwCommand, PwEvent, PwThread};
 use crate::config::eq_preset::EqPreset;
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
+use crate::daemon_client::{self, DaemonEvent};
 use crate::message::Message;
 use crate::plugins::{PluginFilter, PluginManager, PluginSlotConfig, PluginType};
 use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel, SnapshotSlot};
@@ -26,9 +27,9 @@ use uuid::Uuid;
 pub struct SootMix {
     /// Application state.
     state: AppState,
-    /// PipeWire thread handle.
+    /// PipeWire thread handle (only used in standalone mode).
     pw_thread: Option<PwThread>,
-    /// Receiver for PipeWire events.
+    /// Receiver for PipeWire events (only used in standalone mode).
     pw_event_rx: Option<mpsc::Receiver<PwEvent>>,
     /// Configuration manager for persistence.
     config_manager: Option<ConfigManager>,
@@ -52,6 +53,8 @@ pub struct SootMix {
     tray_rx: Option<mpsc::Receiver<TrayMessage>>,
     /// Current main window ID (None when window is closed/hidden).
     main_window_id: Option<iced::window::Id>,
+    /// Whether we're connected to the daemon (vs running standalone).
+    daemon_connected: bool,
 }
 
 impl SootMix {
@@ -87,33 +90,15 @@ impl SootMix {
             }
         }
 
-        // Create channel for PipeWire events
-        let (event_tx, event_rx) = mpsc::channel();
-
-        // Spawn PipeWire thread
-        let pw_thread = match PwThread::spawn(event_tx) {
-            Ok(thread) => {
-                info!("PipeWire thread started");
-                Some(thread)
-            }
-            Err(e) => {
-                error!("Failed to start PipeWire thread: {}", e);
-                None
-            }
-        };
+        // Don't spawn PipeWire thread yet - wait to see if daemon is available.
+        // If daemon connects, we'll use daemon mode.
+        // If daemon doesn't connect, we'll spawn local PW thread on first tick.
+        info!("Waiting for daemon connection...");
 
         // Initialize plugin manager and scan for plugins
         let mut plugin_manager = PluginManager::new();
         let plugin_count = plugin_manager.scan();
         info!("Plugin scan complete: {} plugins found", plugin_count);
-
-        // Send shared plugin instances to PipeWire thread for RT audio processing
-        if let Some(ref pw) = pw_thread {
-            let shared_instances = plugin_manager.shared_instances();
-            if let Err(e) = pw.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
-                error!("Failed to send shared plugin instances to PW thread: {:?}", e);
-            }
-        }
 
         // Initialize plugin filter manager with shared instances
         let mut plugin_filter_manager = PluginFilterManager::new();
@@ -129,10 +114,21 @@ impl SootMix {
         };
 
         let now = Instant::now();
+
+        // Open the initial window (daemon mode doesn't open one by default)
+        let (window_id, open_window) = iced::window::open(iced::window::Settings {
+            size: iced::Size::new(900.0, 600.0),
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "sootmix".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
         let app = Self {
             state,
-            pw_thread,
-            pw_event_rx: Some(event_rx),
+            pw_thread: None,
+            pw_event_rx: None,
             config_manager,
             startup_time: now,
             pending_config,
@@ -143,10 +139,11 @@ impl SootMix {
             plugin_filter_manager,
             tray_handle,
             tray_rx,
-            main_window_id: None, // Will be set when we receive close request
+            main_window_id: Some(window_id),
+            daemon_connected: false,
         };
 
-        (app, Task::none())
+        (app, open_window.discard())
     }
 
     /// Application title.
@@ -223,39 +220,14 @@ impl SootMix {
         match message {
             // ==================== Channel Actions ====================
             Message::ChannelVolumeChanged(id, volume) => {
-                if let Some(channel) = self.state.channel_mut(id) {
-                    channel.volume_db = volume;
-                    // Volume control goes to the loopback output (Stream/Output/Audio), not the sink
-                    if let Some(node_id) = channel.pw_loopback_output_id {
-                        let linear_vol = channel.volume_linear();
-                        debug!(
-                            "Volume change: channel={}, node_id={}, db={:.1}, linear={:.3}",
-                            channel.name, node_id, volume, linear_vol
-                        );
-                        self.send_pw_command(PwCommand::SetVolume {
-                            node_id,
-                            volume: linear_vol,
-                        });
-                    }
-                }
+                self.cmd_set_channel_volume(id, volume);
             }
             Message::ChannelVolumeReleased(_id) => {
                 // Volume changes don't auto-save to snapshot - user must click the active slot to save
             }
             Message::ChannelMuteToggled(id) => {
-                let cmd = if let Some(channel) = self.state.channel_mut(id) {
-                    channel.muted = !channel.muted;
-                    // Mute control goes to the loopback output (Stream/Output/Audio), not the sink
-                    channel.pw_loopback_output_id.map(|node_id| PwCommand::SetMute {
-                        node_id,
-                        muted: channel.muted,
-                    })
-                } else {
-                    None
-                };
-                if let Some(cmd) = cmd {
-                    self.send_pw_command(cmd);
-                }
+                let new_muted = self.state.channel(id).map(|c| !c.muted).unwrap_or(false);
+                self.cmd_set_channel_mute(id, new_muted);
             }
             Message::ChannelEqToggled(id) => {
                 // Get channel info before mutating
@@ -349,132 +321,19 @@ impl SootMix {
             Message::ChannelRenamed(id, new_name) => {
                 let new_name = new_name.trim().to_string();
                 if !new_name.is_empty() {
-                    // Get current channel info
-                    let channel_info = self.state.channel(id).map(|c| {
-                        (c.pw_sink_id, c.name.clone(), c.assigned_apps.clone())
-                    });
-
-                    if let Some((sink_node_id, old_name, assigned_apps)) = channel_info {
-                        // Only update if name actually changed
-                        if new_name != old_name {
-                            // Check if any apps are currently routed to this channel
-                            let has_routed_apps = !assigned_apps.is_empty() &&
-                                assigned_apps.iter().any(|app_id| {
-                                    self.state.available_apps.iter().any(|a| a.identifier() == *app_id)
-                                });
-
-                            if has_routed_apps {
-                                // Apps are routed - only update description (seamless, no audio glitch)
-                                info!("Renaming channel to '{}' (description only, apps routed)", new_name);
-                                if let Some(node_id) = sink_node_id {
-                                    self.send_pw_command(PwCommand::UpdateSinkDescription {
-                                        node_id,
-                                        description: new_name.clone(),
-                                    });
-                                }
-                            } else {
-                                // No apps routed - full rename (recreate sink with new node.name)
-                                info!("Renaming channel to '{}' (full rename, no apps routed)", new_name);
-                                if let Some(node_id) = sink_node_id {
-                                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-                                }
-                                self.send_pw_command(PwCommand::CreateVirtualSink {
-                                    channel_id: id,
-                                    name: new_name.clone(),
-                                });
-                            }
-
-                            // Update UI name
-                            if let Some(channel) = self.state.channel_mut(id) {
-                                channel.name = new_name;
-                            }
-
-                            // Save config with new name
-                            self.save_config();
-                        }
-                    }
+                    self.cmd_rename_channel(id, &new_name);
+                    self.save_config();
                 }
                 self.state.editing_channel = None;
             }
             Message::ChannelDeleted(id) => {
-                // Get channel info before removing
-                let channel_info = self.state.channel(id).map(|c| {
-                    (c.pw_sink_id, c.assigned_apps.clone(), c.is_managed, c.pw_eq_node_id)
-                });
-
-                if let Some((sink_node_id, assigned_apps, is_managed, eq_node_id)) = channel_info {
-                    // Destroy EQ filter if it exists
-                    if eq_node_id.is_some() {
-                        filter_chain::destroy_eq_filter(id).ok();
-                    }
-                    // Find hardware output sink (not virtual sinks)
-                    let our_sink_ids: Vec<u32> = self.state.channels.iter()
-                        .filter_map(|c| c.pw_sink_id)
-                        .collect();
-                    let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
-
-                    // Collect all link destruction commands for after we create new links
-                    let mut links_to_destroy: Vec<u32> = Vec::new();
-
-                    for app_id in assigned_apps {
-                        // Find app node ID
-                        if let Some(app) = self.state.available_apps.iter().find(|a| a.identifier() == app_id) {
-                            let app_node_id = app.node_id;
-
-                            // First create links to default sink
-                            if let Some(default_id) = default_sink_id {
-                                let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_id);
-                                for (output_port, input_port) in port_pairs {
-                                    self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
-                                }
-                            }
-
-                            // Collect links to destroy (to our sink)
-                            if let Some(sink_id) = sink_node_id {
-                                let app_links: Vec<u32> = self.state.pw_graph.links
-                                    .values()
-                                    .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
-                                    .map(|l| l.id)
-                                    .collect();
-                                links_to_destroy.extend(app_links);
-                            }
-                        }
-                    }
-
-                    // Wait for new links to be established
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-
-                    // Now destroy old links explicitly
-                    for link_id in links_to_destroy {
-                        self.send_pw_command(PwCommand::DestroyLink { link_id });
-                    }
-
-                    // Only destroy the sink if it's managed (SootMix-created)
-                    // Adopted sinks are kept alive - we just stop controlling them
-                    if is_managed {
-                        // Wait a bit more before destroying sink
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-
-                        if let Some(node_id) = sink_node_id {
-                            self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-                        }
-                    }
-                }
-                self.state.channels.retain(|c| c.id != id);
+                self.cmd_delete_channel(id);
                 self.save_config();
             }
             Message::NewChannelRequested => {
                 let channel_num = self.state.channels.len() + 1;
-                let channel = MixerChannel::new(format!("Channel {}", channel_num));
-                let id = channel.id;
-                let name = channel.name.clone();
-                self.state.channels.push(channel);
-
-                // Create virtual sink (uses channel name for node.name, readable in Helvum)
-                self.send_pw_command(PwCommand::CreateVirtualSink {
-                    channel_id: id,
-                    name,
-                });
+                let name = format!("Channel {}", channel_num);
+                self.cmd_create_channel(&name);
                 self.save_config();
             }
 
@@ -491,59 +350,25 @@ impl SootMix {
                 if let Some((app_node_id, app_id)) = self.state.dragging_app.take() {
                     info!("Assigning app {} (node {}) to channel {:?}", app_id, app_node_id, channel_id);
 
-                    // Get the channel's virtual sink node ID
-                    let sink_node_id = self.state.channel(channel_id).and_then(|c| c.pw_sink_id);
-
-                    if let Some(sink_node_id) = sink_node_id {
-                        // First, disconnect the app from any existing sinks
-                        // This ensures audio ONLY goes through our virtual sink
-                        let existing_links = self.state.pw_graph.links_from_node(app_node_id);
-                        for link in existing_links {
-                            // Don't destroy links to our own sinks
-                            let is_our_sink = self.state.channels.iter()
-                                .any(|c| c.pw_sink_id == Some(link.input_node));
-                            if !is_our_sink {
-                                info!("Disconnecting app from node {}: destroying link {}", link.input_node, link.id);
-                                self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
-                            }
-                        }
-
-                        // Show available ports for routing
-                        let app_out_ports = self.state.pw_graph.output_ports_for_node(app_node_id);
-                        let sink_in_ports = self.state.pw_graph.input_ports_for_node(sink_node_id);
-                        info!("App {} has {} output ports: {:?}", app_node_id, app_out_ports.len(),
-                            app_out_ports.iter().map(|p| (p.id, &p.name)).collect::<Vec<_>>());
-                        info!("Sink {} has {} input ports: {:?}", sink_node_id, sink_in_ports.len(),
-                            sink_in_ports.iter().map(|p| (p.id, &p.name)).collect::<Vec<_>>());
-
-                        // Find matching port pairs between app and sink
-                        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_node_id);
-
-                        if port_pairs.is_empty() {
-                            warn!("No matching ports found for app {} -> sink {}", app_node_id, sink_node_id);
-                            self.state.last_error = Some("No matching ports found".to_string());
-                        } else {
-                            // Create links for each port pair
-                            for (output_port, input_port) in &port_pairs {
-                                info!("Creating link: port {} -> port {}", output_port, input_port);
-                                self.send_pw_command(PwCommand::CreateLink {
-                                    output_port: *output_port,
-                                    input_port: *input_port,
-                                });
-                            }
-                        }
-
-                        // Add app to channel's assigned apps list
-                        if let Some(channel) = self.state.channel_mut(channel_id) {
-                            if !channel.assigned_apps.contains(&app_id) {
-                                channel.assigned_apps.push(app_id);
-                            }
+                    if self.daemon_connected {
+                        // Daemon mode: send command to daemon, it has the sink IDs
+                        if !self.cmd_assign_app(app_node_id, channel_id) {
+                            self.state.last_error = Some("Failed to assign app".to_string());
                         }
                     } else {
-                        warn!("Channel {:?} has no virtual sink yet", channel_id);
-                        self.state.last_error = Some("Channel has no sink - try again".to_string());
-                        // Put the drag state back so user can try again
-                        self.state.dragging_app = Some((app_node_id, app_id));
+                        // Standalone mode: check if channel has a sink before attempting assignment
+                        let has_sink = self.state.channel(channel_id).and_then(|c| c.pw_sink_id).is_some();
+
+                        if has_sink {
+                            if !self.cmd_assign_app(app_node_id, channel_id) {
+                                self.state.last_error = Some("No matching ports found".to_string());
+                            }
+                        } else {
+                            warn!("Channel {:?} has no virtual sink yet", channel_id);
+                            self.state.last_error = Some("Channel has no sink - try again".to_string());
+                            // Put the drag state back so user can try again
+                            self.state.dragging_app = Some((app_node_id, app_id));
+                        }
                     }
                 }
             }
@@ -558,172 +383,44 @@ impl SootMix {
                 info!("Unassigning app {} from channel {:?}", app_id, channel_id);
 
                 // Find the app's node ID
-                let app_node_id = self.state.available_apps.iter()
+                if let Some(app_node_id) = self.state.available_apps.iter()
                     .find(|a| a.identifier() == app_id)
-                    .map(|a| a.node_id);
-
-                // Get the channel's sink node ID
-                let sink_node_id = self.state.channel(channel_id).and_then(|c| c.pw_sink_id);
-
-                // Find hardware sink to reconnect to
-                let our_sink_ids: Vec<u32> = self.state.channels.iter()
-                    .filter_map(|c| c.pw_sink_id)
-                    .collect();
-                let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
-
-                if let (Some(app_node_id), Some(sink_node_id)) = (app_node_id, sink_node_id) {
-                    // FIRST: Connect to default sink (before destroying old links)
-                    // This ensures there's never a gap where the app has no audio output
-                    if let Some(default_id) = default_sink_id {
-                        info!("Reconnecting app {} to hardware sink {}", app_node_id, default_id);
-                        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_id);
-                        for (output_port, input_port) in port_pairs {
-                            self.send_pw_command(PwCommand::CreateLink {
-                                output_port,
-                                input_port,
-                            });
-                        }
-                    } else {
-                        warn!("No hardware sink found to reconnect app");
+                    .map(|a| a.node_id)
+                {
+                    self.cmd_unassign_app(app_node_id, channel_id);
+                } else {
+                    // App not found (might have been removed), just update local state
+                    if let Some(channel) = self.state.channel_mut(channel_id) {
+                        channel.assigned_apps.retain(|a| a != &app_id);
                     }
-
-                    // THEN: Destroy links from app to our sink
-                    let links_to_destroy: Vec<u32> = self.state.pw_graph.links
-                        .values()
-                        .filter(|l| l.output_node == app_node_id && l.input_node == sink_node_id)
-                        .map(|l| l.id)
-                        .collect();
-
-                    for link_id in links_to_destroy {
-                        info!("Destroying link {} from app to channel sink", link_id);
-                        self.send_pw_command(PwCommand::DestroyLink { link_id });
-                    }
-                }
-
-                // Remove from channel's assigned apps list
-                if let Some(channel) = self.state.channel_mut(channel_id) {
-                    channel.assigned_apps.retain(|a| a != &app_id);
                 }
             }
             Message::ChannelOutputDeviceChanged(channel_id, device_name) => {
-                info!("Channel {:?} output device changed to {:?}", channel_id, device_name);
-
-                // Find the device node ID if a specific device is selected
-                let target_device_id = device_name.as_ref().and_then(|name| {
-                    self.state.available_outputs.iter()
-                        .find(|d| d.description == *name || d.name == *name)
-                        .map(|d| d.node_id)
-                });
-
-                // Update channel state
-                if let Some(channel) = self.state.channel_mut(channel_id) {
-                    channel.output_device_name = device_name;
-                    channel.output_device_id = target_device_id;
-
-                    // Get the loopback output node ID for routing
-                    if let Some(loopback_output_id) = channel.pw_loopback_output_id {
-                        // Send command to route to new device
-                        self.send_pw_command(PwCommand::RouteChannelToDevice {
-                            loopback_output_node: loopback_output_id,
-                            target_device_id,
-                        });
-                    } else {
-                        // Try to find the loopback output node by name
-                        let safe_name: String = channel.name
-                            .chars()
-                            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                            .collect();
-                        // Note: pw-loopback adds "output." prefix to the --name value
-                        let loopback_output_name = format!("output.sootmix.{}.output", safe_name);
-
-                        if let Some(loopback_node) = self.state.pw_graph.nodes.values()
-                            .find(|n| n.name == loopback_output_name)
-                        {
-                            let loopback_id = loopback_node.id;
-                            // Update the channel with the found ID
-                            if let Some(ch) = self.state.channel_mut(channel_id) {
-                                ch.pw_loopback_output_id = Some(loopback_id);
-                            }
-                            self.send_pw_command(PwCommand::RouteChannelToDevice {
-                                loopback_output_node: loopback_id,
-                                target_device_id,
-                            });
-                        } else {
-                            warn!("Loopback output node '{}' not found for routing", loopback_output_name);
-                        }
-                    }
-                }
-
+                self.cmd_set_channel_output(channel_id, device_name.as_deref());
                 self.save_config();
             }
 
             // ==================== Master Actions ====================
             Message::MasterVolumeChanged(volume) => {
-                self.state.master_volume_db = volume;
-                // Apply to selected output device
-                if let Some(node_id) = self.get_output_device_node_id() {
-                    let linear = db_to_linear(volume);
-                    debug!("Master volume: db={:.1}, linear={:.3}, node={}", volume, linear, node_id);
-                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
-                } else {
-                    debug!("Master volume changed but no output device found. available={}, selected={:?}",
-                        self.state.available_outputs.len(), self.state.output_device);
-                }
+                self.cmd_set_master_volume(volume);
             }
             Message::MasterVolumeReleased => {
                 debug!("Master volume released");
                 self.save_config();
             }
             Message::MasterMuteToggled => {
-                self.state.master_muted = !self.state.master_muted;
-                if let Some(node_id) = self.get_output_device_node_id() {
-                    self.send_pw_command(PwCommand::SetMute {
-                        node_id,
-                        muted: self.state.master_muted,
-                    });
-                }
+                let new_muted = !self.state.master_muted;
+                self.cmd_set_master_mute(new_muted);
                 self.save_config();
             }
             Message::OutputDeviceChanged(device_name) => {
                 info!("Output device changed to: {}", device_name);
-                self.state.output_device = Some(device_name.clone());
-
-                // Find the node_id for this device
-                if let Some(device) = self.state.available_outputs.iter()
-                    .find(|d| d.description == device_name || d.name == device_name)
-                {
-                    let node_id = device.node_id;
-
-                    // Set as default sink (pw-loopbacks will automatically route here)
-                    self.send_pw_command(PwCommand::SetDefaultSink { node_id });
-
-                    // Apply current master volume/mute to new device
-                    let linear = db_to_linear(self.state.master_volume_db);
-                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
-                    if self.state.master_muted {
-                        self.send_pw_command(PwCommand::SetMute { node_id, muted: true });
-                    }
-                }
-
+                self.cmd_set_master_output(Some(&device_name));
                 self.save_config();
             }
             Message::ToggleMasterRecording => {
-                if self.state.master_recording_enabled {
-                    // Disable recording - destroy the source
-                    if let Some(node_id) = self.state.master_recording_source_id {
-                        info!("Disabling master recording output");
-                        self.send_pw_command(PwCommand::DestroyRecordingSource { node_id });
-                        self.state.master_recording_enabled = false;
-                        self.state.master_recording_source_id = None;
-                    }
-                } else {
-                    // Enable recording - create the source
-                    info!("Enabling master recording output");
-                    self.send_pw_command(PwCommand::CreateRecordingSource {
-                        name: "master".to_string(),
-                    });
-                    self.state.master_recording_enabled = true;
-                }
+                let new_enabled = !self.state.master_recording_enabled;
+                self.cmd_set_master_recording(new_enabled);
             }
 
             // ==================== EQ Panel ====================
@@ -889,41 +586,28 @@ impl SootMix {
                     let modified = self.state.apply_snapshot(&snapshot);
                     info!("Applied snapshot, modified {} channels", modified.len());
 
-                    // Send PipeWire commands for changed channels
-                    // Volume/mute control goes to the loopback output (Stream/Output/Audio)
+                    // Apply channel volume/mute changes using cmd methods
                     for channel_id in modified {
                         if let Some(channel) = self.state.channel(channel_id) {
-                            if let Some(node_id) = channel.pw_loopback_output_id {
-                                let linear_vol = channel.volume_linear();
-                                debug!(
-                                    "Setting channel {} volume: db={:.1}, linear={:.3}",
-                                    channel.name, channel.volume_db, linear_vol
-                                );
-                                self.send_pw_command(PwCommand::SetVolume {
-                                    node_id,
-                                    volume: linear_vol,
-                                });
-                                self.send_pw_command(PwCommand::SetMute {
-                                    node_id,
-                                    muted: channel.muted,
-                                });
-                            }
+                            debug!(
+                                "Setting channel {} volume: db={:.1}",
+                                channel.name, channel.volume_db
+                            );
+                            let volume = channel.volume_db;
+                            let muted = channel.muted;
+                            // Use cmd methods - they handle daemon vs standalone
+                            self.cmd_set_channel_volume(channel_id, volume);
+                            self.cmd_set_channel_mute(channel_id, muted);
                         }
                     }
 
                     // Apply master volume/mute
-                    if let Some(node_id) = self.get_output_device_node_id() {
-                        let linear = db_to_linear(self.state.master_volume_db);
-                        debug!(
-                            "Setting master volume: db={:.1}, linear={:.3}",
-                            self.state.master_volume_db, linear
-                        );
-                        self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
-                        self.send_pw_command(PwCommand::SetMute {
-                            node_id,
-                            muted: self.state.master_muted,
-                        });
-                    }
+                    debug!(
+                        "Setting master volume: db={:.1}",
+                        self.state.master_volume_db
+                    );
+                    self.cmd_set_master_volume(self.state.master_volume_db);
+                    self.cmd_set_master_mute(self.state.master_muted);
 
                     self.state.active_snapshot = Some(slot);
                 }
@@ -1353,35 +1037,51 @@ impl SootMix {
             }
 
             // ==================== Window & Tray ====================
-            Message::WindowCloseRequested(_window_id) => {
-                // User wants to quit - clean up and exit
-                info!("Window close requested - exiting");
-                self.cleanup();
-                return iced::exit();
+            Message::WindowCloseRequested(window_id) => {
+                // Hide window to tray instead of quitting
+                // The daemon keeps running so audio continues
+                if self.tray_handle.is_some() {
+                    info!("Window close requested - hiding to tray (daemon keeps running)");
+                    self.main_window_id = None;
+                    return iced::window::close(window_id);
+                } else {
+                    // No tray available - actually quit
+                    info!("Window close requested - no tray, exiting");
+                    self.cleanup();
+                    return iced::exit();
+                }
             }
 
             Message::TrayShowWindow => {
                 info!("Tray: Show window requested");
-                // Bring window to focus (it's still open)
-                return iced::window::oldest().and_then(|id| {
-                    iced::window::gain_focus(id)
-                });
+                if self.main_window_id.is_some() {
+                    // Window is open, just focus it
+                    return iced::window::oldest().and_then(|id| {
+                        iced::window::gain_focus(id)
+                    });
+                } else {
+                    // Window is closed, need to open a new one
+                    let (id, open_task) = iced::window::open(iced::window::Settings {
+                        size: iced::Size::new(900.0, 600.0),
+                        platform_specific: iced::window::settings::PlatformSpecific {
+                            application_id: "sootmix".to_string(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                    self.main_window_id = Some(id);
+                    return open_task.discard();
+                }
             }
 
             Message::TrayToggleMuteAll => {
                 info!("Tray: Toggle mute all");
-                // Toggle mute on all channels and master
                 let new_mute_state = !self.state.master_muted;
-                self.state.master_muted = new_mute_state;
+                self.cmd_set_master_mute(new_mute_state);
 
                 // Update tray icon state
                 if let Some(ref handle) = self.tray_handle {
                     handle.set_muted(new_mute_state);
-                }
-
-                // Apply to PipeWire
-                if let Some(output_node_id) = self.get_output_device_node_id() {
-                    self.send_pw_command(PwCommand::SetMute { node_id: output_node_id, muted: new_mute_state });
                 }
             }
 
@@ -1389,6 +1089,11 @@ impl SootMix {
                 info!("Tray: Quit requested");
                 self.cleanup();
                 return iced::exit();
+            }
+
+            // ==================== Daemon Events ====================
+            Message::Daemon(event) => {
+                self.handle_daemon_event(event);
             }
 
             _ => {
@@ -1407,7 +1112,7 @@ impl SootMix {
     /// - Channel strips (full width, horizontally scrollable)
     /// - Apps panel (compact, below strips)
     /// - Collapsible bottom panel for selected channel detail
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self, _window: iced::window::Id) -> Element<Message> {
         // Header bar
         let header = self.view_header();
 
@@ -2213,14 +1918,507 @@ impl SootMix {
             iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick),
             // Listen for window close requests
             iced::window::close_requests().map(Message::WindowCloseRequested),
+            // Listen for daemon events via D-Bus
+            daemon_client::daemon_subscription().map(Message::Daemon),
         ])
     }
 
-    /// Send a command to the PipeWire thread.
+    /// Send a command to the PipeWire thread (standalone mode only).
     fn send_pw_command(&self, cmd: PwCommand) {
         if let Some(ref thread) = self.pw_thread {
             if let Err(e) = thread.send(cmd) {
                 error!("Failed to send command to PipeWire thread: {}", e);
+            }
+        }
+    }
+
+    // ==================== High-Level Audio Commands ====================
+    // These methods work with both daemon mode and standalone mode.
+
+    /// Create a new mixer channel.
+    fn cmd_create_channel(&mut self, name: &str) -> Option<Uuid> {
+        if self.daemon_connected {
+            // In daemon mode, send command via D-Bus
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::CreateChannel(name.to_string())
+            ) {
+                error!("Failed to send create channel command to daemon: {}", e);
+            }
+            // Channel will be added via ChannelAdded signal
+            None
+        } else {
+            // In standalone mode, create channel locally
+            let channel = MixerChannel::new(name);
+            let id = channel.id;
+            self.state.channels.push(channel);
+            self.send_pw_command(PwCommand::CreateVirtualSink {
+                channel_id: id,
+                name: name.to_string(),
+            });
+            Some(id)
+        }
+    }
+
+    /// Delete a mixer channel.
+    fn cmd_delete_channel(&mut self, channel_id: Uuid) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::DeleteChannel(channel_id.to_string())
+            ) {
+                error!("Failed to send delete channel command to daemon: {}", e);
+            }
+        } else {
+            // Get channel info before removing
+            let channel_info = self.state.channel(channel_id).map(|c| {
+                (c.pw_sink_id, c.assigned_apps.clone(), c.is_managed, c.pw_eq_node_id)
+            });
+
+            if let Some((sink_node_id, assigned_apps, is_managed, eq_node_id)) = channel_info {
+                // Destroy EQ filter if it exists
+                if eq_node_id.is_some() {
+                    filter_chain::destroy_eq_filter(channel_id).ok();
+                }
+
+                // Find hardware output sink (not virtual sinks)
+                let our_sink_ids: Vec<u32> = self.state.channels.iter()
+                    .filter_map(|c| c.pw_sink_id)
+                    .collect();
+                let default_sink_id = find_hardware_sink(&self.state.pw_graph, &our_sink_ids);
+
+                // Collect all link destruction commands for after we create new links
+                let mut links_to_destroy: Vec<u32> = Vec::new();
+
+                for app_id in assigned_apps {
+                    // Find app node ID
+                    if let Some(app) = self.state.available_apps.iter().find(|a| a.identifier() == app_id) {
+                        let app_node_id = app.node_id;
+
+                        // First create links to default sink
+                        if let Some(default_id) = default_sink_id {
+                            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_id);
+                            for (output_port, input_port) in port_pairs {
+                                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+                            }
+                        }
+
+                        // Collect links to destroy (to our sink)
+                        if let Some(sink_id) = sink_node_id {
+                            let app_links: Vec<u32> = self.state.pw_graph.links
+                                .values()
+                                .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
+                                .map(|l| l.id)
+                                .collect();
+                            links_to_destroy.extend(app_links);
+                        }
+                    }
+                }
+
+                // Wait for new links to be established
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                // Now destroy old links explicitly
+                for link_id in links_to_destroy {
+                    self.send_pw_command(PwCommand::DestroyLink { link_id });
+                }
+
+                // Only destroy the sink if it's managed (SootMix-created)
+                // Adopted sinks are kept alive - we just stop controlling them
+                if is_managed {
+                    // Wait a bit more before destroying sink
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+
+                    if let Some(node_id) = sink_node_id {
+                        self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                    }
+                }
+            }
+            self.state.channels.retain(|c| c.id != channel_id);
+        }
+    }
+
+    /// Rename a mixer channel.
+    fn cmd_rename_channel(&mut self, channel_id: Uuid, new_name: &str) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::RenameChannel {
+                    id: channel_id.to_string(),
+                    name: new_name.to_string(),
+                }
+            ) {
+                error!("Failed to send rename channel command to daemon: {}", e);
+            }
+            // Update local state immediately for responsive UI
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.name = new_name.to_string();
+            }
+        } else {
+            // Get current channel info
+            let channel_info = self.state.channel(channel_id).map(|c| {
+                (c.pw_sink_id, c.name.clone(), c.assigned_apps.clone())
+            });
+
+            if let Some((sink_node_id, old_name, assigned_apps)) = channel_info {
+                // Only update if name actually changed
+                if new_name != old_name {
+                    // Check if any apps are currently routed to this channel
+                    let has_routed_apps = !assigned_apps.is_empty() &&
+                        assigned_apps.iter().any(|app_id| {
+                            self.state.available_apps.iter().any(|a| a.identifier() == *app_id)
+                        });
+
+                    if has_routed_apps {
+                        // Apps are routed - only update description (seamless, no audio glitch)
+                        info!("Renaming channel to '{}' (description only, apps routed)", new_name);
+                        if let Some(node_id) = sink_node_id {
+                            self.send_pw_command(PwCommand::UpdateSinkDescription {
+                                node_id,
+                                description: new_name.to_string(),
+                            });
+                        }
+                    } else {
+                        // No apps routed - full rename (recreate sink with new node.name)
+                        info!("Renaming channel to '{}' (full rename, no apps routed)", new_name);
+                        if let Some(node_id) = sink_node_id {
+                            self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                        }
+                        self.send_pw_command(PwCommand::CreateVirtualSink {
+                            channel_id,
+                            name: new_name.to_string(),
+                        });
+                    }
+
+                    // Update UI name
+                    if let Some(channel) = self.state.channel_mut(channel_id) {
+                        channel.name = new_name.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set channel volume in dB.
+    fn cmd_set_channel_volume(&mut self, channel_id: Uuid, volume_db: f32) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelVolume {
+                    id: channel_id.to_string(),
+                    volume_db: volume_db as f64,
+                }
+            ) {
+                error!("Failed to send set volume command to daemon: {}", e);
+            }
+            // Update local state immediately for responsive UI
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.volume_db = volume_db;
+            }
+        } else {
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.volume_db = volume_db;
+                let linear = db_to_linear(if channel.muted { -60.0 } else { volume_db });
+                if let Some(node_id) = channel.pw_loopback_output_id {
+                    self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+                }
+            }
+        }
+    }
+
+    /// Set channel mute state.
+    fn cmd_set_channel_mute(&mut self, channel_id: Uuid, muted: bool) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelMute {
+                    id: channel_id.to_string(),
+                    muted,
+                }
+            ) {
+                error!("Failed to send set mute command to daemon: {}", e);
+            }
+            // Update local state immediately for responsive UI
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.muted = muted;
+            }
+        } else {
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.muted = muted;
+                if let Some(node_id) = channel.pw_loopback_output_id {
+                    self.send_pw_command(PwCommand::SetMute { node_id, muted });
+                }
+            }
+        }
+    }
+
+    /// Set master volume in dB.
+    fn cmd_set_master_volume(&mut self, volume_db: f32) {
+        self.state.master_volume_db = volume_db;
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetMasterVolume(volume_db as f64)
+            ) {
+                error!("Failed to send set master volume command to daemon: {}", e);
+            }
+        } else {
+            if let Some(node_id) = self.get_output_device_node_id() {
+                let linear = db_to_linear(if self.state.master_muted { -60.0 } else { volume_db });
+                self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
+            }
+        }
+    }
+
+    /// Set master mute state.
+    fn cmd_set_master_mute(&mut self, muted: bool) {
+        self.state.master_muted = muted;
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetMasterMute(muted)
+            ) {
+                error!("Failed to send set master mute command to daemon: {}", e);
+            }
+        } else {
+            if let Some(node_id) = self.get_output_device_node_id() {
+                self.send_pw_command(PwCommand::SetMute { node_id, muted });
+            }
+        }
+    }
+
+    /// Assign an app to a channel.
+    fn cmd_assign_app(&mut self, app_node_id: u32, channel_id: Uuid) -> bool {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::AssignApp {
+                    app_id: app_node_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                }
+            ) {
+                error!("Failed to send assign app command to daemon: {}", e);
+                return false;
+            }
+            true
+        } else {
+            // Standalone mode: create links directly
+            self.route_app_to_channel_standalone(app_node_id, channel_id)
+        }
+    }
+
+    /// Unassign an app from a channel.
+    fn cmd_unassign_app(&mut self, app_node_id: u32, channel_id: Uuid) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::UnassignApp {
+                    app_id: app_node_id.to_string(),
+                    channel_id: channel_id.to_string(),
+                }
+            ) {
+                error!("Failed to send unassign app command to daemon: {}", e);
+            }
+        } else {
+            // Standalone mode: destroy links and reconnect to default
+            self.unroute_app_from_channel_standalone(app_node_id, channel_id);
+        }
+    }
+
+    /// Set channel output device.
+    fn cmd_set_channel_output(&mut self, channel_id: Uuid, device_name: Option<&str>) {
+        info!("Channel {:?} output device changed to {:?}", channel_id, device_name);
+
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelOutput {
+                    channel_id: channel_id.to_string(),
+                    device_name: device_name.unwrap_or("").to_string(),
+                }
+            ) {
+                error!("Failed to send set channel output command to daemon: {}", e);
+            }
+        } else {
+            // Look up target device ID first to avoid borrow conflicts
+            let target_device_id = device_name.and_then(|name| {
+                self.state.available_outputs.iter()
+                    .find(|d| d.description == name || d.name == name)
+                    .map(|d| d.node_id)
+            });
+
+            // Get channel info for loopback lookup
+            let channel_info = self.state.channel(channel_id).map(|c| {
+                (c.pw_loopback_output_id, c.name.clone())
+            });
+
+            // Update channel state
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.output_device_name = device_name.map(String::from);
+                channel.output_device_id = target_device_id;
+            }
+
+            // Route to device
+            if let Some((loopback_output_id, channel_name)) = channel_info {
+                if let Some(loopback_id) = loopback_output_id {
+                    self.send_pw_command(PwCommand::RouteChannelToDevice {
+                        loopback_output_node: loopback_id,
+                        target_device_id,
+                    });
+                } else {
+                    // Try to find the loopback output node by name
+                    let safe_name: String = channel_name
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                        .collect();
+                    let loopback_output_name = format!("output.sootmix.{}.output", safe_name);
+
+                    if let Some(loopback_node) = self.state.pw_graph.nodes.values()
+                        .find(|n| n.name == loopback_output_name)
+                    {
+                        let loopback_id = loopback_node.id;
+                        // Update the channel with the found ID
+                        if let Some(ch) = self.state.channel_mut(channel_id) {
+                            ch.pw_loopback_output_id = Some(loopback_id);
+                        }
+                        self.send_pw_command(PwCommand::RouteChannelToDevice {
+                            loopback_output_node: loopback_id,
+                            target_device_id,
+                        });
+                    } else {
+                        warn!("Loopback output node '{}' not found for routing", loopback_output_name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set master output device.
+    fn cmd_set_master_output(&mut self, device_name: Option<&str>) {
+        self.state.output_device = device_name.map(String::from);
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetMasterOutput(device_name.unwrap_or("").to_string())
+            ) {
+                error!("Failed to send set master output command to daemon: {}", e);
+            }
+        } else {
+            if let Some(node_id) = self.get_output_device_node_id() {
+                self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+            }
+        }
+    }
+
+    /// Enable/disable master recording.
+    fn cmd_set_master_recording(&mut self, enabled: bool) {
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetMasterRecording(enabled)
+            ) {
+                error!("Failed to send set recording command to daemon: {}", e);
+            }
+        } else {
+            if enabled {
+                if !self.state.master_recording_enabled {
+                    self.send_pw_command(PwCommand::CreateRecordingSource {
+                        name: "master".to_string(),
+                    });
+                    self.state.master_recording_enabled = true;
+                }
+            } else {
+                if let Some(node_id) = self.state.master_recording_source_id {
+                    self.send_pw_command(PwCommand::DestroyRecordingSource { node_id });
+                }
+                self.state.master_recording_enabled = false;
+                self.state.master_recording_source_id = None;
+            }
+        }
+    }
+
+    /// Route an app to a channel (standalone mode helper).
+    fn route_app_to_channel_standalone(&mut self, app_node_id: u32, channel_id: Uuid) -> bool {
+        let channel = match self.state.channel(channel_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        let sink_id = match channel.pw_sink_id {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Get app identifier for tracking
+        let app_identifier = self.state.available_apps.iter()
+            .find(|a| a.node_id == app_node_id)
+            .map(|a| a.identifier().to_string());
+
+        // First, disconnect the app from any existing sinks (except our own)
+        // This ensures audio ONLY goes through our virtual sink
+        let existing_links = self.state.pw_graph.links_from_node(app_node_id);
+        for link in existing_links {
+            // Don't destroy links to our own sinks
+            let is_our_sink = self.state.channels.iter()
+                .any(|c| c.pw_sink_id == Some(link.input_node));
+            if !is_our_sink {
+                info!("Disconnecting app from node {}: destroying link {}", link.input_node, link.id);
+                self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+            }
+        }
+
+        // Find port pairs and create links
+        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_id);
+        if port_pairs.is_empty() {
+            warn!("No matching ports found for app {} -> sink {}", app_node_id, sink_id);
+            return false;
+        }
+
+        for (output_port, input_port) in port_pairs {
+            info!("Creating link: port {} -> port {}", output_port, input_port);
+            self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+        }
+
+        // Add to assigned apps
+        if let Some(identifier) = app_identifier {
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                if !channel.assigned_apps.contains(&identifier) {
+                    channel.assigned_apps.push(identifier);
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Unroute an app from a channel (standalone mode helper).
+    fn unroute_app_from_channel_standalone(&mut self, app_node_id: u32, channel_id: Uuid) {
+        let channel = match self.state.channel(channel_id) {
+            Some(c) => c,
+            None => return,
+        };
+        let sink_id = channel.pw_sink_id;
+
+        // Get app identifier for tracking
+        let app_identifier = self.state.available_apps.iter()
+            .find(|a| a.node_id == app_node_id)
+            .map(|a| a.identifier().to_string());
+
+        // FIRST: Connect to default output (before destroying old links)
+        // This ensures there's never a gap where the app has no audio output
+        if let Some(default_output) = self.get_output_device_node_id() {
+            info!("Reconnecting app {} to hardware sink {}", app_node_id, default_output);
+            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_output);
+            for (output_port, input_port) in port_pairs {
+                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+            }
+        } else {
+            warn!("No hardware sink found to reconnect app");
+        }
+
+        // THEN: Destroy links to our sink
+        if let Some(sink_id) = sink_id {
+            let links_to_destroy: Vec<u32> = self.state.pw_graph.links.values()
+                .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
+                .map(|l| l.id)
+                .collect();
+            for link_id in links_to_destroy {
+                info!("Destroying link {} from app to channel sink", link_id);
+                self.send_pw_command(PwCommand::DestroyLink { link_id });
+            }
+        }
+
+        // Remove from assigned apps
+        if let Some(identifier) = app_identifier {
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.assigned_apps.retain(|a| a != &identifier);
             }
         }
     }
@@ -2872,6 +3070,268 @@ impl SootMix {
 
             // Initialize snapshot A with the restored state
             self.initialize_default_snapshot();
+        }
+    }
+
+    /// Handle events received from the daemon via D-Bus.
+    fn handle_daemon_event(&mut self, event: DaemonEvent) {
+        use crate::daemon_client::DaemonEvent::*;
+
+        match event {
+            Connected => {
+                info!("Connected to SootMix daemon - using daemon mode");
+                self.daemon_connected = true;
+                self.state.pw_connected = true;
+
+                // Shutdown local PW thread if running (daemon handles audio)
+                if let Some(pw) = self.pw_thread.take() {
+                    info!("Shutting down local PipeWire thread (daemon takes over)");
+                    pw.shutdown();
+                }
+                self.pw_event_rx = None;
+            }
+            Disconnected => {
+                warn!("Disconnected from SootMix daemon");
+                self.daemon_connected = false;
+                self.state.pw_connected = false;
+
+                // Spawn local PW thread as fallback
+                if self.pw_thread.is_none() {
+                    info!("Starting local PipeWire thread (standalone mode)");
+                    let (event_tx, event_rx) = mpsc::channel();
+                    match PwThread::spawn(event_tx) {
+                        Ok(thread) => {
+                            // Send shared plugin instances to PW thread
+                            let shared_instances = self.plugin_manager.shared_instances();
+                            if let Err(e) = thread.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
+                                error!("Failed to send shared plugin instances to PW thread: {:?}", e);
+                            }
+                            self.pw_thread = Some(thread);
+                            self.pw_event_rx = Some(event_rx);
+                            info!("PipeWire thread started in standalone mode");
+                        }
+                        Err(e) => {
+                            error!("Failed to start PipeWire thread: {}", e);
+                        }
+                    }
+                }
+            }
+            InitialState {
+                channels,
+                apps,
+                outputs,
+                master_volume,
+                master_muted,
+                master_output,
+                connected,
+                recording_enabled,
+            } => {
+                info!(
+                    "Received initial state from daemon: {} channels, {} apps, {} outputs",
+                    channels.len(),
+                    apps.len(),
+                    outputs.len()
+                );
+
+                // Update master state
+                self.state.pw_connected = connected;
+                self.state.master_volume_db = master_volume as f32;
+                self.state.master_muted = master_muted;
+                self.state.master_recording_enabled = recording_enabled;
+                if !master_output.is_empty() {
+                    self.state.output_device = Some(master_output);
+                }
+
+                // Sync channels from daemon
+                self.state.channels.clear();
+                for ch_info in channels {
+                    if let Ok(id) = Uuid::parse_str(&ch_info.id) {
+                        let channel = MixerChannel {
+                            id,
+                            name: ch_info.name,
+                            volume_db: ch_info.volume_db as f32,
+                            muted: ch_info.muted,
+                            eq_enabled: ch_info.eq_enabled,
+                            eq_preset: ch_info.eq_preset,
+                            assigned_apps: ch_info.assigned_apps,
+                            is_managed: true,
+                            sink_name: None,
+                            pw_sink_id: None,
+                            pw_eq_node_id: None,
+                            pw_loopback_output_id: None,
+                            meter_display: crate::state::MeterDisplayState::default(),
+                            plugin_chain: Vec::new(),
+                            plugin_instances: Vec::new(),
+                            meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
+                            output_device_id: None,
+                            output_device_name: if ch_info.output_device.is_empty() {
+                                None
+                            } else {
+                                Some(ch_info.output_device)
+                            },
+                        };
+                        self.state.channels.push(channel);
+                    }
+                }
+
+                // Sync apps from daemon
+                self.state.available_apps.clear();
+                for app_info in apps {
+                    self.state.available_apps.push(crate::state::AppInfo {
+                        node_id: app_info.node_id,
+                        name: app_info.name,
+                        binary: if app_info.binary.is_empty() {
+                            None
+                        } else {
+                            Some(app_info.binary)
+                        },
+                        icon: if app_info.icon.is_empty() {
+                            None
+                        } else {
+                            Some(app_info.icon)
+                        },
+                    });
+                }
+
+                // Sync outputs from daemon
+                self.state.available_outputs.clear();
+                for output in outputs {
+                    self.state.available_outputs.push(crate::audio::types::OutputDevice {
+                        node_id: output.node_id,
+                        name: output.name,
+                        description: output.description,
+                    });
+                }
+
+                self.state.startup_complete = true;
+                info!("State synced from daemon - {} channels, {} apps",
+                      self.state.channels.len(),
+                      self.state.available_apps.len());
+            }
+            ChannelAdded(ch_info) => {
+                info!("Daemon: Channel added: {}", ch_info.name);
+                if let Ok(id) = Uuid::parse_str(&ch_info.id) {
+                    // Check if channel already exists
+                    if self.state.channel(id).is_none() {
+                        let channel = MixerChannel {
+                            id,
+                            name: ch_info.name,
+                            volume_db: ch_info.volume_db as f32,
+                            muted: ch_info.muted,
+                            eq_enabled: ch_info.eq_enabled,
+                            eq_preset: ch_info.eq_preset,
+                            assigned_apps: ch_info.assigned_apps,
+                            is_managed: true,
+                            sink_name: None,
+                            pw_sink_id: None,
+                            pw_eq_node_id: None,
+                            pw_loopback_output_id: None,
+                            meter_display: crate::state::MeterDisplayState::default(),
+                            plugin_chain: Vec::new(),
+                            plugin_instances: Vec::new(),
+                            meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
+                            output_device_id: None,
+                            output_device_name: if ch_info.output_device.is_empty() {
+                                None
+                            } else {
+                                Some(ch_info.output_device)
+                            },
+                        };
+                        self.state.channels.push(channel);
+                    }
+                }
+            }
+            ChannelRemoved(channel_id) => {
+                info!("Daemon: Channel removed: {}", channel_id);
+                if let Ok(id) = Uuid::parse_str(&channel_id) {
+                    self.state.channels.retain(|c| c.id != id);
+                }
+            }
+            ChannelUpdated(ch_info) => {
+                debug!("Daemon: Channel updated: {}", ch_info.name);
+                if let Ok(id) = Uuid::parse_str(&ch_info.id) {
+                    if let Some(channel) = self.state.channel_mut(id) {
+                        channel.name = ch_info.name;
+                        channel.volume_db = ch_info.volume_db as f32;
+                        channel.muted = ch_info.muted;
+                        channel.eq_enabled = ch_info.eq_enabled;
+                        channel.eq_preset = ch_info.eq_preset;
+                        channel.assigned_apps = ch_info.assigned_apps;
+                        if !ch_info.output_device.is_empty() {
+                            channel.output_device_name = Some(ch_info.output_device);
+                        }
+                    }
+                }
+            }
+            VolumeChanged { channel_id, volume_db } => {
+                if let Ok(id) = Uuid::parse_str(&channel_id) {
+                    if let Some(channel) = self.state.channel_mut(id) {
+                        channel.volume_db = volume_db as f32;
+                    }
+                }
+            }
+            MuteChanged { channel_id, muted } => {
+                if let Ok(id) = Uuid::parse_str(&channel_id) {
+                    if let Some(channel) = self.state.channel_mut(id) {
+                        channel.muted = muted;
+                    }
+                }
+            }
+            AppDiscovered(app_info) => {
+                debug!("Daemon: App discovered: {}", app_info.name);
+                // Check if app already exists
+                if !self.state.available_apps.iter().any(|a| a.node_id == app_info.node_id) {
+                    self.state.available_apps.push(crate::state::AppInfo {
+                        node_id: app_info.node_id,
+                        name: app_info.name,
+                        binary: if app_info.binary.is_empty() { None } else { Some(app_info.binary) },
+                        icon: if app_info.icon.is_empty() { None } else { Some(app_info.icon) },
+                    });
+                }
+            }
+            AppRemoved(app_id) => {
+                debug!("Daemon: App removed: {}", app_id);
+                if let Ok(node_id) = app_id.parse::<u32>() {
+                    self.state.available_apps.retain(|a| a.node_id != node_id);
+                }
+            }
+            AppRouted { app_id, channel_id } => {
+                debug!("Daemon: App {} routed to channel {}", app_id, channel_id);
+                // The channel's assigned_apps should be updated via ChannelUpdated signal
+            }
+            AppUnrouted { app_id, channel_id } => {
+                debug!("Daemon: App {} unrouted from channel {}", app_id, channel_id);
+                // The channel's assigned_apps should be updated via ChannelUpdated signal
+            }
+            PipeWireConnectionChanged(connected) => {
+                info!("PipeWire connection changed: {}", connected);
+                self.state.pw_connected = connected;
+            }
+            MasterVolumeChanged(volume_db) => {
+                self.state.master_volume_db = volume_db as f32;
+            }
+            MasterMuteChanged(muted) => {
+                self.state.master_muted = muted;
+            }
+            Error(msg) => {
+                error!("Daemon error: {}", msg);
+            }
+            MeterUpdate(data) => {
+                // Update channel meter levels from daemon
+                for meter in data {
+                    let id = meter.channel_id();
+                    if let Some(channel) = self.state.channel(id) {
+                        // Meter data is already in dB from daemon
+                        if let Some(ref meter_levels) = channel.meter_levels {
+                            meter_levels.store(meter.level_left_db as f32, meter.level_right_db as f32);
+                        }
+                    }
+                }
+            }
+            OutputsChanged => {
+                debug!("Output devices changed - will refresh on next state query");
+                // The full output list will be refreshed when needed
+            }
         }
     }
 }

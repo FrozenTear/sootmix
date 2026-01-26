@@ -1,0 +1,26 @@
+# SootMix Daemon systemd user service
+# Install to: ~/.config/systemd/user/sootmix-daemon.service
+# Enable with: systemctl --user enable --now sootmix-daemon.service
+
+[Unit]
+Description=SootMix Audio Routing Daemon
+Documentation=https://github.com/FrozenTear/sootmix
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/sootmix-daemon
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=RUST_LOG=sootmix_daemon=info
+
+# Resource limits for audio processing
+Nice=-5
+LimitRTPRIO=50
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=default.target

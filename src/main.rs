@@ -9,6 +9,7 @@
 mod app;
 mod audio;
 mod config;
+mod daemon_client;
 mod message;
 mod plugins;
 mod realtime;
@@ -29,12 +30,10 @@ fn main() -> iced::Result {
 
     info!("Starting SootMix");
 
-    // Run the Iced application
-    iced::application(SootMix::new, SootMix::update, SootMix::view)
+    // Run as daemon so closing windows doesn't exit the app (for tray support)
+    iced::daemon(SootMix::new, SootMix::update, SootMix::view)
         .title("SootMix")
         .subscription(SootMix::subscription)
         .theme(crate::ui::theme::sootmix_theme())
-        .window_size((900.0, 600.0))
-        .exit_on_close_request(false) // Handle close ourselves for tray support
         .run()
 }

@@ -1,0 +1,20 @@
+[package]
+name = "sootmix-ipc"
+version = "0.1.0"
+edition = "2021"
+authors = ["SootMix Contributors"]
+description = "Shared IPC types and D-Bus interface definitions for SootMix"
+license = "MPL-2.0"
+
+[dependencies]
+# D-Bus
+zbus = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "2"

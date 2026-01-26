@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/sootmix-plugin-api"]
+members = [".", "crates/sootmix-plugin-api", "crates/sootmix-ipc", "crates/sootmix-daemon"]
 resolver = "2"
 
 [package]
@@ -22,10 +22,15 @@ all-plugins = ["lv2-plugins", "vst3-plugins"]
 [dependencies]
 # Plugin system
 sootmix-plugin-api = { path = "crates/sootmix-plugin-api" }
+sootmix-ipc = { path = "crates/sootmix-ipc" }
 abi_stable = "0.11"
 libloading = "0.8"
+
 # GUI
 iced = { version = "0.14", features = ["tokio", "advanced", "canvas"] }
+
+# D-Bus
+zbus = "4"
 
 # PipeWire
 pipewire = "0.9"
@@ -33,6 +38,7 @@ libspa = "0.9"
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = "0.1"
 futures = { version = "0.3", features = ["std", "async-await"] }
 
 # Serialization

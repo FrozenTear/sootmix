@@ -22,6 +22,7 @@
 //! - Plugin instances are accessed via try_lock() for RT safety
 //! - Parameter updates flow via lock-free ring buffer
 
+use crate::audio::meter_stream::{calculate_stereo_peaks, AtomicMeterLevels};
 use crate::audio::plugin_filter::PluginProcessingContext;
 use crate::plugins::SharedPluginInstances;
 use crate::realtime::{PluginParamUpdate, RingBufferReader};
@@ -30,6 +31,7 @@ use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, trace};
 use uuid::Uuid;
 
@@ -45,6 +47,8 @@ struct StreamUserData {
     context: Rc<RefCell<PluginProcessingContext>>,
     /// Shared audio buffer between capture and playback streams.
     audio_buffer: Rc<RefCell<AudioRingBuffer>>,
+    /// Atomic meter levels for real-time level reporting (optional).
+    meter_levels: Option<Arc<AtomicMeterLevels>>,
     /// Whether this is the capture (true) or playback (false) stream.
     is_capture: bool,
     /// Channel ID for logging.
@@ -146,6 +150,7 @@ impl PluginFilterStreams {
     /// * `param_reader` - Ring buffer reader for parameter updates
     /// * `sample_rate` - Audio sample rate
     /// * `block_size` - Processing block size
+    /// * `meter_levels` - Optional atomic levels for real-time metering
     pub fn new(
         core: &pipewire::core::CoreRc,
         channel_id: Uuid,
@@ -155,6 +160,7 @@ impl PluginFilterStreams {
         param_reader: RingBufferReader<PluginParamUpdate>,
         sample_rate: f32,
         block_size: usize,
+        meter_levels: Option<Arc<AtomicMeterLevels>>,
     ) -> Result<Self, pipewire::Error> {
         info!(
             "Creating plugin filter streams for channel '{}' ({})",
@@ -209,6 +215,7 @@ impl PluginFilterStreams {
         let capture_user_data = StreamUserData {
             context: Rc::clone(&context),
             audio_buffer: Rc::clone(&audio_buffer),
+            meter_levels: meter_levels.clone(),
             is_capture: true,
             channel_id,
         };
@@ -228,6 +235,7 @@ impl PluginFilterStreams {
         let playback_user_data = StreamUserData {
             context: Rc::clone(&context),
             audio_buffer: Rc::clone(&audio_buffer),
+            meter_levels: None,
             is_capture: false,
             channel_id,
         };
@@ -270,31 +278,28 @@ impl PluginFilterStreams {
         );
 
         // Base flags for all streams
-        let base_flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+        let base_flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS | StreamFlags::AUTOCONNECT;
 
         // Connect capture stream (input direction = receiving audio)
-        // Use AUTOCONNECT only if no specific target is provided
-        let capture_flags = if capture_target.is_some() {
-            base_flags
-        } else {
-            base_flags | StreamFlags::AUTOCONNECT
-        };
-
         self.capture_stream.connect(
             libspa::utils::Direction::Input,
             capture_target,
-            capture_flags,
+            base_flags,
             &mut [],
         )?;
 
         // Connect playback stream (output direction = sending audio)
-        // Always use AUTOCONNECT for playback to connect to default sink
+        // Use DRIVER flag to make this stream drive the graph
         self.playback_stream.connect(
             libspa::utils::Direction::Output,
             playback_target,
-            base_flags | StreamFlags::AUTOCONNECT,
+            base_flags | StreamFlags::DRIVER,
             &mut [],
         )?;
+
+        // Explicitly activate the streams to transition from Paused to Streaming
+        self.capture_stream.set_active(true)?;
+        self.playback_stream.set_active(true)?;
 
         self.active.store(true, Ordering::Relaxed);
         Ok(())
@@ -427,6 +432,12 @@ fn process_capture(user_data: &mut StreamUserData, samples: &mut [f32], n_frames
     for i in 0..n_frames {
         samples[i * NUM_CHANNELS] = left_out[i];
         samples[i * NUM_CHANNELS + 1] = right_out[i];
+    }
+
+    // Calculate peak levels for metering (RT-safe)
+    if let Some(ref meter_levels) = user_data.meter_levels {
+        let (peak_left, peak_right) = calculate_stereo_peaks(samples);
+        meter_levels.store(peak_left, peak_right);
     }
 
     // Write processed audio to shared buffer for playback stream
