@@ -2626,11 +2626,17 @@ impl SootMix {
                           channel.name, node_id, loopback_output_node_id);
                 }
 
-                // Apply initial volume/mute to the loopback output node
+                // Apply initial volume/mute to the loopback output node.
+                // Request binding first to ensure native control works (falls back to CLI if not bound).
+                // This is important because the registry listener might not have processed
+                // the node yet when this event arrives.
                 if let Some(loopback_id) = loopback_output_node_id {
                     let linear = db_to_linear(volume_db);
                     debug!("Applying initial volume to loopback output {}: db={:.1}, linear={:.3}",
                            loopback_id, volume_db, linear);
+                    // Request bind to ensure node is ready for control
+                    self.send_pw_command(PwCommand::BindNode { node_id: loopback_id });
+                    // Set volume - will use CLI fallback if native binding not yet ready
                     self.send_pw_command(PwCommand::SetVolume { node_id: loopback_id, volume: linear });
                     self.send_pw_command(PwCommand::SetMute { node_id: loopback_id, muted });
                 }
