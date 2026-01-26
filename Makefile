@@ -26,8 +26,10 @@ install:
 	# Install icon
 	install -Dm644 contrib/icons/sootmix.svg $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/sootmix.svg
 
-	# Install systemd user service
-	install -Dm644 contrib/sootmix-daemon.service $(DESTDIR)$(PREFIX)/lib/systemd/user/sootmix-daemon.service
+	# Install systemd user service (substitute correct binary path)
+	sed 's|ExecStart=.*|ExecStart=$(BINDIR)/sootmix-daemon|' contrib/sootmix-daemon.service > /tmp/sootmix-daemon.service.tmp
+	install -Dm644 /tmp/sootmix-daemon.service.tmp $(DESTDIR)$(PREFIX)/lib/systemd/user/sootmix-daemon.service
+	rm -f /tmp/sootmix-daemon.service.tmp
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/sootmix
