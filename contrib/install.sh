@@ -56,9 +56,11 @@ install_deps() {
         MISSING=""
         check_command cargo || MISSING="$MISSING cargo"
         check_command git || MISSING="$MISSING git"
-        pkg-config --exists libpipewire-0.3 2>/dev/null || MISSING="$MISSING libpipewire-0.3-dev"
+        check_command cc || MISSING="$MISSING build-essential"
         check_command pkg-config || MISSING="$MISSING pkg-config"
-        pkg-config --exists clang 2>/dev/null || MISSING="$MISSING clang"
+        pkg-config --exists libpipewire-0.3 2>/dev/null || MISSING="$MISSING libpipewire-0.3-dev"
+        pkg-config --exists dbus-1 2>/dev/null || MISSING="$MISSING libdbus-1-dev"
+        check_command clang || MISSING="$MISSING clang libclang-dev"
 
         if [ -n "$MISSING" ]; then
             info "Installing dependencies:$MISSING"
@@ -70,8 +72,10 @@ install_deps() {
         MISSING=""
         check_command cargo || MISSING="$MISSING rust cargo"
         check_command git || MISSING="$MISSING git"
+        check_command pkg-config || MISSING="$MISSING pkgconf-pkg-config"
         pkg-config --exists libpipewire-0.3 2>/dev/null || MISSING="$MISSING pipewire-devel"
-        check_command clang || MISSING="$MISSING clang"
+        pkg-config --exists dbus-1 2>/dev/null || MISSING="$MISSING dbus-devel"
+        check_command clang || MISSING="$MISSING clang clang-devel"
 
         if [ -n "$MISSING" ]; then
             info "Installing dependencies:$MISSING"
@@ -81,8 +85,11 @@ install_deps() {
         warn "Unknown package manager. Please ensure these are installed:"
         echo "  - rust/cargo"
         echo "  - git"
+        echo "  - C compiler (gcc/clang) and build tools"
+        echo "  - pkg-config"
         echo "  - pipewire development libraries"
-        echo "  - clang"
+        echo "  - dbus development libraries"
+        echo "  - clang and libclang"
         echo
         read -p "Continue anyway? [y/N] " -n 1 -r
         echo
@@ -95,7 +102,10 @@ verify_deps() {
     info "Verifying dependencies..."
     check_command cargo || error "cargo not found. Please install Rust: https://rustup.rs"
     check_command git || error "git not found. Please install git."
+    check_command pkg-config || error "pkg-config not found."
+    check_command clang || error "clang not found. Please install clang."
     pkg-config --exists libpipewire-0.3 2>/dev/null || error "PipeWire development libraries not found."
+    pkg-config --exists dbus-1 2>/dev/null || error "D-Bus development libraries not found."
     info "All dependencies satisfied."
 }
 

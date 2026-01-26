@@ -11,7 +11,11 @@ build:
 	cargo build --release --package sootmix
 	cargo build --release --package sootmix-daemon
 
-install: build
+install:
+	@if [ ! -f target/release/sootmix ] || [ ! -f target/release/sootmix-daemon ]; then \
+		echo "Error: Binaries not found. Run 'make' first (without sudo)."; \
+		exit 1; \
+	fi
 	# Install binaries
 	install -Dm755 target/release/sootmix $(DESTDIR)$(BINDIR)/sootmix
 	install -Dm755 target/release/sootmix-daemon $(DESTDIR)$(BINDIR)/sootmix-daemon

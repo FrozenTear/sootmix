@@ -1,6 +1,6 @@
 [package]
 name = "sootmix-ipc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["SootMix Contributors"]
 description = "Shared IPC types and D-Bus interface definitions for SootMix"

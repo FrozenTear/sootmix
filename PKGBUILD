@@ -1,6 +1,6 @@
 # Maintainer: SootMix Contributors
 pkgname=sootmix
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Audio routing and mixing application for Linux using PipeWire"
 arch=('x86_64')

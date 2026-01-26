@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "directories",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "directories",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -3433,7 +3433,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-plugin-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "serde",
