@@ -135,7 +135,6 @@ impl PortDirection {
 }
 
 /// Audio channel position.
-/// Audio channel position.
 /// Ordered by standard channel layout for consistent pairing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AudioChannel {

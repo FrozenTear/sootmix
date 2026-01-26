@@ -641,11 +641,12 @@ impl DaemonService {
                             muted: true,
                         });
                     }
-                    // Route loopback output to default sink (or channel's configured output)
-                    // This connects the virtual sink's output to the actual audio device
+                    // Route loopback output to master output device
+                    // Look up the master output device ID by name
+                    let target_device_id = self.get_master_output_device_id();
                     self.send_pw_command(PwCommand::RouteChannelToDevice {
                         loopback_output_node: loopback_id,
-                        target_device_id: None, // None means default sink
+                        target_device_id,
                     });
                 }
 
@@ -1103,20 +1104,40 @@ impl DaemonService {
             Some(device_name.to_string())
         };
 
-        if let Some(name) = self.state.master_output.clone() {
-            let outputs = self.state.get_outputs();
-            if let Some(output) = outputs
-                .iter()
-                .find(|o| o.description == name || o.name == name)
-            {
-                self.send_pw_command(PwCommand::SetDefaultSink {
-                    node_id: output.node_id,
-                });
-            }
+        let target_device_id = self.get_master_output_device_id();
+
+        if let Some(node_id) = target_device_id {
+            // Set as system default
+            self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+        }
+
+        // Re-route all existing channels to the new master output
+        let loopback_ids: Vec<u32> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| c.pw_loopback_output_id)
+            .collect();
+
+        for loopback_id in loopback_ids {
+            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                loopback_output_node: loopback_id,
+                target_device_id,
+            });
         }
 
         self.save_config();
         Ok(())
+    }
+
+    /// Get the node ID of the master output device, if configured.
+    fn get_master_output_device_id(&self) -> Option<u32> {
+        let name = self.state.master_output.as_ref()?;
+        let outputs = self.state.get_outputs();
+        outputs
+            .iter()
+            .find(|o| o.description == *name || o.name == *name)
+            .map(|o| o.node_id)
     }
 
     pub fn set_master_recording(&mut self, enabled: bool) -> Result<(), ServiceError> {
