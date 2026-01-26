@@ -39,7 +39,10 @@ pub fn create_link(output_port: u32, input_port: u32) -> Result<(), RoutingError
 }
 
 /// Create a link between two ports by name.
-pub fn create_link_by_name(output_port_name: &str, input_port_name: &str) -> Result<(), RoutingError> {
+pub fn create_link_by_name(
+    output_port_name: &str,
+    input_port_name: &str,
+) -> Result<(), RoutingError> {
     info!("Creating link: {} -> {}", output_port_name, input_port_name);
 
     let output = Command::new("pw-link")
@@ -78,8 +81,14 @@ pub fn destroy_link(link_id: u32) -> Result<(), RoutingError> {
 }
 
 /// Destroy a link by port names.
-pub fn destroy_link_by_name(output_port_name: &str, input_port_name: &str) -> Result<(), RoutingError> {
-    info!("Destroying link: {} -> {}", output_port_name, input_port_name);
+pub fn destroy_link_by_name(
+    output_port_name: &str,
+    input_port_name: &str,
+) -> Result<(), RoutingError> {
+    info!(
+        "Destroying link: {} -> {}",
+        output_port_name, input_port_name
+    );
 
     let output = Command::new("pw-link")
         .arg("-d")
@@ -91,6 +100,60 @@ pub fn destroy_link_by_name(output_port_name: &str, input_port_name: &str) -> Re
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RoutingError::LinkFailed(stderr.to_string()));
+    }
+
+    Ok(())
+}
+
+/// Set the target sink for a stream node using WirePlumber metadata.
+/// This tells WirePlumber to route the stream to a specific sink and prevents
+/// it from auto-linking to the default sink.
+pub fn set_stream_target(stream_node_id: u32, target_sink_id: u32) -> Result<(), RoutingError> {
+    info!(
+        "Setting stream {} target to sink {}",
+        stream_node_id, target_sink_id
+    );
+
+    // Use pw-metadata to set the target.node for this stream
+    // This is the WirePlumber-compatible way to force routing
+    let output = Command::new("pw-metadata")
+        .args([
+            "-n",
+            "default",
+            &stream_node_id.to_string(),
+            "target.node",
+            &target_sink_id.to_string(),
+        ])
+        .output()
+        .map_err(|e| RoutingError::PwLinkFailed(format!("pw-metadata failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("pw-metadata set target.node failed: {}", stderr);
+        // Not a fatal error - the link creation should still work
+    }
+
+    Ok(())
+}
+
+/// Clear the target sink for a stream node, allowing WirePlumber to manage it again.
+pub fn clear_stream_target(stream_node_id: u32) -> Result<(), RoutingError> {
+    info!("Clearing stream {} target", stream_node_id);
+
+    let output = Command::new("pw-metadata")
+        .args([
+            "-n",
+            "default",
+            "-d",
+            &stream_node_id.to_string(),
+            "target.node",
+        ])
+        .output()
+        .map_err(|e| RoutingError::PwLinkFailed(format!("pw-metadata failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("pw-metadata delete target.node failed: {}", stderr);
     }
 
     Ok(())
