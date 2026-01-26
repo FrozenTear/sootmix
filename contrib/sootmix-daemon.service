@@ -1,7 +1,3 @@
-# SootMix Daemon systemd user service
-# Install to: ~/.config/systemd/user/sootmix-daemon.service
-# Enable with: systemctl --user enable --now sootmix-daemon.service
-
 [Unit]
 Description=SootMix Audio Routing Daemon
 Documentation=https://github.com/FrozenTear/sootmix
@@ -10,7 +6,7 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/sootmix-daemon
+ExecStart=/usr/bin/sootmix-daemon
 Restart=on-failure
 RestartSec=5
 

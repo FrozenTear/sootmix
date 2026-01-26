@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=SootMix
+Comment=Audio routing and mixing for PipeWire
+GenericName=Audio Mixer
+Exec=sootmix
+Icon=sootmix
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;mixer;pipewire;routing;sound;
+StartupWMClass=sootmix
