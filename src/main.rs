@@ -13,6 +13,7 @@ mod message;
 mod plugins;
 mod realtime;
 mod state;
+mod tray;
 mod ui;
 
 use app::SootMix;
@@ -34,5 +35,6 @@ fn main() -> iced::Result {
         .subscription(SootMix::subscription)
         .theme(crate::ui::theme::sootmix_theme())
         .window_size((900.0, 600.0))
+        .exit_on_close_request(false) // Handle close ourselves for tray support
         .run()
 }

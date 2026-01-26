@@ -218,4 +218,14 @@ pub enum Message {
     ConfigLoaded(crate::config::MixerConfig),
     /// Startup: wait for PipeWire discovery before restoring channels.
     StartupDiscoveryComplete,
+
+    // ==================== Window & Tray ====================
+    /// Window close requested (from window manager).
+    WindowCloseRequested(iced::window::Id),
+    /// Show window (from tray).
+    TrayShowWindow,
+    /// Toggle mute all (from tray).
+    TrayToggleMuteAll,
+    /// Quit application (from tray).
+    TrayQuit,
 }

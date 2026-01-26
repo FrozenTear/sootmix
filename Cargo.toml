@@ -51,6 +51,9 @@ tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# System tray
+ksni = "0.3"
+
 # Plugin formats (optional)
 lilv = { version = "0.2", optional = true }
 vst3 = { version = "0.3", optional = true }

@@ -10,6 +10,7 @@ use crate::config::{ConfigManager, MixerConfig, SavedChannel};
 use crate::message::Message;
 use crate::plugins::{PluginFilter, PluginManager, PluginSlotConfig, PluginType};
 use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel, SnapshotSlot};
+use crate::tray::{TrayHandle, TrayMessage};
 use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{channel_strip, master_strip};
 use crate::ui::routing_rules_panel::routing_rules_panel;
@@ -45,6 +46,12 @@ pub struct SootMix {
     plugin_processor: PluginProcessorManager,
     /// Plugin filter manager for PipeWire audio routing through plugins.
     plugin_filter_manager: PluginFilterManager,
+    /// System tray handle for background operation.
+    tray_handle: Option<TrayHandle>,
+    /// Receiver for tray messages.
+    tray_rx: Option<mpsc::Receiver<TrayMessage>>,
+    /// Current main window ID (None when window is closed/hidden).
+    main_window_id: Option<iced::window::Id>,
 }
 
 impl SootMix {
@@ -112,6 +119,15 @@ impl SootMix {
         let mut plugin_filter_manager = PluginFilterManager::new();
         plugin_filter_manager.set_plugin_instances(plugin_manager.shared_instances());
 
+        // Start system tray
+        let (tray_rx, tray_handle) = match crate::tray::start_tray() {
+            Some((rx, handle)) => (Some(rx), Some(handle)),
+            None => {
+                warn!("System tray not available - close will exit the app");
+                (None, None)
+            }
+        };
+
         let now = Instant::now();
         let app = Self {
             state,
@@ -125,6 +141,9 @@ impl SootMix {
             plugin_manager,
             plugin_processor: PluginProcessorManager::new(),
             plugin_filter_manager,
+            tray_handle,
+            tray_rx,
+            main_window_id: None, // Will be set when we receive close request
         };
 
         (app, Task::none())
@@ -1265,6 +1284,11 @@ impl SootMix {
                 // Check for PipeWire events
                 self.poll_pw_events();
 
+                // Poll tray messages
+                if let Some(tray_msgs) = self.poll_tray_messages() {
+                    return tray_msgs;
+                }
+
                 // Restore config after PipeWire discovery delay (~200ms)
                 if !self.state.startup_complete
                     && self.startup_time.elapsed() > std::time::Duration::from_millis(200)
@@ -1326,6 +1350,45 @@ impl SootMix {
             }
             Message::Initialized => {
                 info!("Application initialized");
+            }
+
+            // ==================== Window & Tray ====================
+            Message::WindowCloseRequested(_window_id) => {
+                // User wants to quit - clean up and exit
+                info!("Window close requested - exiting");
+                self.cleanup();
+                return iced::exit();
+            }
+
+            Message::TrayShowWindow => {
+                info!("Tray: Show window requested");
+                // Bring window to focus (it's still open)
+                return iced::window::oldest().and_then(|id| {
+                    iced::window::gain_focus(id)
+                });
+            }
+
+            Message::TrayToggleMuteAll => {
+                info!("Tray: Toggle mute all");
+                // Toggle mute on all channels and master
+                let new_mute_state = !self.state.master_muted;
+                self.state.master_muted = new_mute_state;
+
+                // Update tray icon state
+                if let Some(ref handle) = self.tray_handle {
+                    handle.set_muted(new_mute_state);
+                }
+
+                // Apply to PipeWire
+                if let Some(output_node_id) = self.get_output_device_node_id() {
+                    self.send_pw_command(PwCommand::SetMute { node_id: output_node_id, muted: new_mute_state });
+                }
+            }
+
+            Message::TrayQuit => {
+                info!("Tray: Quit requested");
+                self.cleanup();
+                return iced::exit();
             }
 
             _ => {
@@ -2145,8 +2208,12 @@ impl SootMix {
 
     /// Subscription for external events.
     pub fn subscription(&self) -> Subscription<Message> {
-        // Tick every 50ms to poll PipeWire events
-        iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick)
+        Subscription::batch([
+            // Tick every 50ms to poll PipeWire events and tray messages
+            iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick),
+            // Listen for window close requests
+            iced::window::close_requests().map(Message::WindowCloseRequested),
+        ])
     }
 
     /// Send a command to the PipeWire thread.
@@ -2269,6 +2336,41 @@ impl SootMix {
         for event in events {
             self.handle_pw_event(event);
         }
+    }
+
+    /// Poll for tray messages and return a task if action needed.
+    fn poll_tray_messages(&mut self) -> Option<Task<Message>> {
+        let rx = self.tray_rx.as_ref()?;
+
+        // Process all pending tray messages
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TrayMessage::ShowWindow => {
+                    return Some(Task::done(Message::TrayShowWindow));
+                }
+                TrayMessage::ToggleMuteAll => {
+                    return Some(Task::done(Message::TrayToggleMuteAll));
+                }
+                TrayMessage::Quit => {
+                    return Some(Task::done(Message::TrayQuit));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Clean up resources before exiting.
+    fn cleanup(&mut self) {
+        info!("Cleaning up resources...");
+
+        // Save current config
+        self.save_config();
+
+        // Destroy all virtual sinks
+        crate::audio::virtual_sink::destroy_all_virtual_sinks();
+
+        // The PipeWire thread will be dropped automatically
     }
 
     /// Handle a PipeWire event.
