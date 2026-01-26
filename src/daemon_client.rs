@@ -359,11 +359,13 @@ pub enum DaemonCommand {
 }
 
 /// Global command sender for the daemon subscription.
-static DAEMON_CMD_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<DaemonCommand>> = std::sync::OnceLock::new();
+/// Uses RwLock instead of OnceLock to allow updating the sender on reconnection.
+static DAEMON_CMD_TX: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>> = std::sync::RwLock::new(None);
 
 /// Send a command to the daemon.
 pub fn send_daemon_command(cmd: DaemonCommand) -> Result<(), String> {
-    if let Some(tx) = DAEMON_CMD_TX.get() {
+    let guard = DAEMON_CMD_TX.read().map_err(|e| format!("Lock poisoned: {}", e))?;
+    if let Some(tx) = guard.as_ref() {
         tx.send(cmd).map_err(|e| e.to_string())
     } else {
         Err("Daemon command channel not initialized".to_string())
@@ -382,7 +384,9 @@ fn daemon_event_stream() -> impl futures::Stream<Item = DaemonEvent> + Send {
 
     // Create command channel and store sender globally
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCommand>();
-    let _ = DAEMON_CMD_TX.set(cmd_tx);
+    if let Ok(mut guard) = DAEMON_CMD_TX.write() {
+        *guard = Some(cmd_tx);
+    }
 
     // Spawn the connection and signal listener task
     tokio::spawn(async move {
@@ -430,12 +434,12 @@ fn daemon_event_stream() -> impl futures::Stream<Item = DaemonEvent> + Send {
                     // If we get here, the connection was lost
                     let _ = tx.send(DaemonEvent::Disconnected);
 
-                    // Recreate command channel for next connection
+                    // Recreate command channel for next connection and update the global sender
                     let (new_cmd_tx, new_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCommand>();
                     cmd_rx = new_cmd_rx;
-                    // Note: Can't update OnceLock, so commands won't work until restart
-                    // This is a limitation we accept for now
-                    drop(new_cmd_tx);
+                    if let Ok(mut guard) = DAEMON_CMD_TX.write() {
+                        *guard = Some(new_cmd_tx);
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to connect to daemon: {}", e);
