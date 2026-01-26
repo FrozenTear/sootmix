@@ -170,17 +170,32 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
 }
 
 /// Destroy all virtual sinks (cleanup on exit).
+/// This kills tracked pw-loopback processes and cleans up any orphaned nodes
+/// that may have been created by processes that respawned after PipeWire restart.
 pub fn destroy_all_virtual_sinks() {
     info!("Destroying all virtual sinks");
+
+    // First, kill all tracked pw-loopback processes
     if let Some(ref mut map) = *get_processes() {
         for (node_id, mut child) in map.drain() {
             debug!("Killing pw-loopback for sink node {} (pid: {:?})", node_id, child.id());
             if let Err(e) = child.kill() {
-                warn!("Failed to kill pw-loopback for node {}: {}", node_id, e);
+                // Process may already be dead if PipeWire restarted
+                debug!("Process kill returned error (may be already dead): {}", e);
             }
             let _ = child.wait();
         }
     }
+
+    // Also kill any pw-loopback processes that may have respawned
+    // This handles the case where PipeWire restarted and pw-loopback auto-restarted
+    // with a new PID that we don't have tracked
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "pw-loopback.*sootmix"])
+        .output();
+
+    // Give processes time to die and nodes to be removed
+    std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
 /// Clean up orphaned sootmix nodes from previous runs.
