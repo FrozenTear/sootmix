@@ -99,18 +99,33 @@ impl ChannelState {
 
     fn meter_levels_db(&self) -> (f32, f32) {
         fn linear_to_db(linear: f32) -> f32 {
-            if linear <= 0.0 { -60.0 } else { 20.0 * linear.log10() }
+            if linear <= 0.0 {
+                -60.0
+            } else {
+                20.0 * linear.log10()
+            }
         }
-        (linear_to_db(self.meter_levels.0), linear_to_db(self.meter_levels.1))
+        (
+            linear_to_db(self.meter_levels.0),
+            linear_to_db(self.meter_levels.1),
+        )
     }
 
     pub fn volume_linear(&self) -> f32 {
-        if self.muted { 0.0 } else { db_to_linear(self.volume_db) }
+        if self.muted {
+            0.0
+        } else {
+            db_to_linear(self.volume_db)
+        }
     }
 }
 
 fn db_to_linear(db: f32) -> f32 {
-    if db <= -60.0 { 0.0 } else { 10.0_f32.powf(db / 20.0) }
+    if db <= -60.0 {
+        0.0
+    } else {
+        10.0_f32.powf(db / 20.0)
+    }
 }
 
 /// Internal app info.
@@ -147,11 +162,15 @@ pub struct PwGraphState {
 
 impl PwGraphState {
     pub fn playback_streams(&self) -> Vec<&PwNode> {
-        self.nodes.values().filter(|n| n.is_playback_stream()).collect()
+        self.nodes
+            .values()
+            .filter(|n| n.is_playback_stream())
+            .collect()
     }
 
     pub fn output_devices(&self, exclude_names: &[&str]) -> Vec<OutputInfo> {
-        self.nodes.values()
+        self.nodes
+            .values()
             .filter(|n| {
                 n.media_class == MediaClass::AudioSink
                     && !exclude_names.iter().any(|ex| n.name.contains(ex))
@@ -165,31 +184,63 @@ impl PwGraphState {
     }
 
     pub fn find_port_pairs(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
-        let output_ports: Vec<_> = self.ports.values()
+        use crate::audio::types::AudioChannel;
+
+        // Collect and sort ports by channel for consistent ordering
+        let mut output_ports: Vec<_> = self
+            .ports
+            .values()
             .filter(|p| p.node_id == output_node && p.direction == PortDirection::Output)
             .collect();
-        let input_ports: Vec<_> = self.ports.values()
+        let mut input_ports: Vec<_> = self
+            .ports
+            .values()
             .filter(|p| p.node_id == input_node && p.direction == PortDirection::Input)
             .collect();
 
-        let mut pairs = Vec::new();
+        // Sort by channel first, then by port ID for stability
+        output_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
+        input_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
 
+        let mut pairs = Vec::new();
+        let mut used_inputs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        // First pass: match by compatible channels
         for out_port in &output_ports {
             for in_port in &input_ports {
-                let out_name = out_port.name.to_lowercase();
-                let in_name = in_port.name.to_lowercase();
-                let is_match =
-                    (out_name.contains("fl") && in_name.contains("fl"))
-                    || (out_name.contains("fr") && in_name.contains("fr"))
-                    || (out_name.contains("_0") && in_name.contains("_0"))
-                    || (out_name.contains("_1") && in_name.contains("_1"));
-
-                if is_match {
+                if used_inputs.contains(&in_port.id) {
+                    continue;
+                }
+                if out_port.channel.is_compatible(&in_port.channel) {
                     pairs.push((out_port.id, in_port.id));
+                    used_inputs.insert(in_port.id);
+                    break;
                 }
             }
         }
 
+        // Second pass: if no channel matches found, try name-based matching
+        if pairs.is_empty() {
+            for out_port in &output_ports {
+                for in_port in &input_ports {
+                    if used_inputs.contains(&in_port.id) {
+                        continue;
+                    }
+                    let out_name = out_port.name.to_lowercase();
+                    let in_name = in_port.name.to_lowercase();
+                    let is_match = (out_name.contains("_0") && in_name.contains("_0"))
+                        || (out_name.contains("_1") && in_name.contains("_1"));
+
+                    if is_match {
+                        pairs.push((out_port.id, in_port.id));
+                        used_inputs.insert(in_port.id);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback: pair by sorted position (deterministic order)
         if pairs.is_empty() && !output_ports.is_empty() && !input_ports.is_empty() {
             for (out_port, in_port) in output_ports.iter().zip(input_ports.iter()) {
                 pairs.push((out_port.id, in_port.id));
@@ -200,7 +251,10 @@ impl PwGraphState {
     }
 
     pub fn links_from_node(&self, node_id: u32) -> Vec<&PwLink> {
-        self.links.values().filter(|l| l.output_node == node_id).collect()
+        self.links
+            .values()
+            .filter(|l| l.output_node == node_id)
+            .collect()
     }
 }
 
@@ -220,11 +274,15 @@ pub struct DaemonState {
     pub auto_routed_apps: HashSet<u32>,
     /// Channels waiting for their sink ports to be ready for auto-routing
     pub pending_auto_route_channels: HashSet<Uuid>,
+    /// Counter for periodic app refresh
+    pub refresh_counter: u32,
 }
 
 impl DaemonState {
     pub fn new(mixer_config: MixerConfig, routing_rules: RoutingRulesConfig) -> Self {
-        let channels: Vec<ChannelState> = mixer_config.channels.iter()
+        let channels: Vec<ChannelState> = mixer_config
+            .channels
+            .iter()
             .map(ChannelState::from_saved)
             .collect();
 
@@ -241,6 +299,7 @@ impl DaemonState {
             routing_rules,
             auto_routed_apps: HashSet::new(),
             pending_auto_route_channels: HashSet::new(),
+            refresh_counter: 0,
         }
     }
 
@@ -248,19 +307,25 @@ impl DaemonState {
         self.channels.iter().map(|c| c.to_channel_info()).collect()
     }
 
-    pub fn get_apps(&self) -> Vec<AppInfo> {
+    pub fn get_apps(&mut self) -> Vec<AppInfo> {
+        // Refresh app list before returning to ensure we have the latest
+        self.update_available_apps();
         self.apps.iter().map(|a| a.to_app_info()).collect()
     }
 
     pub fn get_outputs(&self) -> Vec<OutputInfo> {
-        let exclude: Vec<&str> = self.channels.iter()
+        let exclude: Vec<&str> = self
+            .channels
+            .iter()
             .filter_map(|c| c.pw_sink_id.map(|_| c.name.as_str()))
             .collect();
         self.pw_graph.output_devices(&exclude)
     }
 
     pub fn update_available_apps(&mut self) {
-        self.apps = self.pw_graph.playback_streams()
+        self.apps = self
+            .pw_graph
+            .playback_streams()
             .iter()
             .filter(|node| {
                 let name = &node.name;
@@ -271,11 +336,15 @@ impl DaemonState {
             })
             .map(|node| AppState {
                 node_id: node.id,
-                name: node.app_name.clone()
-                    .or_else(|| if !node.description.is_empty() {
-                        Some(node.description.clone())
-                    } else {
-                        None
+                name: node
+                    .app_name
+                    .clone()
+                    .or_else(|| {
+                        if !node.description.is_empty() {
+                            Some(node.description.clone())
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or_else(|| node.name.clone()),
                 binary: node.binary_name.clone(),
@@ -284,20 +353,24 @@ impl DaemonState {
     }
 
     pub fn get_routing_rules(&self) -> Vec<RoutingRuleInfo> {
-        self.routing_rules.rules.iter().map(|r| RoutingRuleInfo {
-            id: r.id.to_string(),
-            name: r.name.clone(),
-            enabled: r.enabled,
-            match_target: match r.match_target {
-                crate::config::MatchTarget::Name => "name".to_string(),
-                crate::config::MatchTarget::Binary => "binary".to_string(),
-                crate::config::MatchTarget::Either => "either".to_string(),
-            },
-            match_type: r.match_type.type_name().to_string(),
-            pattern: r.match_type.pattern().to_string(),
-            target_channel: r.target_channel.clone(),
-            priority: r.priority,
-        }).collect()
+        self.routing_rules
+            .rules
+            .iter()
+            .map(|r| RoutingRuleInfo {
+                id: r.id.to_string(),
+                name: r.name.clone(),
+                enabled: r.enabled,
+                match_target: match r.match_target {
+                    crate::config::MatchTarget::Name => "name".to_string(),
+                    crate::config::MatchTarget::Binary => "binary".to_string(),
+                    crate::config::MatchTarget::Either => "either".to_string(),
+                },
+                match_type: r.match_type.type_name().to_string(),
+                pattern: r.match_type.pattern().to_string(),
+                target_channel: r.target_channel.clone(),
+                priority: r.priority,
+            })
+            .collect()
     }
 }
 
@@ -331,8 +404,8 @@ impl DaemonService {
     pub fn start_pipewire(&mut self) -> Result<(), ServiceError> {
         let (event_tx, event_rx) = mpsc::channel();
 
-        let pw_thread = PwThread::spawn(event_tx)
-            .map_err(|e| ServiceError::PipeWire(e.to_string()))?;
+        let pw_thread =
+            PwThread::spawn(event_tx).map_err(|e| ServiceError::PipeWire(e.to_string()))?;
 
         self.pw_thread = Some(pw_thread);
         self.pw_event_rx = Some(event_rx);
@@ -343,21 +416,56 @@ impl DaemonService {
 
     /// Wait for initial PipeWire discovery to complete.
     pub fn wait_for_discovery(&mut self) {
-        let discovery_duration = Duration::from_millis(500);
+        let max_wait = Duration::from_millis(1500);
+        let min_wait = Duration::from_millis(300);
+        let poll_interval = Duration::from_millis(50);
         let start = std::time::Instant::now();
 
-        while start.elapsed() < discovery_duration {
+        let mut last_node_count = 0;
+        let mut stable_iterations = 0;
+        const STABILITY_THRESHOLD: u32 = 4; // 200ms of no new nodes
+
+        while start.elapsed() < max_wait {
             self.process_pw_events();
-            std::thread::sleep(Duration::from_millis(50));
+
+            let current_count = self.state.pw_graph.nodes.len();
+            if current_count == last_node_count {
+                stable_iterations += 1;
+            } else {
+                stable_iterations = 0;
+                last_node_count = current_count;
+            }
+
+            // Exit early if we have nodes and they've been stable for a bit
+            // but ensure we wait at least min_wait
+            if start.elapsed() >= min_wait
+                && current_count > 0
+                && stable_iterations >= STABILITY_THRESHOLD
+            {
+                break;
+            }
+
+            std::thread::sleep(poll_interval);
         }
 
-        info!("PipeWire discovery complete: {} nodes, {} apps",
-              self.state.pw_graph.nodes.len(), self.state.apps.len());
+        // Final refresh of app list
+        self.state.update_available_apps();
+
+        info!(
+            "PipeWire discovery complete: {} nodes, {} ports, {} apps (waited {:?})",
+            self.state.pw_graph.nodes.len(),
+            self.state.pw_graph.ports.len(),
+            self.state.apps.len(),
+            start.elapsed()
+        );
     }
 
     /// Restore channels from config.
     pub fn restore_channels(&mut self) -> Result<(), ServiceError> {
-        let channels_to_create: Vec<(Uuid, String)> = self.state.channels.iter()
+        let channels_to_create: Vec<(Uuid, String)> = self
+            .state
+            .channels
+            .iter()
             .filter(|c| c.is_managed && c.pw_sink_id.is_none())
             .map(|c| (c.id, c.name.clone()))
             .collect();
@@ -387,6 +495,22 @@ impl DaemonService {
         for event in events {
             self.handle_pw_event(event);
         }
+
+        // Periodic app refresh - every ~2 seconds (20 iterations at 100ms each)
+        // This catches apps that were added with incomplete properties
+        self.state.refresh_counter += 1;
+        if self.state.refresh_counter >= 20 {
+            self.state.refresh_counter = 0;
+            let old_count = self.state.apps.len();
+            self.state.update_available_apps();
+            if self.state.apps.len() != old_count {
+                debug!(
+                    "Periodic refresh: app count changed from {} to {}",
+                    old_count,
+                    self.state.apps.len()
+                );
+            }
+        }
     }
 
     fn handle_pw_event(&mut self, event: PwEvent) {
@@ -415,11 +539,17 @@ impl DaemonService {
                 // Check if this was a channel's sink or loopback output and clear stale IDs
                 for channel in &mut self.state.channels {
                     if channel.pw_sink_id == Some(id) {
-                        warn!("Channel '{}' sink node {} was removed externally", channel.name, id);
+                        warn!(
+                            "Channel '{}' sink node {} was removed externally",
+                            channel.name, id
+                        );
                         channel.pw_sink_id = None;
                         channel.pw_loopback_output_id = None;
                     } else if channel.pw_loopback_output_id == Some(id) {
-                        warn!("Channel '{}' loopback output node {} was removed externally", channel.name, id);
+                        warn!(
+                            "Channel '{}' loopback output node {} was removed externally",
+                            channel.name, id
+                        );
                         channel.pw_loopback_output_id = None;
                     }
                 }
@@ -432,14 +562,38 @@ impl DaemonService {
                 let port_node_id = port.node_id;
                 self.state.pw_graph.ports.insert(port.id, port);
 
+                // Port arrival is a good signal that a node is fully initialized.
+                // Refresh app list to catch nodes that were added with incomplete properties.
+                let old_app_count = self.state.apps.len();
+                self.state.update_available_apps();
+                if self.state.apps.len() > old_app_count {
+                    debug!(
+                        "Found {} new app(s) after port added for node {}",
+                        self.state.apps.len() - old_app_count,
+                        port_node_id
+                    );
+                    // Try auto-routing newly discovered apps
+                    for app in &self.state.apps {
+                        if app.node_id == port_node_id {
+                            self.try_auto_route_app(app.node_id, &app.name.clone());
+                        }
+                    }
+                }
+
                 // Check if this port belongs to a sink that's pending auto-routing
                 // Always check - don't rely on pending_auto_route_channels since ports arrive one at a time
-                let channel_to_route = self.state.channels.iter()
+                let channel_to_route = self
+                    .state
+                    .channels
+                    .iter()
                     .find(|c| c.pw_sink_id == Some(port_node_id) && !c.assigned_apps.is_empty())
                     .map(|c| c.id);
 
                 if let Some(channel_id) = channel_to_route {
-                    debug!("Port added for channel sink {}, trying auto-route", port_node_id);
+                    debug!(
+                        "Port added for channel sink {}, trying auto-route",
+                        port_node_id
+                    );
                     self.try_auto_route_pending_apps(channel_id);
                 }
             }
@@ -452,15 +606,28 @@ impl DaemonService {
             PwEvent::LinkRemoved(id) => {
                 self.state.pw_graph.links.remove(&id);
             }
-            PwEvent::VirtualSinkCreated { channel_id, node_id, loopback_output_node_id } => {
-                let channel_update = self.state.channels.iter_mut()
+            PwEvent::VirtualSinkCreated {
+                channel_id,
+                node_id,
+                loopback_output_node_id,
+            } => {
+                let channel_update = self
+                    .state
+                    .channels
+                    .iter_mut()
                     .find(|c| c.id == channel_id)
                     .map(|channel| {
                         channel.pw_sink_id = Some(node_id);
                         channel.pw_loopback_output_id = loopback_output_node_id;
-                        info!("Virtual sink created for channel '{}': sink={}, loopback={:?}",
-                              channel.name, node_id, loopback_output_node_id);
-                        (channel.volume_linear(), channel.muted, loopback_output_node_id)
+                        info!(
+                            "Virtual sink created for channel '{}': sink={}, loopback={:?}",
+                            channel.name, node_id, loopback_output_node_id
+                        );
+                        (
+                            channel.volume_linear(),
+                            channel.muted,
+                            loopback_output_node_id,
+                        )
                     });
 
                 if let Some((volume, muted, Some(loopback_id))) = channel_update {
@@ -536,19 +703,24 @@ impl DaemonService {
                 muted: self.state.master_muted,
                 output_device: self.state.master_output.clone(),
             },
-            channels: self.state.channels.iter().map(|c| SavedChannel {
-                id: c.id,
-                name: c.name.clone(),
-                is_managed: c.is_managed,
-                sink_name: c.sink_name.clone(),
-                volume_db: c.volume_db,
-                muted: c.muted,
-                eq_enabled: c.eq_enabled,
-                eq_preset: c.eq_preset.clone(),
-                assigned_apps: c.assigned_apps.clone(),
-                plugin_chain: Vec::new(),
-                output_device_name: c.output_device_name.clone(),
-            }).collect(),
+            channels: self
+                .state
+                .channels
+                .iter()
+                .map(|c| SavedChannel {
+                    id: c.id,
+                    name: c.name.clone(),
+                    is_managed: c.is_managed,
+                    sink_name: c.sink_name.clone(),
+                    volume_db: c.volume_db,
+                    muted: c.muted,
+                    eq_enabled: c.eq_enabled,
+                    eq_preset: c.eq_preset.clone(),
+                    assigned_apps: c.assigned_apps.clone(),
+                    plugin_chain: Vec::new(),
+                    output_device_name: c.output_device_name.clone(),
+                })
+                .collect(),
         };
 
         if let Err(e) = self.config_manager.save_mixer_config(&config) {
@@ -578,7 +750,10 @@ impl DaemonService {
         let id = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let (sink_id, is_managed) = self.state.channels.iter()
+        let (sink_id, is_managed) = self
+            .state
+            .channels
+            .iter()
             .find(|c| c.id == id)
             .map(|c| (c.pw_sink_id, c.is_managed))
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
@@ -599,7 +774,10 @@ impl DaemonService {
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
         let sink_id = {
-            let channel = self.state.channels.iter_mut()
+            let channel = self
+                .state
+                .channels
+                .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
@@ -620,12 +798,19 @@ impl DaemonService {
         Ok(())
     }
 
-    pub fn set_channel_volume(&mut self, channel_id: &str, volume_db: f64) -> Result<(), ServiceError> {
+    pub fn set_channel_volume(
+        &mut self,
+        channel_id: &str,
+        volume_db: f64,
+    ) -> Result<(), ServiceError> {
         let id = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
         let (volume, loopback_id) = {
-            let channel = self.state.channels.iter_mut()
+            let channel = self
+                .state
+                .channels
+                .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
@@ -648,7 +833,10 @@ impl DaemonService {
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
         let loopback_id = {
-            let channel = self.state.channels.iter_mut()
+            let channel = self
+                .state
+                .channels
+                .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
@@ -672,7 +860,8 @@ impl DaemonService {
 
         if let Some(device_name) = self.state.master_output.clone() {
             let outputs = self.state.get_outputs();
-            if let Some(output) = outputs.iter()
+            if let Some(output) = outputs
+                .iter()
                 .find(|o| o.description == device_name || o.name == device_name)
             {
                 self.send_pw_command(PwCommand::SetVolume {
@@ -691,7 +880,8 @@ impl DaemonService {
 
         if let Some(device_name) = self.state.master_output.clone() {
             let outputs = self.state.get_outputs();
-            if let Some(output) = outputs.iter()
+            if let Some(output) = outputs
+                .iter()
                 .find(|o| o.description == device_name || o.name == device_name)
             {
                 self.send_pw_command(PwCommand::SetMute {
@@ -709,33 +899,54 @@ impl DaemonService {
         let channel_uuid = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let app_node_id: u32 = app_id.parse()
+        let app_node_id: u32 = app_id
+            .parse()
             .map_err(|_| ServiceError::AppNotFound(app_id.to_string()))?;
 
-        let app_identifier = self.state.apps.iter()
+        let app_identifier = self
+            .state
+            .apps
+            .iter()
             .find(|a| a.node_id == app_node_id)
             .ok_or_else(|| ServiceError::AppNotFound(app_id.to_string()))?
-            .identifier().to_string();
+            .identifier()
+            .to_string();
 
-        let sink_node_id = self.state.channels.iter()
+        let sink_node_id = self
+            .state
+            .channels
+            .iter()
             .find(|c| c.id == channel_uuid)
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?
-            .pw_sink_id.ok_or_else(|| ServiceError::ChannelNotFound("No sink for channel".to_string()))?;
+            .pw_sink_id
+            .ok_or_else(|| ServiceError::ChannelNotFound("No sink for channel".to_string()))?;
 
         // Connect to our sink FIRST, then disconnect from old sinks
         // This ensures the app always has an audio path and doesn't pause playback
-        let our_sinks: Vec<u32> = self.state.channels.iter()
+        let our_sinks: Vec<u32> = self
+            .state
+            .channels
+            .iter()
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
         // Create links to our sink FIRST
-        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_node_id);
+        let port_pairs = self
+            .state
+            .pw_graph
+            .find_port_pairs(app_node_id, sink_node_id);
         for (output_port, input_port) in port_pairs {
-            self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+            self.send_pw_command(PwCommand::CreateLink {
+                output_port,
+                input_port,
+            });
         }
 
         // Then disconnect from non-sootmix sinks
-        let links_to_destroy: Vec<u32> = self.state.pw_graph.links_from_node(app_node_id)
+        let links_to_destroy: Vec<u32> = self
+            .state
+            .pw_graph
+            .links_from_node(app_node_id)
             .iter()
             .filter(|link| !our_sinks.contains(&link.input_node))
             .map(|l| l.id)
@@ -746,7 +957,12 @@ impl DaemonService {
         }
 
         // Add to assigned apps list
-        if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_uuid) {
+        if let Some(channel) = self
+            .state
+            .channels
+            .iter_mut()
+            .find(|c| c.id == channel_uuid)
+        {
             if !channel.assigned_apps.contains(&app_identifier) {
                 channel.assigned_apps.push(app_identifier);
             }
@@ -760,15 +976,23 @@ impl DaemonService {
         let channel_uuid = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let app_node_id: u32 = app_id.parse()
+        let app_node_id: u32 = app_id
+            .parse()
             .map_err(|_| ServiceError::AppNotFound(app_id.to_string()))?;
 
-        let app_identifier = self.state.apps.iter()
+        let app_identifier = self
+            .state
+            .apps
+            .iter()
             .find(|a| a.node_id == app_node_id)
             .ok_or_else(|| ServiceError::AppNotFound(app_id.to_string()))?
-            .identifier().to_string();
+            .identifier()
+            .to_string();
 
-        let sink_node_id = self.state.channels.iter()
+        let sink_node_id = self
+            .state
+            .channels
+            .iter()
             .find(|c| c.id == channel_uuid)
             .map(|c| c.pw_sink_id)
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
@@ -776,15 +1000,25 @@ impl DaemonService {
         // Find hardware sink to reconnect to
         let outputs = self.state.get_outputs();
         if let Some(default) = outputs.first() {
-            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default.node_id);
+            let port_pairs = self
+                .state
+                .pw_graph
+                .find_port_pairs(app_node_id, default.node_id);
             for (output_port, input_port) in port_pairs {
-                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port,
+                    input_port,
+                });
             }
         }
 
         // Destroy links to our sink
         if let Some(sink_id) = sink_node_id {
-            let links_to_destroy: Vec<u32> = self.state.pw_graph.links.values()
+            let links_to_destroy: Vec<u32> = self
+                .state
+                .pw_graph
+                .links
+                .values()
                 .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
                 .map(|l| l.id)
                 .collect();
@@ -795,7 +1029,12 @@ impl DaemonService {
         }
 
         // Remove from assigned apps list
-        if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_uuid) {
+        if let Some(channel) = self
+            .state
+            .channels
+            .iter_mut()
+            .find(|c| c.id == channel_uuid)
+        {
             channel.assigned_apps.retain(|a| a != &app_identifier);
         }
 
@@ -803,21 +1042,33 @@ impl DaemonService {
         Ok(())
     }
 
-    pub fn set_channel_output(&mut self, channel_id: &str, device_name: &str) -> Result<(), ServiceError> {
+    pub fn set_channel_output(
+        &mut self,
+        channel_id: &str,
+        device_name: &str,
+    ) -> Result<(), ServiceError> {
         let channel_uuid = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let device_name_opt = if device_name.is_empty() { None } else { Some(device_name.to_string()) };
+        let device_name_opt = if device_name.is_empty() {
+            None
+        } else {
+            Some(device_name.to_string())
+        };
 
         let outputs = self.state.get_outputs();
         let target_device_id = device_name_opt.as_ref().and_then(|name| {
-            outputs.iter()
+            outputs
+                .iter()
                 .find(|d| d.description == *name || d.name == *name)
                 .map(|d| d.node_id)
         });
 
         let loopback_id = {
-            let channel = self.state.channels.iter_mut()
+            let channel = self
+                .state
+                .channels
+                .iter_mut()
                 .find(|c| c.id == channel_uuid)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
@@ -837,14 +1088,21 @@ impl DaemonService {
     }
 
     pub fn set_master_output(&mut self, device_name: &str) -> Result<(), ServiceError> {
-        self.state.master_output = if device_name.is_empty() { None } else { Some(device_name.to_string()) };
+        self.state.master_output = if device_name.is_empty() {
+            None
+        } else {
+            Some(device_name.to_string())
+        };
 
         if let Some(name) = self.state.master_output.clone() {
             let outputs = self.state.get_outputs();
-            if let Some(output) = outputs.iter()
+            if let Some(output) = outputs
+                .iter()
                 .find(|o| o.description == name || o.name == name)
             {
-                self.send_pw_command(PwCommand::SetDefaultSink { node_id: output.node_id });
+                self.send_pw_command(PwCommand::SetDefaultSink {
+                    node_id: output.node_id,
+                });
             }
         }
 
@@ -872,7 +1130,8 @@ impl DaemonService {
     /// Called when a new node appears in PipeWire.
     fn try_auto_route_app(&mut self, node_id: u32, _node_name: &str) {
         // Find the app by node_id
-        let (app_identifier, app_name) = match self.state.apps.iter().find(|a| a.node_id == node_id) {
+        let (app_identifier, app_name) = match self.state.apps.iter().find(|a| a.node_id == node_id)
+        {
             Some(app) => (app.identifier().to_string(), app.name.clone()),
             None => {
                 debug!("try_auto_route_app: node {} not in apps list", node_id);
@@ -882,39 +1141,63 @@ impl DaemonService {
 
         // Find a channel that has this app in its assigned_apps
         // Check both identifier (binary name) and display name for compatibility
-        let channel_match = self.state.channels.iter()
-            .find(|c| c.assigned_apps.contains(&app_identifier) || c.assigned_apps.iter().any(|a| a == &app_name))
+        let channel_match = self
+            .state
+            .channels
+            .iter()
+            .find(|c| {
+                c.assigned_apps.contains(&app_identifier)
+                    || c.assigned_apps.iter().any(|a| a == &app_name)
+            })
             .map(|c| (c.id, c.pw_sink_id, c.name.clone()));
 
         let (channel_id, sink_id, channel_name) = match channel_match {
             Some((id, Some(sink_id), name)) => (id, sink_id, name),
             Some((_id, None, name)) => {
-                debug!("try_auto_route_app: app '{}' matches channel '{}' but sink not ready yet", app_identifier, name);
+                debug!(
+                    "try_auto_route_app: app '{}' matches channel '{}' but sink not ready yet",
+                    app_identifier, name
+                );
                 return;
             }
             _ => {
-                debug!("try_auto_route_app: app '{}' has no matching channel assignment", app_identifier);
+                debug!(
+                    "try_auto_route_app: app '{}' has no matching channel assignment",
+                    app_identifier
+                );
                 return;
             }
         };
         let _ = channel_name; // suppress warning
 
-        info!("Auto-routing app '{}' (node {}) to channel {}", app_identifier, node_id, channel_id);
+        info!(
+            "Auto-routing app '{}' (node {}) to channel {}",
+            app_identifier, node_id, channel_id
+        );
 
         // Route the app: connect to our sink FIRST, then disconnect from default sinks
         // This ensures the app always has an audio path and doesn't pause playback
-        let our_sinks: Vec<u32> = self.state.channels.iter()
+        let our_sinks: Vec<u32> = self
+            .state
+            .channels
+            .iter()
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
         // Create links to our sink FIRST
         let port_pairs = self.state.pw_graph.find_port_pairs(node_id, sink_id);
         for (output_port, input_port) in port_pairs {
-            self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+            self.send_pw_command(PwCommand::CreateLink {
+                output_port,
+                input_port,
+            });
         }
 
         // Then destroy links to non-sootmix sinks
-        let links_to_destroy: Vec<u32> = self.state.pw_graph.links_from_node(node_id)
+        let links_to_destroy: Vec<u32> = self
+            .state
+            .pw_graph
+            .links_from_node(node_id)
             .iter()
             .filter(|link| !our_sinks.contains(&link.input_node))
             .map(|l| l.id)
@@ -929,7 +1212,10 @@ impl DaemonService {
     /// Called when a virtual sink is created (sink is now ready to receive apps).
     fn try_auto_route_pending_apps(&mut self, channel_id: Uuid) {
         // Get channel info
-        let (assigned_apps, sink_id) = match self.state.channels.iter()
+        let (assigned_apps, sink_id) = match self
+            .state
+            .channels
+            .iter()
             .find(|c| c.id == channel_id)
             .map(|c| (c.assigned_apps.clone(), c.pw_sink_id))
         {
@@ -943,7 +1229,10 @@ impl DaemonService {
 
         // Find apps that match the assigned list
         // Check both identifier (binary name) and display name for compatibility
-        let apps_to_route: Vec<(u32, String)> = self.state.apps.iter()
+        let apps_to_route: Vec<(u32, String)> = self
+            .state
+            .apps
+            .iter()
             .filter(|app| {
                 let id = app.identifier().to_string();
                 let name = &app.name;
@@ -953,7 +1242,10 @@ impl DaemonService {
             .collect();
 
         // Collect our sink IDs for filtering
-        let our_sinks: Vec<u32> = self.state.channels.iter()
+        let our_sinks: Vec<u32> = self
+            .state
+            .channels
+            .iter()
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
@@ -962,18 +1254,27 @@ impl DaemonService {
             let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_id);
 
             if port_pairs.is_empty() {
-                debug!("No port pairs found for {}→{}, will retry later", app_node_id, sink_id);
+                debug!(
+                    "No port pairs found for {}→{}, will retry later",
+                    app_node_id, sink_id
+                );
                 continue;
             }
 
             info!("Auto-routing app '{}' to channel", app_identifier);
 
             for (output_port, input_port) in port_pairs {
-                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port,
+                    input_port,
+                });
             }
 
             // Then destroy links to non-sootmix sinks
-            let links_to_destroy: Vec<u32> = self.state.pw_graph.links_from_node(app_node_id)
+            let links_to_destroy: Vec<u32> = self
+                .state
+                .pw_graph
+                .links_from_node(app_node_id)
                 .iter()
                 .filter(|link| !our_sinks.contains(&link.input_node))
                 .map(|l| l.id)
