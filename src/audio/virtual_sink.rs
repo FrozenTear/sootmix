@@ -81,8 +81,13 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
         sink_node_name, description
     );
 
+    // Playback props for the loopback output stream.
+    // IMPORTANT: We set stream.capture.sink=false and volume=1.0 to ensure unity gain.
+    // The object.linger=true keeps the stream alive and prevents WirePlumber from
+    // resetting it. session.suspend-timeout-enabled=false prevents auto-suspend.
     let playback_props = format!(
-        "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR]"
+        "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR] \
+         object.linger=true session.suspend-timeout-enabled=false stream.capture.sink=false"
     );
 
     info!("Creating virtual sink: {} (description: {})", sink_node_name, description);

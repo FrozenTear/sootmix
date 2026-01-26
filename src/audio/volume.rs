@@ -19,8 +19,11 @@ pub enum VolumeError {
 /// Set volume on a node.
 ///
 /// Volume is in linear scale (0.0 = silent, 1.0 = 100%, >1.0 = boost).
+/// Allows up to 4.0 (~+12dB) to match native PipeWire API capabilities.
 pub fn set_volume(node_id: u32, volume: f32) -> Result<(), VolumeError> {
-    let volume_clamped = volume.max(0.0).min(1.5); // Allow up to 150%
+    // Allow up to 4.0 (~+12dB boost), matching native API limits in control.rs
+    // This ensures consistent behavior whether using native API or CLI fallback
+    let volume_clamped = volume.max(0.0).min(4.0);
 
     info!(
         "wpctl set-volume {} {:.2}",
@@ -151,7 +154,8 @@ pub fn get_volume(node_id: u32) -> Result<(f32, bool), VolumeError> {
 
 /// Set volume on the default sink.
 pub fn set_default_sink_volume(volume: f32) -> Result<(), VolumeError> {
-    let volume_clamped = volume.max(0.0).min(1.5);
+    // Allow up to 4.0 (~+12dB boost), matching native API limits
+    let volume_clamped = volume.max(0.0).min(4.0);
 
     debug!("Setting default sink volume to {:.2}", volume_clamped);
 
