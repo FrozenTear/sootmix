@@ -182,10 +182,15 @@ impl AudioChannel {
         if self == other {
             return true;
         }
-        // Mono can connect to left channel
         matches!(
             (self, other),
-            (Self::Mono, Self::FrontLeft) | (Self::FrontLeft, Self::Mono)
+            // Mono can connect to left channel
+            (Self::Mono, Self::FrontLeft)
+                | (Self::FrontLeft, Self::Mono)
+                // Unknown channels (e.g. Bluetooth numeric ports like capture_0)
+                // are compatible with any named channel — positional pairing handles order
+                | (Self::Unknown, _)
+                | (_, Self::Unknown)
         )
     }
 }

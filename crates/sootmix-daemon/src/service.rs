@@ -336,7 +336,13 @@ impl DaemonState {
             .iter()
             .filter_map(|c| c.pw_sink_id.map(|_| c.name.as_str()))
             .collect();
-        self.pw_graph.output_devices(&exclude)
+        let mut outputs = vec![OutputInfo {
+            node_id: 0,
+            name: "system-default".to_string(),
+            description: "System Default".to_string(),
+        }];
+        outputs.extend(self.pw_graph.output_devices(&exclude));
+        outputs
     }
 
     pub fn update_available_apps(&mut self) {
@@ -670,16 +676,18 @@ impl DaemonService {
                 }
             }
             PwEvent::NodeRemoved(id) => {
-                if let Some(removed) = self.state.pw_graph.nodes.get(&id) {
-                    if removed.media_class == MediaClass::AudioSink
-                        && !removed.name.starts_with("sootmix.")
-                    {
+                let was_hw_sink = self.state.pw_graph.nodes.get(&id).map_or(false, |removed| {
+                    let is_hw = removed.media_class == MediaClass::AudioSink
+                        && !removed.name.starts_with("sootmix.");
+                    if is_hw {
                         info!(
                             "Hardware sink removed: id={}, name='{}', desc='{}'",
                             id, removed.name, removed.description
                         );
                     }
-                }
+                    is_hw
+                });
+
                 self.state.pw_graph.nodes.remove(&id);
                 self.update_apps_and_emit_signals();
 
@@ -699,6 +707,12 @@ impl DaemonService {
                         );
                         channel.pw_loopback_output_id = None;
                     }
+                }
+
+                // When a hardware sink disappears, re-route orphaned channels
+                // to the fallback device (configured master or system default)
+                if was_hw_sink {
+                    self.try_fallback_orphaned_channels();
                 }
             }
             PwEvent::NodeChanged(node) => {
@@ -778,6 +792,55 @@ impl DaemonService {
                         self.send_pw_command(PwCommand::RouteChannelToDevice {
                             loopback_output_node: loopback_id,
                             target_device_id,
+                        });
+                    }
+                }
+
+                // Check if this port belongs to a hardware sink that channels are
+                // routed to. This handles the timing issue where a Bluetooth device
+                // reconnects and try_reroute_channels_to_device fires before the
+                // sink's input ports are registered, causing empty port pairs.
+                let is_hw_sink = self
+                    .state
+                    .pw_graph
+                    .nodes
+                    .get(&port_node_id)
+                    .map_or(false, |n| {
+                        n.media_class == MediaClass::AudioSink
+                            && !n.name.starts_with("sootmix.")
+                    });
+
+                if is_hw_sink {
+                    // Find channels whose loopback output should be linked to this
+                    // sink but currently has no links (routing raced ahead of ports).
+                    let orphaned_loopbacks: Vec<u32> = self
+                        .state
+                        .channels
+                        .iter()
+                        .filter_map(|c| {
+                            let loopback_id = c.pw_loopback_output_id?;
+                            let has_links = self
+                                .state
+                                .pw_graph
+                                .links
+                                .values()
+                                .any(|l| l.output_node == loopback_id);
+                            if !has_links {
+                                Some(loopback_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    for loopback_id in orphaned_loopbacks {
+                        debug!(
+                            "Hardware sink {} got new port, retrying route for orphaned loopback {}",
+                            port_node_id, loopback_id
+                        );
+                        self.send_pw_command(PwCommand::RouteChannelToDevice {
+                            loopback_output_node: loopback_id,
+                            target_device_id: Some(port_node_id),
                         });
                     }
                 }
@@ -1044,17 +1107,11 @@ impl DaemonService {
     pub fn set_master_volume(&mut self, volume_db: f64) -> Result<(), ServiceError> {
         self.state.master_volume_db = volume_db as f32;
 
-        if let Some(device_name) = self.state.master_output.clone() {
-            let outputs = self.state.get_outputs();
-            if let Some(output) = outputs
-                .iter()
-                .find(|o| o.description == device_name || o.name == device_name)
-            {
-                self.send_pw_command(PwCommand::SetVolume {
-                    node_id: output.node_id,
-                    volume: db_to_linear(volume_db as f32),
-                });
-            }
+        if let Some(node_id) = self.get_master_output_device_id() {
+            self.send_pw_command(PwCommand::SetVolume {
+                node_id,
+                volume: db_to_linear(volume_db as f32),
+            });
         }
 
         self.save_config();
@@ -1064,17 +1121,11 @@ impl DaemonService {
     pub fn set_master_mute(&mut self, muted: bool) -> Result<(), ServiceError> {
         self.state.master_muted = muted;
 
-        if let Some(device_name) = self.state.master_output.clone() {
-            let outputs = self.state.get_outputs();
-            if let Some(output) = outputs
-                .iter()
-                .find(|o| o.description == device_name || o.name == device_name)
-            {
-                self.send_pw_command(PwCommand::SetMute {
-                    node_id: output.node_id,
-                    muted,
-                });
-            }
+        if let Some(node_id) = self.get_master_output_device_id() {
+            self.send_pw_command(PwCommand::SetMute {
+                node_id,
+                muted,
+            });
         }
 
         self.save_config();
@@ -1289,11 +1340,14 @@ impl DaemonService {
             Some(device_name.to_string())
         };
 
+        let is_system_default = device_name == Self::SYSTEM_DEFAULT_SENTINEL;
         let target_device_id = self.get_master_output_device_id();
 
-        if let Some(node_id) = target_device_id {
-            // Set as system default
-            self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+        if !is_system_default {
+            if let Some(node_id) = target_device_id {
+                // Set as system default only when selecting a specific device
+                self.send_pw_command(PwCommand::SetDefaultSink { node_id });
+            }
         }
 
         // Re-route all existing channels to the new master output
@@ -1301,6 +1355,7 @@ impl DaemonService {
             .state
             .channels
             .iter()
+            .filter(|c| c.output_device_name.is_none())
             .filter_map(|c| c.pw_loopback_output_id)
             .collect();
 
@@ -1315,6 +1370,9 @@ impl DaemonService {
         Ok(())
     }
 
+    /// Sentinel value for "follow the system default sink".
+    const SYSTEM_DEFAULT_SENTINEL: &'static str = "system-default";
+
     /// Get the node ID of the master output device.
     ///
     /// Checks the configured master output name first, then falls back to the
@@ -1323,6 +1381,11 @@ impl DaemonService {
     fn get_master_output_device_id(&self) -> Option<u32> {
         // Try the configured master output first
         if let Some(name) = self.state.master_output.as_ref() {
+            // "system-default" means always follow WirePlumber's default
+            if name == Self::SYSTEM_DEFAULT_SENTINEL {
+                return crate::audio::routing::get_default_sink_id();
+            }
+
             let outputs = self.state.get_outputs();
             if let Some(output) = outputs
                 .iter()
@@ -1528,6 +1591,50 @@ impl DaemonService {
         self.state.pending_auto_route_channels.remove(&channel_id);
     }
 
+    /// Re-route orphaned channel loopback outputs to the fallback device.
+    ///
+    /// Called when a hardware sink is removed (BT disconnect, USB unplug).
+    /// Finds channels whose loopback output has no remaining links and
+    /// routes them to the configured master output or system default.
+    fn try_fallback_orphaned_channels(&mut self) {
+        let target_device_id = self.get_master_output_device_id();
+
+        let orphaned_loopbacks: Vec<(u32, String)> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| {
+                let loopback_id = c.pw_loopback_output_id?;
+                let has_links = self
+                    .state
+                    .pw_graph
+                    .links
+                    .values()
+                    .any(|l| l.output_node == loopback_id);
+                if !has_links {
+                    Some((loopback_id, c.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if orphaned_loopbacks.is_empty() {
+            return;
+        }
+
+        for (loopback_id, channel_name) in orphaned_loopbacks {
+            info!(
+                "Fallback: re-routing orphaned channel '{}' (loopback {}) to device {:?}",
+                channel_name, loopback_id, target_device_id
+            );
+            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                loopback_output_node: loopback_id,
+                target_device_id,
+            });
+        }
+    }
+
     /// Re-route channel loopback outputs when a hardware sink (re)appears.
     ///
     /// Handles Bluetooth reconnects, USB audio plugged in, etc.
@@ -1547,12 +1654,19 @@ impl DaemonService {
             configured_name == device_name || configured_name == device_desc
         };
 
-        // Check if this device matches the master output
+        // Check if this device matches the master output.
+        // "system-default" matches ANY hardware sink (it dynamically follows the default).
+        let master_is_system_default = self
+            .state
+            .master_output
+            .as_ref()
+            .map(|name| name == Self::SYSTEM_DEFAULT_SENTINEL)
+            .unwrap_or(false);
         let master_matches = self
             .state
             .master_output
             .as_ref()
-            .map(|name| matches_device(name))
+            .map(|name| name == Self::SYSTEM_DEFAULT_SENTINEL || matches_device(name))
             .unwrap_or(false);
 
         // Collect loopback IDs that need re-routing
@@ -1587,13 +1701,16 @@ impl DaemonService {
                 }
             }
 
-            // Master output matches this device
+            // Master output matches this device (or master is "system-default")
             if master_matches && c.output_device_name.is_none() {
-                loopbacks_to_route.push((
-                    loopback_id,
-                    c.name.clone(),
-                    Some(device_node_id),
-                ));
+                // When master is "system-default", route to whatever the
+                // current system default is, not necessarily this new device
+                let target = if master_is_system_default {
+                    None // resolved later via get_master_output_device_id()
+                } else {
+                    Some(device_node_id)
+                };
+                loopbacks_to_route.push((loopback_id, c.name.clone(), target));
                 continue;
             }
 

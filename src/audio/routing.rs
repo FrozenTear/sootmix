@@ -6,7 +6,7 @@
 
 use std::process::Command;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum RoutingError {
@@ -124,7 +124,8 @@ pub fn list_links() -> Result<Vec<String>, RoutingError> {
 /// This finds all output ports of the app node and links them to
 /// corresponding input ports of the sink.
 pub fn route_app_to_sink(app_node_name: &str, sink_node_name: &str) -> Result<(), RoutingError> {
-    // Link FL to FL, FR to FR
+    // Link FL to FL, FR to FR — attempt both channels independently so one
+    // failure doesn't prevent the other from connecting.
     let channels = ["FL", "FR"];
 
     for channel in channels {
@@ -134,7 +135,9 @@ pub fn route_app_to_sink(app_node_name: &str, sink_node_name: &str) -> Result<()
         // Try playback_ prefix if output_ doesn't exist
         if let Err(_) = create_link_by_name(&output_port, &input_port) {
             let output_port_alt = format!("{}:playback_{}", app_node_name, channel);
-            create_link_by_name(&output_port_alt, &input_port)?;
+            if let Err(e) = create_link_by_name(&output_port_alt, &input_port) {
+                warn!("Failed to link channel {} for {} -> {}: {}", channel, app_node_name, sink_node_name, e);
+            }
         }
     }
 

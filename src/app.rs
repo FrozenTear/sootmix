@@ -1042,13 +1042,12 @@ impl SootMix {
 
             // ==================== Window & Tray ====================
             Message::WindowCloseRequested(window_id) => {
-                // Hide window to tray instead of quitting
-                // The daemon keeps running so audio continues
                 if self.tray_handle.is_some() {
-                    info!("Window close requested - minimizing to tray (daemon keeps running)");
-                    // Minimize instead of close to keep subscriptions running
-                    // iced daemon mode stops processing when all windows are closed
-                    return iced::window::minimize(window_id, true);
+                    // Close the window — daemon mode keeps the app running with
+                    // no windows open, so subscriptions and audio continue.
+                    info!("Window close requested - closing to tray (daemon keeps running)");
+                    self.main_window_id = None;
+                    return iced::window::close(window_id);
                 } else {
                     // No tray available - actually quit
                     info!("Window close requested - no tray, exiting");
@@ -1058,14 +1057,27 @@ impl SootMix {
             }
 
             Message::TrayShowWindow => {
-                // Restore minimized window and focus it
-                info!("Tray: Restoring window");
-                return iced::window::oldest().and_then(|id| {
-                    Task::batch([
-                        iced::window::minimize(id, false),
-                        iced::window::gain_focus(id),
-                    ])
-                });
+                if let Some(window_id) = self.main_window_id {
+                    // Window exists but may be minimized — restore and focus
+                    info!("Tray: Restoring existing window");
+                    return Task::batch([
+                        iced::window::minimize(window_id, false),
+                        iced::window::gain_focus(window_id),
+                    ]);
+                } else {
+                    // Window was closed — open a new one
+                    info!("Tray: Opening new window");
+                    let (window_id, open_task) = iced::window::open(iced::window::Settings {
+                        size: iced::Size::new(900.0, 600.0),
+                        platform_specific: iced::window::settings::PlatformSpecific {
+                            application_id: "sootmix".to_string(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                    self.main_window_id = Some(window_id);
+                    return open_task.discard();
+                }
             }
 
             Message::TrayToggleMuteAll => {
@@ -2423,16 +2435,21 @@ impl SootMix {
     fn get_output_device_node_id(&self) -> Option<u32> {
         // If user selected a device, find its node_id
         if let Some(ref device_name) = self.state.output_device {
-            self.state.available_outputs.iter()
-                .find(|d| d.description == *device_name || d.name == *device_name)
-                .map(|d| d.node_id)
-        } else {
-            // Use hardware sink finder as fallback
-            let our_sink_ids: Vec<u32> = self.state.channels.iter()
-                .filter_map(|c| c.pw_sink_id)
-                .collect();
-            find_hardware_sink(&self.state.pw_graph, &our_sink_ids)
+            // "system-default" means follow the system default — fall through to hardware finder
+            if device_name != "system-default" {
+                if let Some(d) = self.state.available_outputs.iter()
+                    .find(|d| d.description == *device_name || d.name == *device_name)
+                {
+                    return Some(d.node_id);
+                }
+            }
         }
+
+        // Use hardware sink finder as fallback (also used for "system-default")
+        let our_sink_ids: Vec<u32> = self.state.channels.iter()
+            .filter_map(|c| c.pw_sink_id)
+            .collect();
+        find_hardware_sink(&self.state.pw_graph, &our_sink_ids)
     }
 
     /// Initialize snapshot A with current state if not already set.
@@ -2568,6 +2585,12 @@ impl SootMix {
 
         // Save current config
         self.save_config();
+
+        // Shut down tray icon so it doesn't linger as a ghost
+        if let Some(ref handle) = self.tray_handle {
+            handle.shutdown();
+        }
+        self.tray_handle = None;
 
         // Destroy all virtual sinks
         crate::audio::virtual_sink::destroy_all_virtual_sinks();

@@ -111,6 +111,12 @@ impl TrayHandle {
             }).await;
         });
     }
+
+    /// Shut down the tray icon, removing it from the system tray.
+    pub fn shutdown(&self) {
+        info!("Shutting down system tray");
+        self.handle.shutdown();
+    }
 }
 
 /// Start the system tray icon.
