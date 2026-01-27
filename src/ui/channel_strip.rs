@@ -314,14 +314,20 @@ pub fn channel_strip<'a>(
 
     // === OUTPUT DEVICE PICKER ===
     let output_options: Vec<String> = std::iter::once("Default".to_string())
-        .chain(available_outputs.iter().map(|d| d.description.clone()))
+        .chain(
+            available_outputs
+                .iter()
+                .filter(|d| d.name != "system-default")
+                .map(|d| d.description.clone()),
+        )
         .collect();
 
     let selected_output = output_device_name
         .clone()
         .or_else(|| Some("Default".to_string()));
 
-    let output_picker: Element<'a, Message> = if available_outputs.is_empty() {
+    let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
+    let output_picker: Element<'a, Message> = if !has_hw_outputs {
         Space::new().width(0).height(0).into()
     } else {
         column![
@@ -605,34 +611,74 @@ pub fn master_strip<'a>(
         .on_press(Message::ToggleMasterRecording);
 
     // === OUTPUT DEVICE PICKER ===
-    let output_options: Vec<String> = available_outputs
+    // Build display labels and a mapping to the name/sentinel to send.
+    // Filter out the synthetic "system-default" entry since we add it manually.
+    let hw_outputs: Vec<&OutputDevice> = available_outputs
         .iter()
-        .map(|d| d.description.clone())
+        .filter(|d| d.name != "system-default")
         .collect();
 
-    let output_picker: Element<'a, Message> = if output_options.is_empty() {
+    let output_options: Vec<String> = std::iter::once("System Default".to_string())
+        .chain(hw_outputs.iter().map(|d| d.description.clone()))
+        .collect();
+
+    // Map the selected_output (stored as name/sentinel) to the display label
+    let selected = selected_output.map(|s| {
+        if s == "system-default" {
+            "System Default".to_string()
+        } else {
+            // Match by name or description to find the display label
+            hw_outputs
+                .iter()
+                .find(|d| d.name == s || d.description == s)
+                .map(|d| d.description.clone())
+                .unwrap_or_else(|| s.to_string())
+        }
+    });
+
+    let has_any_outputs = !hw_outputs.is_empty();
+    let output_picker: Element<'a, Message> = if !has_any_outputs && selected.is_none() {
         text("No outputs").size(TEXT_CAPTION).color(TEXT_DIM).into()
     } else {
-        let selected = selected_output.map(|s| s.to_string());
+        let outputs_for_closure: Vec<(String, String)> = hw_outputs
+            .iter()
+            .map(|d| (d.description.clone(), d.name.clone()))
+            .collect();
         column![
             text("Output").size(TEXT_CAPTION).color(TEXT_DIM),
-            pick_list(output_options, selected, Message::OutputDeviceChanged,)
-                .placeholder("Select...")
-                .text_size(TEXT_SMALL)
-                .padding([SPACING_XS, SPACING_SM])
-                .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
-                .style(|_theme: &Theme, _status| {
-                    pick_list::Style {
-                        text_color: TEXT,
-                        placeholder_color: TEXT_DIM,
-                        handle_color: TEXT_DIM,
-                        background: Background::Color(SURFACE),
-                        border: Border::default()
-                            .rounded(RADIUS_SM)
-                            .color(SOOTMIX_DARK.border_default)
-                            .width(1.0),
+            pick_list(
+                output_options,
+                selected,
+                move |selection: String| {
+                    if selection == "System Default" {
+                        Message::OutputDeviceChanged("system-default".to_string())
+                    } else {
+                        // Send the device name (not description) for specific devices
+                        let device_name = outputs_for_closure
+                            .iter()
+                            .find(|(desc, _)| *desc == selection)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or(selection);
+                        Message::OutputDeviceChanged(device_name)
                     }
-                }),
+                },
+            )
+            .placeholder("Select...")
+            .text_size(TEXT_SMALL)
+            .padding([SPACING_XS, SPACING_SM])
+            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
+            .style(|_theme: &Theme, _status| {
+                pick_list::Style {
+                    text_color: TEXT,
+                    placeholder_color: TEXT_DIM,
+                    handle_color: TEXT_DIM,
+                    background: Background::Color(SURFACE),
+                    border: Border::default()
+                        .rounded(RADIUS_SM)
+                        .color(SOOTMIX_DARK.border_default)
+                        .width(1.0),
+                }
+            }),
         ]
         .spacing(SPACING_XS)
         .into()

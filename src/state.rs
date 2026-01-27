@@ -682,6 +682,14 @@ impl AppState {
             .filter_map(|c| c.pw_sink_id.map(|_| c.name.as_str()))
             .collect();
 
-        self.available_outputs = self.pw_graph.output_devices(&virtual_sink_names);
+        let hw_outputs = self.pw_graph.output_devices(&virtual_sink_names);
+        // Prepend "System Default" synthetic entry
+        let mut outputs = vec![crate::audio::types::OutputDevice {
+            node_id: 0,
+            name: "system-default".to_string(),
+            description: "System Default".to_string(),
+        }];
+        outputs.extend(hw_outputs);
+        self.available_outputs = outputs;
     }
 }
