@@ -355,40 +355,59 @@ fn run_pipewire_loop(
     Ok(())
 }
 
-/// Process any pending CLI commands that were throttled but are now ready to execute
+/// Spawn a background thread for blocking CLI operations that would stall the PW main loop.
+/// Clones the event sender so the background thread can report results/errors.
+fn spawn_cli_work<F>(event_tx: &Rc<mpsc::Sender<PwEvent>>, work: F)
+where
+    F: FnOnce(mpsc::Sender<PwEvent>) + Send + 'static,
+{
+    let tx = mpsc::Sender::clone(event_tx);
+    thread::spawn(move || work(tx));
+}
+
+/// Process any pending CLI commands that were throttled but are now ready to execute.
+/// CLI commands are dispatched to background threads to avoid blocking the PW loop.
 fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
     let ready_cmds = state.borrow_mut().get_ready_pending_cmds();
 
-    for (node_id, cmd) in ready_cmds {
-        match cmd {
-            PendingCliCmd::Volume(volume) => {
-                trace!(
-                    "Processing pending volume command: node={} volume={:.3}",
-                    node_id,
-                    volume
-                );
-                if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
-                    error!(
-                        "Pending CLI volume control failed for node {}: {}",
-                        node_id, e
+    if ready_cmds.is_empty() {
+        return;
+    }
+
+    let tx = mpsc::Sender::clone(&state.borrow().event_tx);
+
+    thread::spawn(move || {
+        for (node_id, cmd) in ready_cmds {
+            match cmd {
+                PendingCliCmd::Volume(volume) => {
+                    trace!(
+                        "Processing pending volume command: node={} volume={:.3}",
+                        node_id,
+                        volume
                     );
+                    if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
+                        error!(
+                            "Pending CLI volume control failed for node {}: {}",
+                            node_id, e
+                        );
+                    }
                 }
-            }
-            PendingCliCmd::Mute(muted) => {
-                trace!(
-                    "Processing pending mute command: node={} muted={}",
-                    node_id,
-                    muted
-                );
-                if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
-                    error!(
-                        "Pending CLI mute control failed for node {}: {}",
-                        node_id, e
+                PendingCliCmd::Mute(muted) => {
+                    trace!(
+                        "Processing pending mute command: node={} muted={}",
+                        node_id,
+                        muted
                     );
+                    if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
+                        error!(
+                            "Pending CLI mute control failed for node {}: {}",
+                            node_id, e
+                        );
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 fn handle_command(
@@ -411,26 +430,25 @@ fn handle_command(
                 "Creating virtual sink: '{}' for channel {}",
                 name, channel_id
             );
-            let event_tx = state.borrow().event_tx.clone();
-            match crate::audio::virtual_sink::create_virtual_sink_full(&name, &name) {
-                Ok(result) => {
-                    state
-                        .borrow_mut()
-                        .virtual_sinks
-                        .insert(channel_id, result.sink_node_id);
-                    let _ = event_tx.send(PwEvent::VirtualSinkCreated {
-                        channel_id,
-                        node_id: result.sink_node_id,
-                        loopback_output_node_id: result.loopback_output_node_id,
-                    });
+            // Virtual sink creation spawns pw-loopback and polls for the node,
+            // which blocks for 200-300ms. Run on a background thread.
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                match crate::audio::virtual_sink::create_virtual_sink_full(&name, &name) {
+                    Ok(result) => {
+                        let _ = event_tx.send(PwEvent::VirtualSinkCreated {
+                            channel_id,
+                            node_id: result.sink_node_id,
+                            loopback_output_node_id: result.loopback_output_node_id,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to create virtual sink: {}",
+                            e
+                        )));
+                    }
                 }
-                Err(e) => {
-                    let _ = event_tx.send(PwEvent::Error(format!(
-                        "Failed to create virtual sink: {}",
-                        e
-                    )));
-                }
-            }
+            });
         }
 
         PwCommand::UpdateSinkDescription {
@@ -438,25 +456,29 @@ fn handle_command(
             description,
         } => {
             debug!("Updating sink {} description to '{}'", node_id, description);
-            if let Err(e) =
-                crate::audio::virtual_sink::update_node_description(node_id, &description)
-            {
-                warn!("Failed to update sink description: {}", e);
-            }
+            spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                if let Err(e) =
+                    crate::audio::virtual_sink::update_node_description(node_id, &description)
+                {
+                    warn!("Failed to update sink description: {}", e);
+                }
+            });
         }
 
         PwCommand::DestroyVirtualSink { node_id } => {
             debug!("Destroying virtual sink: {}", node_id);
-            let event_tx = state.borrow().event_tx.clone();
             state.borrow_mut().bound_nodes.remove(&node_id);
-            if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
-                warn!("Failed to destroy virtual sink {}: {}", node_id, e);
-            }
             state
                 .borrow_mut()
                 .virtual_sinks
                 .retain(|_, &mut id| id != node_id);
-            let _ = event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
+            // Kill the pw-loopback process on a background thread to avoid blocking.
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
+                    warn!("Failed to destroy virtual sink {}: {}", node_id, e);
+                }
+                let _ = event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
+            });
         }
 
         PwCommand::CreateLink {
@@ -480,11 +502,12 @@ fn handle_command(
                 Some(n) => n,
                 None => {
                     warn!("Output port {} not found, using CLI fallback", output_port);
-                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ =
-                            event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
-                    }
+                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                            let _ =
+                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                        }
+                    });
                     return;
                 }
             };
@@ -493,11 +516,12 @@ fn handle_command(
                 Some(n) => n,
                 None => {
                     warn!("Input port {} not found, using CLI fallback", input_port);
-                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ =
-                            event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
-                    }
+                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                            let _ =
+                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                        }
+                    });
                     return;
                 }
             };
@@ -523,21 +547,23 @@ fn handle_command(
                 }
                 Err(e) => {
                     warn!("Native link creation failed: {:?}, using CLI fallback", e);
-                    if let Err(e2) = crate::audio::routing::create_link(output_port, input_port) {
-                        let event_tx = state.borrow().event_tx.clone();
-                        let _ =
-                            event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e2)));
-                    }
+                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                        if let Err(e2) = crate::audio::routing::create_link(output_port, input_port) {
+                            let _ =
+                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e2)));
+                        }
+                    });
                 }
             }
         }
 
         PwCommand::DestroyLink { link_id } => {
             debug!("Destroying link: {}", link_id);
-            if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                let event_tx = state.borrow().event_tx.clone();
-                let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
-            }
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                    let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
+                }
+            });
         }
 
         PwCommand::BindNode { node_id } => {
@@ -561,9 +587,11 @@ fn handle_command(
                     .should_run_cli(node_id, PendingCliCmd::Volume(volume))
                 {
                     debug!("Native volume failed ({}), using CLI fallback", e);
-                    if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
-                        error!("CLI volume control also failed: {}", e2);
-                    }
+                    spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                        if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                            error!("CLI volume control also failed: {}", e2);
+                        }
+                    });
                 }
             }
         }
@@ -577,25 +605,29 @@ fn handle_command(
                     .should_run_cli(node_id, PendingCliCmd::Mute(muted))
                 {
                     debug!("Native mute failed ({}), using CLI fallback", e);
-                    if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
-                        error!("CLI mute control also failed: {}", e2);
-                    }
+                    spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                        if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
+                            error!("CLI mute control also failed: {}", e2);
+                        }
+                    });
                 }
             }
         }
 
         PwCommand::SetDefaultSink { node_id } => {
             info!("Setting default sink to node {}", node_id);
-            let output = std::process::Command::new("wpctl")
-                .args(["set-default", &node_id.to_string()])
-                .output();
+            spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                let output = std::process::Command::new("wpctl")
+                    .args(["set-default", &node_id.to_string()])
+                    .output();
 
-            if let Ok(result) = output {
-                if !result.status.success() {
-                    let stderr = String::from_utf8_lossy(&result.stderr);
-                    warn!("wpctl set-default failed: {}", stderr);
+                if let Ok(result) = output {
+                    if !result.status.success() {
+                        let stderr = String::from_utf8_lossy(&result.stderr);
+                        warn!("wpctl set-default failed: {}", stderr);
+                    }
                 }
-            }
+            });
         }
 
         PwCommand::RouteChannelToDevice {
@@ -606,9 +638,8 @@ fn handle_command(
                 "Routing loopback output {} to device {:?}",
                 loopback_output_node, target_device_id
             );
-            let event_tx = state.borrow().event_tx.clone();
 
-            // Destroy existing links
+            // Collect all state data on the PW thread (non-blocking reads)
             let links_to_destroy: Vec<u32> = {
                 let s = state.borrow();
                 s.links
@@ -617,13 +648,6 @@ fn handle_command(
                     .map(|l| l.id)
                     .collect()
             };
-
-            for link_id in links_to_destroy {
-                debug!("Destroying existing link {} from loopback output", link_id);
-                if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                    warn!("Failed to destroy link {}: {}", link_id, e);
-                }
-            }
 
             let target_node_id = target_device_id.or_else(|| {
                 let s = state.borrow();
@@ -635,75 +659,86 @@ fn handle_command(
                     .map(|n| n.id)
             });
 
-            if let Some(target_id) = target_node_id {
-                let port_pairs: Vec<(u32, u32)> = {
-                    let s = state.borrow();
-                    // Collect and sort ports by channel for consistent ordering
-                    let mut out_ports: Vec<_> = s
-                        .ports
-                        .values()
-                        .filter(|p| {
-                            p.node_id == loopback_output_node
-                                && p.direction == PortDirection::Output
-                        })
-                        .collect();
-                    let mut in_ports: Vec<_> = s
-                        .ports
-                        .values()
-                        .filter(|p| p.node_id == target_id && p.direction == PortDirection::Input)
-                        .collect();
+            let port_pairs: Vec<(u32, u32)> = if let Some(target_id) = target_node_id {
+                let s = state.borrow();
+                let mut out_ports: Vec<_> = s
+                    .ports
+                    .values()
+                    .filter(|p| {
+                        p.node_id == loopback_output_node
+                            && p.direction == PortDirection::Output
+                    })
+                    .collect();
+                let mut in_ports: Vec<_> = s
+                    .ports
+                    .values()
+                    .filter(|p| p.node_id == target_id && p.direction == PortDirection::Input)
+                    .collect();
 
-                    // Sort by channel first, then by port ID for stability
-                    out_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
-                    in_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
+                out_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
+                in_ports.sort_by(|a, b| (&a.channel, a.id).cmp(&(&b.channel, b.id)));
 
-                    let mut pairs = Vec::new();
-                    let mut used_inputs: std::collections::HashSet<u32> =
-                        std::collections::HashSet::new();
+                let mut pairs = Vec::new();
+                let mut used_inputs: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
 
-                    // First pass: match by compatible channels
+                for out_port in &out_ports {
+                    for in_port in &in_ports {
+                        if used_inputs.contains(&in_port.id) {
+                            continue;
+                        }
+                        if out_port.channel.is_compatible(&in_port.channel) {
+                            pairs.push((out_port.id, in_port.id));
+                            used_inputs.insert(in_port.id);
+                            break;
+                        }
+                    }
+                }
+
+                if pairs.is_empty() {
                     for out_port in &out_ports {
                         for in_port in &in_ports {
                             if used_inputs.contains(&in_port.id) {
                                 continue;
                             }
-                            if out_port.channel.is_compatible(&in_port.channel) {
+                            let out_name = out_port.name.to_lowercase();
+                            let in_name = in_port.name.to_lowercase();
+                            let is_match = (out_name.contains("_0") && in_name.contains("_0"))
+                                || (out_name.contains("_1") && in_name.contains("_1"));
+                            if is_match {
                                 pairs.push((out_port.id, in_port.id));
                                 used_inputs.insert(in_port.id);
                                 break;
                             }
                         }
                     }
+                }
 
-                    // Second pass: try name-based matching
-                    if pairs.is_empty() {
-                        for out_port in &out_ports {
-                            for in_port in &in_ports {
-                                if used_inputs.contains(&in_port.id) {
-                                    continue;
-                                }
-                                let out_name = out_port.name.to_lowercase();
-                                let in_name = in_port.name.to_lowercase();
-                                let is_match = (out_name.contains("_0") && in_name.contains("_0"))
-                                    || (out_name.contains("_1") && in_name.contains("_1"));
-                                if is_match {
-                                    pairs.push((out_port.id, in_port.id));
-                                    used_inputs.insert(in_port.id);
-                                    break;
-                                }
-                            }
-                        }
+                if pairs.is_empty() && !out_ports.is_empty() && !in_ports.is_empty() {
+                    for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()) {
+                        pairs.push((out_port.id, in_port.id));
                     }
+                }
 
-                    // Fallback: pair by sorted position (deterministic order)
-                    if pairs.is_empty() && !out_ports.is_empty() && !in_ports.is_empty() {
-                        for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()) {
-                            pairs.push((out_port.id, in_port.id));
-                        }
+                pairs
+            } else {
+                Vec::new()
+            };
+
+            // Dispatch all CLI link operations to a background thread
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                for link_id in links_to_destroy {
+                    debug!("Destroying existing link {} from loopback output", link_id);
+                    if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                        warn!("Failed to destroy link {}: {}", link_id, e);
                     }
+                }
 
-                    pairs
-                };
+                if target_node_id.is_none() {
+                    warn!("No target device found for routing");
+                    let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
+                    return;
+                }
 
                 for (output_port, input_port) in port_pairs {
                     info!(
@@ -717,38 +752,37 @@ fn handle_command(
                         );
                     }
                 }
-            } else {
-                warn!("No target device found for routing");
-                let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
-            }
+            });
         }
 
         PwCommand::CreateRecordingSource { name } => {
             info!("Creating recording source: {}", name);
-            let event_tx = state.borrow().event_tx.clone();
-            match crate::audio::virtual_sink::create_virtual_source(&name) {
-                Ok(result) => {
-                    let _ = event_tx.send(PwEvent::RecordingSourceCreated {
-                        name,
-                        node_id: result.source_node_id,
-                    });
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                match crate::audio::virtual_sink::create_virtual_source(&name) {
+                    Ok(result) => {
+                        let _ = event_tx.send(PwEvent::RecordingSourceCreated {
+                            name,
+                            node_id: result.source_node_id,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to create recording source: {}",
+                            e
+                        )));
+                    }
                 }
-                Err(e) => {
-                    let _ = event_tx.send(PwEvent::Error(format!(
-                        "Failed to create recording source: {}",
-                        e
-                    )));
-                }
-            }
+            });
         }
 
         PwCommand::DestroyRecordingSource { node_id } => {
             info!("Destroying recording source: {}", node_id);
-            let event_tx = state.borrow().event_tx.clone();
-            if let Err(e) = crate::audio::virtual_sink::destroy_virtual_source(node_id) {
-                warn!("Failed to destroy recording source {}: {}", node_id, e);
-            }
-            let _ = event_tx.send(PwEvent::RecordingSourceDestroyed { node_id });
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                if let Err(e) = crate::audio::virtual_sink::destroy_virtual_source(node_id) {
+                    warn!("Failed to destroy recording source {}: {}", node_id, e);
+                }
+                let _ = event_tx.send(PwEvent::RecordingSourceDestroyed { node_id });
+            });
         }
     }
 }

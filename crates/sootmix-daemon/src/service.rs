@@ -10,7 +10,7 @@ use crate::config::{ConfigManager, MixerConfig, RoutingRulesConfig, SavedChannel
 use sootmix_ipc::{AppInfo, ChannelInfo, OutputInfo, RoutingRuleInfo};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
@@ -285,6 +285,10 @@ pub struct DaemonState {
     pub pending_auto_route_channels: HashSet<Uuid>,
     /// Counter for periodic app refresh
     pub refresh_counter: u32,
+    /// Time of last PipeWire reconnection attempt (for backoff)
+    pub last_reconnect_attempt: Option<Instant>,
+    /// Number of consecutive reconnection failures (for exponential backoff)
+    pub reconnect_failures: u32,
 }
 
 impl DaemonState {
@@ -309,6 +313,8 @@ impl DaemonState {
             auto_routed_apps: HashSet::new(),
             pending_auto_route_channels: HashSet::new(),
             refresh_counter: 0,
+            last_reconnect_attempt: None,
+            reconnect_failures: 0,
         }
     }
 
@@ -393,9 +399,6 @@ pub struct DaemonService {
     signal_tx: Option<tokio_mpsc::UnboundedSender<SignalEvent>>,
 }
 
-// Manual impl of Send for DaemonService
-// Safety: We only access pw_event_rx from the main thread
-unsafe impl Send for DaemonService {}
 
 impl DaemonService {
     pub fn new(
@@ -543,11 +546,18 @@ impl DaemonService {
         let events: Vec<PwEvent> = if let Some(ref rx) = self.pw_event_rx {
             rx.try_iter().collect()
         } else {
+            // No event receiver -- check if we need to reconnect
+            self.attempt_reconnect_if_needed();
             return;
         };
 
         for event in events {
             self.handle_pw_event(event);
+        }
+
+        // If PW disconnected during event processing, the receiver was dropped
+        if !self.state.pw_connected && self.pw_thread.is_none() {
+            self.attempt_reconnect_if_needed();
         }
 
         // Periodic app refresh - every ~2 seconds (20 iterations at 100ms each)
@@ -559,6 +569,55 @@ impl DaemonService {
         }
     }
 
+    /// Attempt PipeWire reconnection with exponential backoff.
+    fn attempt_reconnect_if_needed(&mut self) {
+        // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
+        let backoff = Duration::from_secs(
+            (2u64 << self.state.reconnect_failures.min(4)).min(30),
+        );
+
+        let should_attempt = match self.state.last_reconnect_attempt {
+            None => true,
+            Some(last) => last.elapsed() >= backoff,
+        };
+
+        if !should_attempt {
+            return;
+        }
+
+        self.state.last_reconnect_attempt = Some(Instant::now());
+        info!(
+            "Attempting PipeWire reconnection (attempt #{})...",
+            self.state.reconnect_failures + 1
+        );
+
+        match self.start_pipewire() {
+            Ok(()) => {
+                // Wait for PipeWire to discover the graph
+                self.wait_for_discovery();
+
+                // Restore channels
+                if let Err(e) = self.restore_channels() {
+                    warn!("Failed to restore channels after reconnection: {}", e);
+                }
+
+                self.state.reconnect_failures = 0;
+                self.state.last_reconnect_attempt = None;
+                info!("PipeWire reconnected successfully");
+            }
+            Err(e) => {
+                self.state.reconnect_failures += 1;
+                warn!(
+                    "PipeWire reconnection failed: {} (next attempt in {:?})",
+                    e,
+                    Duration::from_secs(
+                        (2u64 << self.state.reconnect_failures.min(4)).min(30)
+                    )
+                );
+            }
+        }
+    }
+
     fn handle_pw_event(&mut self, event: PwEvent) {
         match event {
             PwEvent::Connected => {
@@ -567,7 +626,19 @@ impl DaemonService {
             }
             PwEvent::Disconnected => {
                 self.state.pw_connected = false;
-                warn!("PipeWire disconnected");
+                warn!("PipeWire disconnected, will attempt reconnection");
+                // Drop the old PW thread so we can create a new one
+                self.pw_thread = None;
+                self.pw_event_rx = None;
+                // Clear stale PW state
+                self.state.pw_graph = PwGraphState::default();
+                for channel in &mut self.state.channels {
+                    channel.pw_sink_id = None;
+                    channel.pw_loopback_output_id = None;
+                }
+                self.state.auto_routed_apps.clear();
+                self.state.pending_auto_route_channels.clear();
+                self.state.master_recording_source_id = None;
             }
             PwEvent::NodeAdded(node) => {
                 let node_id = node.id;
