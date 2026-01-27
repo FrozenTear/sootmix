@@ -123,7 +123,8 @@ impl SootMix {
 
         // Open the initial window (daemon mode doesn't open one by default)
         let (window_id, open_window) = iced::window::open(iced::window::Settings {
-            size: iced::Size::new(900.0, 600.0),
+            size: iced::Size::new(900.0, 700.0),
+            min_size: Some(iced::Size::new(480.0, 700.0)),
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: "sootmix".to_string(),
                 ..Default::default()
@@ -1082,7 +1083,8 @@ impl SootMix {
 
                 info!("Tray: Opening new window");
                 let (window_id, open_task) = iced::window::open(iced::window::Settings {
-                    size: iced::Size::new(900.0, 600.0),
+                    size: iced::Size::new(900.0, 700.0),
+                    min_size: Some(iced::Size::new(480.0, 700.0)),
                     platform_specific: iced::window::settings::PlatformSpecific {
                         application_id: "sootmix".to_string(),
                         ..Default::default()
@@ -1845,6 +1847,8 @@ impl SootMix {
     }
 
     /// View the channel strips area.
+    ///
+    // TODO: Master position should be configurable (left/right) in the future.
     fn view_channel_strips(&self) -> Element<Message> {
         let dragging = self.state.dragging_app.as_ref();
         let editing = self.state.editing_channel.as_ref();
@@ -1853,7 +1857,7 @@ impl SootMix {
 
         // Build channel strip widgets
         let available_outputs = &self.state.available_outputs;
-        let mut strips: Vec<Element<Message>> = self
+        let channel_strips: Vec<Element<Message>> = self
             .state
             .channels
             .iter()
@@ -1863,35 +1867,38 @@ impl SootMix {
             })
             .collect();
 
-        // Add separator before master
-        strips.push(
-            container(Space::new().width(2))
-                .height(CHANNEL_STRIP_HEIGHT)
-                .style(|_| container::Style {
-                    background: Some(Background::Color(SURFACE_LIGHT)),
-                    ..container::Style::default()
-                })
-                .into(),
-        );
-
-        // Add master strip
-        strips.push(master_strip(
+        // Master strip (pinned to the left, outside scrollable area)
+        let master = master_strip(
             self.state.master_volume_db,
             self.state.master_muted,
             &self.state.available_outputs,
             self.state.output_device.as_deref(),
             &self.state.master_meter_display,
             self.state.master_recording_enabled,
-        ));
+        );
 
-        let strips_row = row(strips)
+        // Separator between master and channel strips
+        let separator: Element<Message> = container(Space::new().width(2))
+            .height(Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(SURFACE_LIGHT)),
+                ..container::Style::default()
+            })
+            .into();
+
+        // Channel strips in a scrollable row
+        let channels_row = row(channel_strips)
             .spacing(SPACING)
             .align_y(Alignment::Start);
 
-        scrollable(strips_row)
+        let scrollable_channels = scrollable(channels_row)
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::default(),
-            ))
+            ));
+
+        row![master, separator, scrollable_channels]
+            .spacing(SPACING)
+            .align_y(Alignment::Start)
             .into()
     }
 
@@ -2624,8 +2631,12 @@ impl SootMix {
         }
         self.tray_handle = None;
 
-        // Destroy all virtual sinks
-        crate::audio::virtual_sink::destroy_all_virtual_sinks();
+        // Only destroy virtual sinks if running standalone (not daemon mode).
+        // The daemon owns the pw-loopback processes; killing them here would
+        // break routing for other clients.
+        if !self.daemon_connected {
+            crate::audio::virtual_sink::destroy_all_virtual_sinks();
+        }
 
         // The PipeWire thread will be dropped automatically
     }
@@ -3480,11 +3491,12 @@ impl Drop for SootMix {
             }
         }
 
-        // Clean up managed virtual sinks (destroy_all_virtual_sinks only destroys sootmix.* sinks)
-        crate::audio::virtual_sink::destroy_all_virtual_sinks();
-
-        // Clean up EQ filter chains
-        filter_chain::destroy_all_eq_filters();
+        // Only destroy virtual sinks and EQ filters if running standalone.
+        // In daemon mode the daemon owns these processes.
+        if !self.daemon_connected {
+            crate::audio::virtual_sink::destroy_all_virtual_sinks();
+            filter_chain::destroy_all_eq_filters();
+        }
 
         // Shutdown PipeWire thread
         if let Some(thread) = self.pw_thread.take() {

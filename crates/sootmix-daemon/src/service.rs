@@ -692,6 +692,7 @@ impl DaemonService {
                 self.update_apps_and_emit_signals();
 
                 // Check if this was a channel's sink or loopback output and clear stale IDs
+                let mut channels_to_recreate: Vec<(Uuid, String)> = Vec::new();
                 for channel in &mut self.state.channels {
                     if channel.pw_sink_id == Some(id) {
                         warn!(
@@ -700,6 +701,9 @@ impl DaemonService {
                         );
                         channel.pw_sink_id = None;
                         channel.pw_loopback_output_id = None;
+                        if channel.is_managed {
+                            channels_to_recreate.push((channel.id, channel.name.clone()));
+                        }
                     } else if channel.pw_loopback_output_id == Some(id) {
                         warn!(
                             "Channel '{}' loopback output node {} was removed externally",
@@ -707,6 +711,15 @@ impl DaemonService {
                         );
                         channel.pw_loopback_output_id = None;
                     }
+                }
+
+                // Auto-recreate managed virtual sinks that were killed externally
+                for (channel_id, name) in channels_to_recreate {
+                    info!("Recreating virtual sink for channel '{}' after external removal", name);
+                    self.send_pw_command(PwCommand::CreateVirtualSink {
+                        channel_id,
+                        name,
+                    });
                 }
 
                 // When a hardware sink disappears, re-route orphaned channels

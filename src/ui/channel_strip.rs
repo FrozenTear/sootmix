@@ -313,42 +313,68 @@ pub fn channel_strip<'a>(
     let fx_btn = fx_button(id, plugin_count);
 
     // === OUTPUT DEVICE PICKER ===
+    let max_display_chars = 12;
     let output_options: Vec<String> = std::iter::once("Default".to_string())
         .chain(
             available_outputs
                 .iter()
                 .filter(|d| d.name != "system-default")
-                .map(|d| d.description.clone()),
+                .map(|d| truncate_string(&d.description, max_display_chars)),
         )
         .collect();
 
     let selected_output = output_device_name
         .clone()
+        .map(|name| {
+            if name == "Default" {
+                name
+            } else {
+                // Find matching device and truncate its description
+                available_outputs
+                    .iter()
+                    .find(|d| d.description == name || d.name == name)
+                    .map(|d| truncate_string(&d.description, max_display_chars))
+                    .unwrap_or_else(|| truncate_string(&name, max_display_chars))
+            }
+        })
         .or_else(|| Some("Default".to_string()));
 
     let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
     let output_picker: Element<'a, Message> = if !has_hw_outputs {
         Space::new().width(0).height(0).into()
     } else {
+        // Build a mapping from truncated display names back to full descriptions
+        let display_to_full: Vec<(String, String)> = available_outputs
+            .iter()
+            .filter(|d| d.name != "system-default")
+            .map(|d| (truncate_string(&d.description, max_display_chars), d.description.clone()))
+            .collect();
+
         column![
-            text("Output").size(TEXT_CAPTION).color(TEXT_DIM),
-            pick_list(output_options, selected_output, move |selection| {
+            text("Output").size(TEXT_SMALL).color(TEXT_DIM),
+            pick_list(output_options, selected_output, move |selection: String| {
                 let device = if selection == "Default" {
                     None
                 } else {
-                    Some(selection)
+                    // Map truncated display name back to full description
+                    let full_name = display_to_full
+                        .iter()
+                        .find(|(trunc, _)| *trunc == selection)
+                        .map(|(_, full)| full.clone())
+                        .unwrap_or(selection);
+                    Some(full_name)
                 };
                 Message::ChannelOutputDeviceChanged(id, device)
             },)
-                .text_size(TEXT_CAPTION)
-                .padding([SPACING_XS, SPACING_SM])
+                .text_size(TEXT_SMALL)
+                .padding([SPACING_SM, SPACING_SM])
                 .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
                 .style(|_theme: &Theme, _status| {
                     pick_list::Style {
                         text_color: TEXT,
                         placeholder_color: TEXT_DIM,
-                        handle_color: TEXT_DIM,
-                        background: Background::Color(SURFACE),
+                        handle_color: SOOTMIX_DARK.text_muted,
+                        background: Background::Color(SOOTMIX_DARK.surface_raised),
                         border: Border::default()
                             .rounded(RADIUS_SM)
                             .color(SOOTMIX_DARK.border_default)
@@ -613,13 +639,14 @@ pub fn master_strip<'a>(
     // === OUTPUT DEVICE PICKER ===
     // Build display labels and a mapping to the name/sentinel to send.
     // Filter out the synthetic "system-default" entry since we add it manually.
+    let max_display_chars = 12;
     let hw_outputs: Vec<&OutputDevice> = available_outputs
         .iter()
         .filter(|d| d.name != "system-default")
         .collect();
 
     let output_options: Vec<String> = std::iter::once("System Default".to_string())
-        .chain(hw_outputs.iter().map(|d| d.description.clone()))
+        .chain(hw_outputs.iter().map(|d| truncate_string(&d.description, max_display_chars)))
         .collect();
 
     // Map the selected_output (stored as name/sentinel) to the display label
@@ -627,25 +654,25 @@ pub fn master_strip<'a>(
         if s == "system-default" {
             "System Default".to_string()
         } else {
-            // Match by name or description to find the display label
+            // Match by name or description to find the display label (truncated)
             hw_outputs
                 .iter()
                 .find(|d| d.name == s || d.description == s)
-                .map(|d| d.description.clone())
-                .unwrap_or_else(|| s.to_string())
+                .map(|d| truncate_string(&d.description, max_display_chars))
+                .unwrap_or_else(|| truncate_string(s, max_display_chars))
         }
     });
 
     let has_any_outputs = !hw_outputs.is_empty();
     let output_picker: Element<'a, Message> = if !has_any_outputs && selected.is_none() {
-        text("No outputs").size(TEXT_CAPTION).color(TEXT_DIM).into()
+        text("No outputs").size(TEXT_SMALL).color(TEXT_DIM).into()
     } else {
         let outputs_for_closure: Vec<(String, String)> = hw_outputs
             .iter()
-            .map(|d| (d.description.clone(), d.name.clone()))
+            .map(|d| (truncate_string(&d.description, max_display_chars), d.name.clone()))
             .collect();
         column![
-            text("Output").size(TEXT_CAPTION).color(TEXT_DIM),
+            text("Output").size(TEXT_SMALL).color(TEXT_DIM),
             pick_list(
                 output_options,
                 selected,
@@ -653,10 +680,10 @@ pub fn master_strip<'a>(
                     if selection == "System Default" {
                         Message::OutputDeviceChanged("system-default".to_string())
                     } else {
-                        // Send the device name (not description) for specific devices
+                        // Map truncated display name back to device name
                         let device_name = outputs_for_closure
                             .iter()
-                            .find(|(desc, _)| *desc == selection)
+                            .find(|(trunc, _)| *trunc == selection)
                             .map(|(_, name)| name.clone())
                             .unwrap_or(selection);
                         Message::OutputDeviceChanged(device_name)
@@ -665,14 +692,14 @@ pub fn master_strip<'a>(
             )
             .placeholder("Select...")
             .text_size(TEXT_SMALL)
-            .padding([SPACING_XS, SPACING_SM])
+            .padding([SPACING_SM, SPACING_SM])
             .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
             .style(|_theme: &Theme, _status| {
                 pick_list::Style {
                     text_color: TEXT,
                     placeholder_color: TEXT_DIM,
-                    handle_color: TEXT_DIM,
-                    background: Background::Color(SURFACE),
+                    handle_color: SOOTMIX_DARK.text_muted,
+                    background: Background::Color(SOOTMIX_DARK.surface_raised),
                     border: Border::default()
                         .rounded(RADIUS_SM)
                         .color(SOOTMIX_DARK.border_default)
