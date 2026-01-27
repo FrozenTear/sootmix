@@ -716,13 +716,21 @@ fn handle_command(
             };
 
             let target_node_id = target_device_id.or_else(|| {
-                let s = state.borrow();
-                s.nodes
-                    .values()
-                    .find(|n| {
-                        n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix.")
-                    })
-                    .map(|n| n.id)
+                // Use the WirePlumber default sink as fallback instead of
+                // picking an arbitrary AudioSink (which could be a sootmix
+                // virtual sink or the wrong device).
+                crate::audio::routing::get_default_sink_id().and_then(|id| {
+                    let s = state.borrow();
+                    // Verify it exists in our graph and isn't a sootmix sink
+                    if s.nodes.get(&id).map_or(false, |n| {
+                        n.media_class == MediaClass::AudioSink
+                            && !n.name.starts_with("sootmix.")
+                    }) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
             });
 
             let port_pairs: Vec<(u32, u32)> = if let Some(target_id) = target_node_id {

@@ -136,6 +136,34 @@ pub fn set_stream_target(stream_node_id: u32, target_sink_id: u32) -> Result<(),
     Ok(())
 }
 
+/// Get the WirePlumber default audio sink node ID.
+///
+/// Uses `wpctl inspect @DEFAULT_AUDIO_SINK@` to find the system's current
+/// default output device. Returns `None` if the command fails or no default
+/// is set.
+pub fn get_default_sink_id() -> Option<u32> {
+    let output = Command::new("wpctl")
+        .args(["inspect", "@DEFAULT_AUDIO_SINK@"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // First line looks like: "id 42, type PipeWire:Interface:Node/3"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?;
+    let id_str = first_line
+        .strip_prefix("id ")?
+        .split(',')
+        .next()?
+        .trim();
+    let id = id_str.parse::<u32>().ok()?;
+    debug!("WirePlumber default sink: node {}", id);
+    Some(id)
+}
+
 /// Clear the target sink for a stream node, allowing WirePlumber to manage it again.
 pub fn clear_stream_target(stream_node_id: u32) -> Result<(), RoutingError> {
     info!("Clearing stream {} target", stream_node_id);

@@ -645,13 +645,41 @@ impl DaemonService {
             PwEvent::NodeAdded(node) => {
                 let node_id = node.id;
                 let node_name = node.name.clone();
+                let node_class = node.media_class.clone();
+                let is_hw_sink = node_class == MediaClass::AudioSink
+                    && !node.name.starts_with("sootmix.");
+                let node_desc = node.description.clone();
+
+                if is_hw_sink {
+                    info!(
+                        "Hardware sink appeared: id={}, name='{}', desc='{}', class={:?}",
+                        node_id, node_name, node_desc, node_class
+                    );
+                }
+
                 self.state.pw_graph.nodes.insert(node.id, node);
                 self.update_apps_and_emit_signals();
 
                 // Auto-route apps that match saved assignments
                 self.try_auto_route_app(node_id, &node_name);
+
+                // When a hardware sink (re)appears (e.g. Bluetooth reconnect),
+                // re-route any channels whose output device matches this sink.
+                if is_hw_sink {
+                    self.try_reroute_channels_to_device(node_id, &node_name, &node_desc);
+                }
             }
             PwEvent::NodeRemoved(id) => {
+                if let Some(removed) = self.state.pw_graph.nodes.get(&id) {
+                    if removed.media_class == MediaClass::AudioSink
+                        && !removed.name.starts_with("sootmix.")
+                    {
+                        info!(
+                            "Hardware sink removed: id={}, name='{}', desc='{}'",
+                            id, removed.name, removed.description
+                        );
+                    }
+                }
                 self.state.pw_graph.nodes.remove(&id);
                 self.update_apps_and_emit_signals();
 
@@ -1287,14 +1315,29 @@ impl DaemonService {
         Ok(())
     }
 
-    /// Get the node ID of the master output device, if configured.
+    /// Get the node ID of the master output device.
+    ///
+    /// Checks the configured master output name first, then falls back to the
+    /// WirePlumber system default sink. This ensures channels always route to
+    /// a valid hardware device even if the configured device isn't available.
     fn get_master_output_device_id(&self) -> Option<u32> {
-        let name = self.state.master_output.as_ref()?;
-        let outputs = self.state.get_outputs();
-        outputs
-            .iter()
-            .find(|o| o.description == *name || o.name == *name)
-            .map(|o| o.node_id)
+        // Try the configured master output first
+        if let Some(name) = self.state.master_output.as_ref() {
+            let outputs = self.state.get_outputs();
+            if let Some(output) = outputs
+                .iter()
+                .find(|o| o.description == *name || o.name == *name)
+            {
+                return Some(output.node_id);
+            }
+            debug!(
+                "Configured master output '{}' not found, falling back to system default",
+                name
+            );
+        }
+
+        // Fall back to WirePlumber default sink
+        crate::audio::routing::get_default_sink_id()
     }
 
     pub fn set_master_recording(&mut self, enabled: bool) -> Result<(), ServiceError> {
@@ -1483,5 +1526,113 @@ impl DaemonService {
 
         // Remove from pending set (we've tried, links are created as ports become available)
         self.state.pending_auto_route_channels.remove(&channel_id);
+    }
+
+    /// Re-route channel loopback outputs when a hardware sink (re)appears.
+    ///
+    /// Handles Bluetooth reconnects, USB audio plugged in, etc.
+    ///
+    /// Strategy:
+    /// 1. If a channel has a per-channel output matching this device, re-route it
+    /// 2. If the master output matches this device, re-route channels using master
+    /// 3. For any channel whose loopback output has no links (orphaned), re-route
+    ///    to the best available target (configured master or system default)
+    fn try_reroute_channels_to_device(
+        &mut self,
+        device_node_id: u32,
+        device_name: &str,
+        device_desc: &str,
+    ) {
+        let matches_device = |configured_name: &str| -> bool {
+            configured_name == device_name || configured_name == device_desc
+        };
+
+        // Check if this device matches the master output
+        let master_matches = self
+            .state
+            .master_output
+            .as_ref()
+            .map(|name| matches_device(name))
+            .unwrap_or(false);
+
+        // Collect loopback IDs that need re-routing
+        info!(
+            "try_reroute_channels_to_device: device_name='{}', device_desc='{}', master_output={:?}, master_matches={}",
+            device_name, device_desc, self.state.master_output, master_matches
+        );
+
+        let mut loopbacks_to_route: Vec<(u32, String, Option<u32>)> = Vec::new();
+
+        for c in &self.state.channels {
+            let loopback_id = match c.pw_loopback_output_id {
+                Some(id) => id,
+                None => {
+                    debug!(
+                        "Channel '{}': no loopback output ID, skipping",
+                        c.name
+                    );
+                    continue;
+                }
+            };
+
+            // Per-channel output takes priority
+            if let Some(ref dev_name) = c.output_device_name {
+                if matches_device(dev_name) {
+                    loopbacks_to_route.push((
+                        loopback_id,
+                        c.name.clone(),
+                        Some(device_node_id),
+                    ));
+                    continue;
+                }
+            }
+
+            // Master output matches this device
+            if master_matches && c.output_device_name.is_none() {
+                loopbacks_to_route.push((
+                    loopback_id,
+                    c.name.clone(),
+                    Some(device_node_id),
+                ));
+                continue;
+            }
+
+            // Check if this channel's loopback output has no links (orphaned).
+            // This catches the case where no master output is configured, or
+            // the device was disconnected and links were destroyed.
+            if c.output_device_name.is_none() {
+                let has_links = self
+                    .state
+                    .pw_graph
+                    .links
+                    .values()
+                    .any(|l| l.output_node == loopback_id);
+
+                debug!(
+                    "Channel '{}': loopback_id={}, has_links={}, output_device=None",
+                    c.name, loopback_id, has_links
+                );
+
+                if !has_links {
+                    loopbacks_to_route.push((loopback_id, c.name.clone(), None));
+                }
+            }
+        }
+
+        if loopbacks_to_route.is_empty() {
+            info!("try_reroute_channels_to_device: no channels need re-routing");
+        }
+
+        for (loopback_id, channel_name, target) in loopbacks_to_route {
+            let target_id = target.or_else(|| self.get_master_output_device_id());
+            info!(
+                "Re-routing channel '{}' loopback output to device node {:?} (trigger: '{}' node {})",
+                channel_name, target_id, device_desc, device_node_id
+            );
+            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                loopback_output_node: loopback_id,
+                target_device_id: target_id,
+            });
+        }
     }
 }
