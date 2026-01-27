@@ -13,6 +13,7 @@ mod daemon_client;
 mod message;
 mod plugins;
 mod realtime;
+mod single_instance;
 mod state;
 mod tray;
 mod ui;
@@ -29,6 +30,12 @@ fn main() -> iced::Result {
         .init();
 
     info!("Starting SootMix");
+
+    // Single-instance check: if another UI is already running, activate it and exit
+    if single_instance::try_activate_existing() {
+        info!("Another SootMix UI instance is already running — activated it");
+        return Ok(());
+    }
 
     // Run as daemon so closing windows doesn't exit the app (for tray support)
     iced::daemon(SootMix::new, SootMix::update, SootMix::view)

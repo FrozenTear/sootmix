@@ -55,6 +55,8 @@ pub struct SootMix {
     main_window_id: Option<iced::window::Id>,
     /// Whether we're connected to the daemon (vs running standalone).
     daemon_connected: bool,
+    /// Receiver for single-instance activation requests from new launches.
+    activation_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl SootMix {
@@ -104,6 +106,10 @@ impl SootMix {
         let mut plugin_filter_manager = PluginFilterManager::new();
         plugin_filter_manager.set_plugin_instances(plugin_manager.shared_instances());
 
+        // Start single-instance activation listener so subsequent launches
+        // activate our window instead of creating duplicate tray icons
+        let activation_rx = crate::single_instance::start_activation_listener();
+
         // Start system tray
         let (tray_rx, tray_handle) = match crate::tray::start_tray() {
             Some((rx, handle)) => (Some(rx), Some(handle)),
@@ -141,6 +147,7 @@ impl SootMix {
             tray_rx,
             main_window_id: Some(window_id),
             daemon_connected: false,
+            activation_rx,
         };
 
         (app, open_window.discard())
@@ -975,6 +982,11 @@ impl SootMix {
                 // Poll tray messages
                 if let Some(tray_msgs) = self.poll_tray_messages() {
                     return tray_msgs;
+                }
+
+                // Poll single-instance activation requests
+                if let Some(task) = self.poll_activation() {
+                    return task;
                 }
 
                 // Restore config after PipeWire discovery delay (~200ms)
@@ -2577,6 +2589,24 @@ impl SootMix {
         }
 
         None
+    }
+
+    /// Poll for activation requests from new app launches.
+    fn poll_activation(&mut self) -> Option<Task<Message>> {
+        let rx = self.activation_rx.as_ref()?;
+
+        match rx.try_recv() {
+            Ok(()) => {
+                info!("Another instance requested activation — showing window");
+                Some(Task::done(Message::TrayShowWindow))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                warn!("Activation listener channel disconnected");
+                self.activation_rx = None;
+                None
+            }
+        }
     }
 
     /// Clean up resources before exiting.
