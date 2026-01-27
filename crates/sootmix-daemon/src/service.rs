@@ -352,7 +352,7 @@ impl DaemonState {
             .iter()
             .filter(|node| {
                 let name = &node.name;
-                !name.starts_with("sootmix.")
+                !name.contains("sootmix.")
                     && !name.starts_with("LB-")
                     && !name.contains("loopback")
                     && !name.starts_with("filter-chain")
