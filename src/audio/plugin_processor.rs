@@ -83,6 +83,9 @@ impl ChannelPluginProcessor {
     }
 }
 
+/// Number of audio channels (stereo).
+const NUM_CHANNELS: usize = 2;
+
 /// Manages plugin audio processing for all channels.
 pub struct PluginProcessorManager {
     /// Per-channel processors.
@@ -91,14 +94,21 @@ pub struct PluginProcessorManager {
     sample_rate: f32,
     /// Block size for audio processing.
     block_size: usize,
+    /// Pre-allocated ping-pong buffer A for RT-safe plugin chain processing.
+    temp_a: Vec<Vec<f32>>,
+    /// Pre-allocated ping-pong buffer B for RT-safe plugin chain processing.
+    temp_b: Vec<Vec<f32>>,
 }
 
 impl PluginProcessorManager {
     pub fn new() -> Self {
+        let block_size = 512;
         Self {
             processors: HashMap::new(),
             sample_rate: 48000.0,
-            block_size: 512,
+            block_size,
+            temp_a: vec![vec![0.0f32; block_size]; NUM_CHANNELS],
+            temp_b: vec![vec![0.0f32; block_size]; NUM_CHANNELS],
         }
     }
 
@@ -106,6 +116,8 @@ impl PluginProcessorManager {
     pub fn set_audio_params(&mut self, sample_rate: f32, block_size: usize) {
         self.sample_rate = sample_rate;
         self.block_size = block_size;
+        self.temp_a = vec![vec![0.0f32; block_size]; NUM_CHANNELS];
+        self.temp_b = vec![vec![0.0f32; block_size]; NUM_CHANNELS];
         debug!(
             "Plugin processor audio params: {} Hz, {} samples",
             sample_rate, block_size
@@ -186,7 +198,7 @@ impl PluginProcessorManager {
     /// * `Ok(false)` if channel has no active plugins or lock was contended (passthrough)
     /// * `Err` on processing error
     pub fn process_audio(
-        &self,
+        &mut self,
         channel_id: Uuid,
         instances: &SharedPluginInstances,
         inputs: &[&[f32]],
@@ -215,43 +227,56 @@ impl PluginProcessorManager {
             }
         };
 
-        // Process through plugin chain
         let num_samples = inputs.first().map(|b| b.len()).unwrap_or(0);
 
-        // We need intermediate buffers for chaining plugins
-        // For now, use a simple approach with temp buffers
-        let mut temp_buffers: Vec<Vec<f32>> = inputs.iter().map(|b| b.to_vec()).collect();
+        // Ensure pre-allocated buffers are large enough (rare resize for unexpected block sizes)
+        for buf in self.temp_a.iter_mut().chain(self.temp_b.iter_mut()) {
+            if buf.len() < num_samples {
+                buf.resize(num_samples, 0.0);
+            }
+        }
 
+        // Copy input into temp_a (current read buffer)
+        for (src, dst) in inputs.iter().zip(self.temp_a.iter_mut()) {
+            dst[..num_samples].copy_from_slice(src);
+        }
+
+        // Ping-pong: read from temp_a, write to temp_b, then swap
+        let mut read_a = true;
         for &instance_id in &processor.plugin_instances {
             let instance = match instances_guard.get_mut(&instance_id) {
                 Some(i) => i,
-                None => {
-                    // Plugin not found, skip it
-                    continue;
-                }
+                None => continue,
             };
 
-            // Check bypass state (would need to track this per-instance)
-            // For now, always process
+            let (read_bufs, write_bufs) = if read_a {
+                (&mut self.temp_a as *mut Vec<Vec<f32>>, &mut self.temp_b as *mut Vec<Vec<f32>>)
+            } else {
+                (&mut self.temp_b as *mut Vec<Vec<f32>>, &mut self.temp_a as *mut Vec<Vec<f32>>)
+            };
 
-            // Create input/output slices for this plugin
-            let input_slices: Vec<&[f32]> = temp_buffers.iter().map(|b| b.as_slice()).collect();
+            // SAFETY: temp_a and temp_b are distinct fields; we need simultaneous
+            // read and write access to different buffers for plugin processing.
+            let (read_bufs, write_bufs) = unsafe { (&*read_bufs, &mut *write_bufs) };
 
-            // Create output buffers
-            let mut output_vecs: Vec<Vec<f32>> = vec![vec![0.0; num_samples]; outputs.len()];
-            let mut output_slices: Vec<&mut [f32]> =
-                output_vecs.iter_mut().map(|b| b.as_mut_slice()).collect();
+            let input_slices: [&[f32]; 2] = [
+                &read_bufs[0][..num_samples],
+                &read_bufs[1][..num_samples],
+            ];
+            let (wb0, wb1) = write_bufs.split_at_mut(1);
+            let mut output_slices: [&mut [f32]; 2] = [
+                &mut wb0[0][..num_samples],
+                &mut wb1[0][..num_samples],
+            ];
 
-            // Process through plugin
             instance.process(&input_slices, &mut output_slices);
-
-            // Swap buffers for next plugin in chain
-            temp_buffers = output_vecs;
+            read_a = !read_a;
         }
 
-        // Copy final output
-        for (temp, output) in temp_buffers.iter().zip(outputs.iter_mut()) {
-            output.copy_from_slice(temp);
+        // Copy from the last-written buffer to output
+        let final_bufs = if read_a { &self.temp_a } else { &self.temp_b };
+        for (temp, output) in final_bufs.iter().zip(outputs.iter_mut()) {
+            output.copy_from_slice(&temp[..num_samples]);
         }
 
         Ok(true)

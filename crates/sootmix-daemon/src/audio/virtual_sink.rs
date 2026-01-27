@@ -265,7 +265,7 @@ pub fn destroy_all_virtual_sinks() {
     // This handles the case where PipeWire restarted and pw-loopback auto-restarted
     // with a new PID that we don't have tracked
     let _ = std::process::Command::new("pkill")
-        .args(["-f", "pw-loopback.*sootmix"])
+        .args(["-f", "pw-loopback.*--name.*sootmix\\."])
         .output();
 
     // Give processes time to die and nodes to be removed

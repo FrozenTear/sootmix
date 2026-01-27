@@ -173,17 +173,21 @@ pub struct PluginInstance {
     activated: bool,
     /// Current sample rate.
     sample_rate: f32,
+    /// Source path of the loaded library (for unloading from NativePluginLoader).
+    source_path: PathBuf,
 }
 
 impl PluginInstance {
     /// Create a new plugin instance.
     pub(crate) fn new(metadata: PluginMetadata, plugin: PluginBox) -> Self {
+        let source_path = metadata.path.clone();
         Self {
             id: Uuid::new_v4(),
             metadata,
             plugin,
             activated: false,
             sample_rate: 48000.0,
+            source_path,
         }
     }
 
@@ -535,15 +539,34 @@ impl PluginManager {
     }
 
     /// Unload a plugin instance.
+    ///
+    /// Removes the instance first (dropping the PluginBox), then unloads the
+    /// native library. The instance must be dropped before the library to avoid
+    /// use-after-free of plugin vtable pointers.
     pub fn unload(&mut self, id: Uuid) -> bool {
-        let mut instances = self.instances.lock();
-        if let Some(mut instance) = instances.remove(&id) {
-            instance.deactivate();
-            info!("Unloaded plugin: {}", id);
-            true
-        } else {
-            false
+        let (source_path, plugin_type) = {
+            let mut instances = self.instances.lock();
+            match instances.remove(&id) {
+                Some(mut instance) => {
+                    instance.deactivate();
+                    let path = instance.source_path.clone();
+                    let ptype = instance.metadata.plugin_type;
+                    info!("Unloaded plugin: {}", id);
+                    // instance (and its PluginBox) is dropped here
+                    (path, ptype)
+                }
+                None => return false,
+            }
+        };
+
+        // Now safe to unload the library since the PluginBox has been dropped
+        if plugin_type == PluginType::Native {
+            if self.native_loader.unload(&source_path) {
+                debug!("Unloaded native library: {:?}", source_path);
+            }
         }
+
+        true
     }
 
     /// Get plugin info by instance ID.

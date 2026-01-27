@@ -53,6 +53,11 @@ struct StreamUserData {
     is_capture: bool,
     /// Channel ID for logging.
     channel_id: Uuid,
+    /// Pre-allocated deinterleave buffers for RT-safe capture processing.
+    left_in: Vec<f32>,
+    right_in: Vec<f32>,
+    left_out: Vec<f32>,
+    right_out: Vec<f32>,
 }
 
 /// Simple audio ring buffer for passing samples between streams.
@@ -218,6 +223,10 @@ impl PluginFilterStreams {
             meter_levels: meter_levels.clone(),
             is_capture: true,
             channel_id,
+            left_in: vec![0.0f32; block_size],
+            right_in: vec![0.0f32; block_size],
+            left_out: vec![0.0f32; block_size],
+            right_out: vec![0.0f32; block_size],
         };
 
         let capture_listener = capture_stream
@@ -238,6 +247,10 @@ impl PluginFilterStreams {
             meter_levels: None,
             is_capture: false,
             channel_id,
+            left_in: Vec::new(),
+            right_in: Vec::new(),
+            left_out: Vec::new(),
+            right_out: Vec::new(),
         };
 
         let playback_listener = playback_stream
@@ -409,29 +422,35 @@ fn process_capture(user_data: &mut StreamUserData, samples: &mut [f32], n_frames
         trace!("Applied {} parameter updates", updates);
     }
 
-    // Prepare input/output buffers for processing
-    // Split interleaved into separate channels
-    let mut left_in = vec![0.0f32; n_frames];
-    let mut right_in = vec![0.0f32; n_frames];
-    let mut left_out = vec![0.0f32; n_frames];
-    let mut right_out = vec![0.0f32; n_frames];
+    // Ensure pre-allocated buffers are large enough (rare edge case)
+    if user_data.left_in.len() < n_frames {
+        user_data.left_in.resize(n_frames, 0.0);
+        user_data.right_in.resize(n_frames, 0.0);
+        user_data.left_out.resize(n_frames, 0.0);
+        user_data.right_out.resize(n_frames, 0.0);
+    }
 
-    // Deinterleave input
+    // Deinterleave input into pre-allocated buffers
+    let left_in = &mut user_data.left_in[..n_frames];
+    let right_in = &mut user_data.right_in[..n_frames];
+    let left_out = &mut user_data.left_out[..n_frames];
+    let right_out = &mut user_data.right_out[..n_frames];
+
     for i in 0..n_frames {
         left_in[i] = samples[i * NUM_CHANNELS];
         right_in[i] = samples[i * NUM_CHANNELS + 1];
     }
 
-    // Process through plugin chain
-    let inputs: Vec<&[f32]> = vec![&left_in, &right_in];
-    let mut outputs: Vec<&mut [f32]> = vec![&mut left_out, &mut right_out];
+    // Process through plugin chain using stack arrays for slice refs
+    let inputs: [&[f32]; 2] = [left_in, right_in];
+    let mut outputs: [&mut [f32]; 2] = [left_out, right_out];
 
     context.process_audio(&inputs, &mut outputs);
 
     // Interleave output back into samples
     for i in 0..n_frames {
-        samples[i * NUM_CHANNELS] = left_out[i];
-        samples[i * NUM_CHANNELS + 1] = right_out[i];
+        samples[i * NUM_CHANNELS] = outputs[0][i];
+        samples[i * NUM_CHANNELS + 1] = outputs[1][i];
     }
 
     // Calculate peak levels for metering (RT-safe)

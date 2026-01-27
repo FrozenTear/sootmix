@@ -107,9 +107,10 @@ impl ChannelState {
     }
 
     fn meter_levels_db(&self) -> (f32, f32) {
+        // NOTE: Keep in sync with canonical implementation in src/audio/control.rs
         fn linear_to_db(linear: f32) -> f32 {
             if linear <= 0.0 {
-                -60.0
+                -96.0
             } else {
                 20.0 * linear.log10()
             }
@@ -129,8 +130,9 @@ impl ChannelState {
     }
 }
 
+// NOTE: Keep in sync with canonical implementation in src/audio/control.rs
 fn db_to_linear(db: f32) -> f32 {
-    if db <= -60.0 {
+    if db <= -96.0 {
         0.0
     } else {
         10.0_f32.powf(db / 20.0)

@@ -217,8 +217,10 @@ fn serialize_object(object: Object) -> ControlResult<Vec<u8>> {
 }
 
 /// Helper to convert dB to linear volume.
+///
+/// Uses -96 dB as the silence floor, matching the D-Bus volume validation range.
 pub fn db_to_linear(db: f32) -> f32 {
-    if db <= -60.0 {
+    if db <= -96.0 {
         0.0
     } else {
         10.0_f32.powf(db / 20.0)
@@ -226,9 +228,11 @@ pub fn db_to_linear(db: f32) -> f32 {
 }
 
 /// Helper to convert linear volume to dB.
+///
+/// Uses -96 dB as the silence floor, matching the D-Bus volume validation range.
 pub fn linear_to_db(linear: f32) -> f32 {
     if linear <= 0.0 {
-        -60.0
+        -96.0
     } else {
         20.0 * linear.log10()
     }
@@ -267,8 +271,11 @@ mod tests {
         // -6 dB ≈ 0.5 linear
         assert!((db_to_linear(-6.0) - 0.501).abs() < 0.01);
 
-        // -60 dB = 0.0 (silence)
-        assert_eq!(db_to_linear(-60.0), 0.0);
+        // -96 dB = 0.0 (silence floor, matches D-Bus validation range)
+        assert_eq!(db_to_linear(-96.0), 0.0);
+
+        // -60 dB should still produce a non-zero value
+        assert!(db_to_linear(-60.0) > 0.0);
 
         // Round trip
         let original = 0.75;

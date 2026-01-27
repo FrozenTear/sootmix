@@ -242,7 +242,7 @@ pub fn destroy_all_virtual_sinks() {
     // Also kill any pw-loopback processes that may have respawned
     // with a new PID that we don't have tracked
     if let Err(e) = Command::new("pkill")
-        .args(["-f", "pw-loopback.*sootmix"])
+        .args(["-f", "pw-loopback.*--name.*sootmix\\."])
         .output()
     {
         warn!("pkill fallback failed: {}", e);
