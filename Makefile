@@ -1,9 +1,9 @@
-PREFIX ?= /usr
+PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
 DESTDIR ?=
 
-.PHONY: all build install uninstall clean
+.PHONY: all build install uninstall clean deploy
 
 all: build
 
@@ -37,6 +37,16 @@ uninstall:
 	rm -f $(DESTDIR)$(DATADIR)/applications/sootmix.desktop
 	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/sootmix.svg
 	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/sootmix-daemon.service
+
+deploy: build
+	sudo install -Dm755 target/release/sootmix $(BINDIR)/sootmix
+	sudo install -Dm755 target/release/sootmix-daemon $(BINDIR)/sootmix-daemon
+	@if systemctl --user is-active sootmix-daemon.service >/dev/null 2>&1; then \
+		systemctl --user restart sootmix-daemon.service; \
+		echo "sootmix-daemon restarted."; \
+	else \
+		echo "sootmix-daemon service not active, skipping restart."; \
+	fi
 
 clean:
 	cargo clean
