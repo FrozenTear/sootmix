@@ -21,9 +21,9 @@ use pipewire::properties::properties;
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::Pod;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -334,6 +334,9 @@ struct PwThreadState {
     event_tx: Rc<mpsc::Sender<PwEvent>>,
     /// Last CLI command time per node (for throttling fallback).
     cli_last_cmd: HashMap<u32, Instant>,
+    /// Node IDs currently being processed by CLI background threads.
+    /// Prevents concurrent CLI operations on the same node.
+    cli_in_flight: Arc<Mutex<HashSet<u32>>>,
     /// PipeWire sample rate (queried on init, defaults to 48000).
     sample_rate: f32,
     /// PipeWire block size (quantum, defaults to 512).
@@ -358,6 +361,7 @@ impl PwThreadState {
             shared_plugin_instances: None,
             event_tx,
             cli_last_cmd: HashMap::new(),
+            cli_in_flight: Arc::new(Mutex::new(HashSet::new())),
             sample_rate,
             block_size,
         }
@@ -585,6 +589,34 @@ where
     thread::spawn(move || work(tx));
 }
 
+/// Spawn a CLI background thread for a specific node, with in-flight tracking.
+/// If the node is already being processed by another CLI thread, the work is skipped.
+fn spawn_cli_work_for_node<F>(
+    event_tx: &Rc<mpsc::Sender<PwEvent>>,
+    in_flight: &Arc<Mutex<HashSet<u32>>>,
+    node_id: u32,
+    work: F,
+) where
+    F: FnOnce(mpsc::Sender<PwEvent>) + Send + 'static,
+{
+    {
+        let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if set.contains(&node_id) {
+            trace!("Node {} already has CLI operation in-flight, skipping", node_id);
+            return;
+        }
+        set.insert(node_id);
+    }
+
+    let tx = mpsc::Sender::clone(event_tx);
+    let in_flight_clone = Arc::clone(in_flight);
+    thread::spawn(move || {
+        work(tx);
+        let mut set = in_flight_clone.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&node_id);
+    });
+}
+
 /// Handle a command from the UI thread.
 fn handle_command(
     cmd: PwCommand,
@@ -765,7 +797,8 @@ fn handle_command(
                     // Node not bound or native failed, use throttled CLI fallback
                     if state.borrow_mut().should_run_cli(node_id) {
                         debug!("Native volume failed ({}), using CLI fallback", e);
-                        spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                        let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+                        spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
                             if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
                                 error!("CLI volume control also failed: {}", e2);
                             }
@@ -788,7 +821,8 @@ fn handle_command(
                     // Node not bound or native failed, use throttled CLI fallback
                     if state.borrow_mut().should_run_cli(node_id) {
                         debug!("Native mute failed ({}), using CLI fallback", e);
-                        spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                        let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+                        spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
                             if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
                                 error!("CLI mute control also failed: {}", e2);
                             }
@@ -818,7 +852,8 @@ fn handle_command(
                     // Node not bound or native failed, use throttled CLI fallback
                     if state.borrow_mut().should_run_cli(node_id) {
                         debug!("Native volume+mute failed ({}), using CLI fallback", e);
-                        spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                        let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+                        spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
                             if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
                                 warn!("CLI volume control failed: {}", e2);
                             }

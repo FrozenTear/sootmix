@@ -364,7 +364,8 @@ impl Default for PluginFilterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
 
     #[test]
     fn test_filter_stream_creation() {

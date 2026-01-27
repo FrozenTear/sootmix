@@ -4,7 +4,7 @@
 
 //! Plugin manager - discovery, lifecycle, and registry.
 
-use super::{native::NativePluginLoader, PluginFilter, PluginLoadError, PluginMetadata, PluginResult, PluginType};
+use super::{native::{NativePluginLoader, check_plugin_permissions}, PluginFilter, PluginLoadError, PluginMetadata, PluginResult, PluginType};
 #[cfg(feature = "lv2-plugins")]
 use super::lv2::Lv2PluginLoader;
 #[cfg(feature = "vst3-plugins")]
@@ -107,6 +107,12 @@ impl PluginRegistry {
                     "wasm" => PluginType::Wasm,
                     _ => continue,
                 };
+
+                // Check file permissions before registering
+                if let Err(e) = check_plugin_permissions(&path) {
+                    warn!("Skipping plugin with insecure permissions: {:?}: {}", path, e);
+                    continue;
+                }
 
                 let metadata = PluginMetadata {
                     path: path.clone(),

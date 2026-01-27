@@ -22,6 +22,32 @@ pub enum VirtualSinkError {
     InvalidJson,
 }
 
+/// Check availability of PipeWire CLI tools at startup.
+/// Logs warnings for any missing tools with guidance.
+pub fn check_pipewire_tools() {
+    let tools = [
+        ("pw-loopback", "Required for creating virtual sinks"),
+        ("pw-cli", "Required for node management and link creation"),
+        ("pw-dump", "Required for discovering PipeWire nodes"),
+        ("pw-link", "Used for port linking operations"),
+        ("wpctl", "Required for volume control and default sink management"),
+    ];
+
+    for (tool, purpose) in &tools {
+        match Command::new("which").arg(tool).output() {
+            Ok(output) if output.status.success() => {
+                debug!("{} found", tool);
+            }
+            _ => {
+                warn!(
+                    "PipeWire tool '{}' not found in PATH. {}: {}",
+                    tool, "This tool is needed", purpose
+                );
+            }
+        }
+    }
+}
+
 /// Track running pw-loopback processes for cleanup.
 static LOOPBACK_PROCESSES: Mutex<Option<HashMap<u32, Child>>> = Mutex::new(None);
 
@@ -175,22 +201,128 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
         "No tracked process for node {}, attempting pw-cli destroy",
         node_id
     );
-    let _ = Command::new("pw-cli")
+    match Command::new("pw-cli")
         .args(["destroy", &node_id.to_string()])
-        .output();
+        .output()
+    {
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("pw-cli destroy failed for node {}: {}", node_id, stderr);
+        }
+        Err(e) => {
+            warn!("pw-cli destroy failed for node {}: {}", node_id, e);
+        }
+        _ => {}
+    }
 
     Ok(())
 }
 
 /// Destroy all virtual sinks (cleanup on exit).
+/// Kills tracked pw-loopback processes and cleans up any orphaned nodes
+/// that may have been created by processes that respawned after PipeWire restart.
 pub fn destroy_all_virtual_sinks() {
+    info!("Destroying all virtual sinks");
+
+    // First, kill all tracked pw-loopback processes
     if let Some(ref mut map) = *get_processes() {
         for (node_id, mut child) in map.drain() {
-            info!("Cleaning up virtual sink {}", node_id);
-            let _ = child.kill();
+            debug!(
+                "Killing pw-loopback for sink node {} (pid: {:?})",
+                node_id,
+                child.id()
+            );
+            if let Err(e) = child.kill() {
+                debug!("Process kill returned error (may be already dead): {}", e);
+            }
             let _ = child.wait();
         }
     }
+
+    // Also kill any pw-loopback processes that may have respawned
+    // with a new PID that we don't have tracked
+    if let Err(e) = Command::new("pkill")
+        .args(["-f", "pw-loopback.*sootmix"])
+        .output()
+    {
+        warn!("pkill fallback failed: {}", e);
+    }
+
+    // Give processes time to die and nodes to be removed
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// Clean up orphaned sootmix nodes from previous runs.
+/// This should be called on startup before creating new channels.
+pub fn cleanup_orphaned_nodes() {
+    info!("Scanning for orphaned sootmix nodes...");
+
+    let output = match Command::new("pw-dump").output() {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("Failed to run pw-dump for orphan cleanup: {}", e);
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        warn!("pw-dump failed during orphan cleanup");
+        return;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let objects: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
+        Ok(o) => o,
+        Err(_) => {
+            warn!("Failed to parse pw-dump JSON for orphan cleanup");
+            return;
+        }
+    };
+
+    let mut orphaned_ids: Vec<u32> = Vec::new();
+
+    for obj in objects {
+        let obj_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if obj_type != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        let props = obj.get("info").and_then(|i| i.get("props"));
+        let node_name = props
+            .and_then(|p| p.get("node.name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+
+        // Check if this is a sootmix node (either sink or output)
+        if node_name.starts_with("sootmix.") || node_name.starts_with("output.sootmix.") {
+            if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
+                orphaned_ids.push(id as u32);
+            }
+        }
+    }
+
+    if orphaned_ids.is_empty() {
+        info!("No orphaned sootmix nodes found");
+        return;
+    }
+
+    info!(
+        "Found {} orphaned sootmix nodes, cleaning up...",
+        orphaned_ids.len()
+    );
+    for id in orphaned_ids {
+        debug!("Destroying orphaned node {}", id);
+        if let Err(e) = Command::new("pw-cli")
+            .args(["destroy", &id.to_string()])
+            .output()
+        {
+            warn!("Failed to destroy orphaned node {}: {}", id, e);
+        }
+    }
+
+    // Give PipeWire time to process the destructions
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    info!("Orphan cleanup complete");
 }
 
 /// Poll for a node to appear with exponential backoff.

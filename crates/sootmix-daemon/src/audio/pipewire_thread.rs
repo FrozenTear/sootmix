@@ -11,9 +11,9 @@ use pipewire::properties::properties;
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::Pod;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -141,6 +141,9 @@ struct PwThreadState {
     cli_last_cmd: HashMap<u32, Instant>,
     /// Pending CLI commands that were throttled - stores the latest value to apply
     pending_cli_cmds: HashMap<u32, PendingCliCmd>,
+    /// Node IDs currently being processed by CLI background threads.
+    /// Prevents concurrent CLI operations on the same node.
+    cli_in_flight: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl PwThreadState {
@@ -155,6 +158,7 @@ impl PwThreadState {
             event_tx,
             cli_last_cmd: HashMap::new(),
             pending_cli_cmds: HashMap::new(),
+            cli_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -365,8 +369,40 @@ where
     thread::spawn(move || work(tx));
 }
 
+/// Spawn a CLI background thread for a specific node, with in-flight tracking.
+/// If the node is already being processed by another CLI thread, the work is skipped.
+/// The pending CLI timer will retry later.
+fn spawn_cli_work_for_node<F>(
+    event_tx: &Rc<mpsc::Sender<PwEvent>>,
+    in_flight: &Arc<Mutex<HashSet<u32>>>,
+    node_id: u32,
+    work: F,
+) where
+    F: FnOnce(mpsc::Sender<PwEvent>) + Send + 'static,
+{
+    // Check if node is already in-flight
+    {
+        let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if set.contains(&node_id) {
+            trace!("Node {} already has CLI operation in-flight, skipping", node_id);
+            return;
+        }
+        set.insert(node_id);
+    }
+
+    let tx = mpsc::Sender::clone(event_tx);
+    let in_flight_clone = Arc::clone(in_flight);
+    thread::spawn(move || {
+        work(tx);
+        // Remove node from in-flight set when done
+        let mut set = in_flight_clone.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(&node_id);
+    });
+}
+
 /// Process any pending CLI commands that were throttled but are now ready to execute.
 /// CLI commands are dispatched to background threads to avoid blocking the PW loop.
+/// Uses in-flight tracking to prevent concurrent CLI operations on the same node.
 fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
     let ready_cmds = state.borrow_mut().get_ready_pending_cmds();
 
@@ -374,10 +410,33 @@ fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
         return;
     }
 
-    let tx = mpsc::Sender::clone(&state.borrow().event_tx);
+    let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+    let _tx = mpsc::Sender::clone(&state.borrow().event_tx);
 
+    // Filter out commands for nodes already in-flight
+    let filtered_cmds: Vec<(u32, PendingCliCmd)> = {
+        let set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        ready_cmds
+            .into_iter()
+            .filter(|(node_id, _)| !set.contains(node_id))
+            .collect()
+    };
+
+    if filtered_cmds.is_empty() {
+        return;
+    }
+
+    // Mark all as in-flight
+    {
+        let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        for (node_id, _) in &filtered_cmds {
+            set.insert(*node_id);
+        }
+    }
+
+    let in_flight_clone = Arc::clone(&in_flight);
     thread::spawn(move || {
-        for (node_id, cmd) in ready_cmds {
+        for (node_id, cmd) in &filtered_cmds {
             match cmd {
                 PendingCliCmd::Volume(volume) => {
                     trace!(
@@ -385,7 +444,7 @@ fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
                         node_id,
                         volume
                     );
-                    if let Err(e) = crate::audio::volume::set_volume(node_id, volume) {
+                    if let Err(e) = crate::audio::volume::set_volume(*node_id, *volume) {
                         error!(
                             "Pending CLI volume control failed for node {}: {}",
                             node_id, e
@@ -398,7 +457,7 @@ fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
                         node_id,
                         muted
                     );
-                    if let Err(e) = crate::audio::volume::set_mute(node_id, muted) {
+                    if let Err(e) = crate::audio::volume::set_mute(*node_id, *muted) {
                         error!(
                             "Pending CLI mute control failed for node {}: {}",
                             node_id, e
@@ -406,6 +465,11 @@ fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
                     }
                 }
             }
+        }
+        // Remove all from in-flight set
+        let mut set = in_flight_clone.lock().unwrap_or_else(|e| e.into_inner());
+        for (node_id, _) in &filtered_cmds {
+            set.remove(node_id);
         }
     });
 }
@@ -587,7 +651,8 @@ fn handle_command(
                     .should_run_cli(node_id, PendingCliCmd::Volume(volume))
                 {
                     debug!("Native volume failed ({}), using CLI fallback", e);
-                    spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                    let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+                    spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
                         if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
                             error!("CLI volume control also failed: {}", e2);
                         }
@@ -605,7 +670,8 @@ fn handle_command(
                     .should_run_cli(node_id, PendingCliCmd::Mute(muted))
                 {
                     debug!("Native mute failed ({}), using CLI fallback", e);
-                    spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                    let in_flight = Arc::clone(&state.borrow().cli_in_flight);
+                    spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
                         if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
                             error!("CLI mute control also failed: {}", e2);
                         }

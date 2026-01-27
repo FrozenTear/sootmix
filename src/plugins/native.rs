@@ -11,11 +11,44 @@ use super::{PluginLoadError, PluginResult};
 use libloading::{Library, Symbol};
 use sootmix_plugin_api::{PluginBox, PluginEntry, API_VERSION_MAJOR, API_VERSION_MINOR};
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Entry point function name that plugins must export.
 const ENTRY_POINT_NAME: &[u8] = b"sootmix_plugin_entry\0";
+
+/// Check that a plugin file and its parent directory do not have insecure permissions.
+/// Rejects world-writable files or files in world-writable directories.
+pub(super) fn check_plugin_permissions(path: &Path) -> PluginResult<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mode = metadata.mode();
+
+    // Reject world-writable plugin files
+    if mode & 0o002 != 0 {
+        warn!(
+            "Rejecting plugin with world-writable permissions: {:?} (mode {:o})",
+            path, mode
+        );
+        return Err(PluginLoadError::InsecurePermissions(path.to_path_buf()));
+    }
+
+    // Reject plugins in world-writable directories
+    if let Some(parent) = path.parent() {
+        if let Ok(dir_meta) = std::fs::metadata(parent) {
+            let dir_mode = dir_meta.mode();
+            if dir_mode & 0o002 != 0 {
+                warn!(
+                    "Rejecting plugin in world-writable directory: {:?} (dir mode {:o})",
+                    path, dir_mode
+                );
+                return Err(PluginLoadError::InsecurePermissions(path.to_path_buf()));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Native plugin loader.
 ///
@@ -39,6 +72,9 @@ impl NativePluginLoader {
         if !path.exists() {
             return Err(PluginLoadError::NotFound(path.to_path_buf()));
         }
+
+        // Check file permissions before loading
+        check_plugin_permissions(path)?;
 
         debug!("Loading native plugin: {:?}", path);
 
@@ -124,6 +160,9 @@ impl NativePluginLoader {
         if !path.exists() {
             return Err(PluginLoadError::NotFound(path.to_path_buf()));
         }
+
+        // Check file permissions before loading
+        check_plugin_permissions(path)?;
 
         // Temporarily load to check
         let library = unsafe {

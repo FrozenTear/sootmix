@@ -10,6 +10,55 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 use zbus::interface;
 
+/// Input validation helpers for D-Bus method arguments.
+mod validate {
+    /// Validate a channel name: non-empty, max 128 chars, no control characters.
+    pub fn validate_channel_name(name: &str) -> Result<(), zbus::fdo::Error> {
+        if name.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("Channel name must not be empty".into()));
+        }
+        if name.len() > 128 {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                format!("Channel name exceeds 128 character limit (got {})", name.len()),
+            ));
+        }
+        if name.chars().any(|c| c.is_control()) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Channel name must not contain control characters".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a volume in dB: reject NaN/Infinity, clamp to -96.0..=24.0 range.
+    pub fn validate_volume_db(volume_db: f64) -> Result<f64, zbus::fdo::Error> {
+        if volume_db.is_nan() || volume_db.is_infinite() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Volume must be a finite number".into(),
+            ));
+        }
+        Ok(volume_db.clamp(-96.0, 24.0))
+    }
+
+    /// Validate a device name: non-empty, max 256 chars, no control characters.
+    pub fn validate_device_name(name: &str) -> Result<(), zbus::fdo::Error> {
+        if name.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("Device name must not be empty".into()));
+        }
+        if name.len() > 256 {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                format!("Device name exceeds 256 character limit (got {})", name.len()),
+            ));
+        }
+        if name.chars().any(|c| c.is_control()) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Device name must not contain control characters".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The D-Bus interface implementation.
 pub struct DaemonDbusService {
     service: Arc<Mutex<DaemonService>>,
@@ -31,6 +80,7 @@ impl DaemonDbusService {
         #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
         name: &str,
     ) -> zbus::fdo::Result<String> {
+        validate::validate_channel_name(name)?;
         debug!("D-Bus: create_channel({})", name);
         let (channel_id, channel_info) = {
             let mut service = self
@@ -90,6 +140,7 @@ impl DaemonDbusService {
         channel_id: &str,
         name: &str,
     ) -> zbus::fdo::Result<()> {
+        validate::validate_channel_name(name)?;
         debug!("D-Bus: rename_channel({}, {})", channel_id, name);
         let channel_info = {
             let mut service = self
@@ -125,6 +176,7 @@ impl DaemonDbusService {
         channel_id: &str,
         volume_db: f64,
     ) -> zbus::fdo::Result<()> {
+        let volume_db = validate::validate_volume_db(volume_db)?;
         let id_string = channel_id.to_string();
         {
             let mut service = self
@@ -173,6 +225,7 @@ impl DaemonDbusService {
         #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
         volume_db: f64,
     ) -> zbus::fdo::Result<()> {
+        let volume_db = validate::validate_volume_db(volume_db)?;
         {
             let mut service = self
                 .service
@@ -293,6 +346,7 @@ impl DaemonDbusService {
         channel_id: &str,
         device_name: &str,
     ) -> zbus::fdo::Result<()> {
+        validate::validate_device_name(device_name)?;
         debug!("D-Bus: set_channel_output({}, {})", channel_id, device_name);
         let channel_info = {
             let mut service = self
@@ -325,6 +379,7 @@ impl DaemonDbusService {
         #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
         device_name: &str,
     ) -> zbus::fdo::Result<()> {
+        validate::validate_device_name(device_name)?;
         debug!("D-Bus: set_master_output({})", device_name);
         {
             let mut service = self

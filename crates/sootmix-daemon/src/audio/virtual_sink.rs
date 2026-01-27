@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -22,10 +22,36 @@ pub enum VirtualSinkError {
     InvalidJson,
 }
 
+/// Check availability of PipeWire CLI tools at startup.
+/// Logs warnings for any missing tools with guidance.
+pub fn check_pipewire_tools() {
+    let tools = [
+        ("pw-loopback", "Required for creating virtual sinks"),
+        ("pw-cli", "Required for node management and link creation"),
+        ("pw-dump", "Required for discovering PipeWire nodes"),
+        ("pw-link", "Used for port linking operations"),
+        ("wpctl", "Required for volume control and default sink management"),
+    ];
+
+    for (tool, purpose) in &tools {
+        match Command::new("which").arg(tool).output() {
+            Ok(output) if output.status.success() => {
+                debug!("{} found", tool);
+            }
+            _ => {
+                warn!(
+                    "PipeWire tool '{}' not found in PATH. {}: {}",
+                    tool, "This tool is needed", purpose
+                );
+            }
+        }
+    }
+}
+
 static LOOPBACK_PROCESSES: Mutex<Option<HashMap<u32, Child>>> = Mutex::new(None);
 
-fn get_processes() -> std::sync::MutexGuard<'static, Option<HashMap<u32, Child>>> {
-    LOOPBACK_PROCESSES.lock().unwrap()
+fn get_processes() -> parking_lot::MutexGuard<'static, Option<HashMap<u32, Child>>> {
+    LOOPBACK_PROCESSES.lock()
 }
 
 fn ensure_processes_map() {
@@ -75,9 +101,12 @@ pub fn create_virtual_sink_full(
             }
         }
 
-        let _ = Command::new("pw-cli")
+        if let Err(e) = Command::new("pw-cli")
             .args(["destroy", &existing_id.to_string()])
-            .output();
+            .output()
+        {
+            warn!("pw-cli destroy failed for node {}: {}", existing_id, e);
+        }
         // Also destroy the output node if it exists
         let full_loopback_name = format!("output.{}", loopback_node_name);
         if let Ok(output_id) =
@@ -90,9 +119,12 @@ pub fn create_virtual_sink_full(
                     let _ = child.wait();
                 }
             }
-            let _ = Command::new("pw-cli")
+            if let Err(e) = Command::new("pw-cli")
                 .args(["destroy", &output_id.to_string()])
-                .output();
+                .output()
+            {
+                warn!("pw-cli destroy failed for output node {}: {}", output_id, e);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -190,9 +222,19 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
         "No tracked process for node {}, attempting pw-cli destroy",
         node_id
     );
-    let _ = Command::new("pw-cli")
+    match Command::new("pw-cli")
         .args(["destroy", &node_id.to_string()])
-        .output();
+        .output()
+    {
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("pw-cli destroy failed for node {}: {}", node_id, stderr);
+        }
+        Err(e) => {
+            warn!("pw-cli destroy failed for node {}: {}", node_id, e);
+        }
+        _ => {}
+    }
 
     Ok(())
 }
@@ -290,9 +332,12 @@ pub fn cleanup_orphaned_nodes() {
     );
     for id in orphaned_ids {
         debug!("Destroying orphaned node {}", id);
-        let _ = Command::new("pw-cli")
+        if let Err(e) = Command::new("pw-cli")
             .args(["destroy", &id.to_string()])
-            .output();
+            .output()
+        {
+            warn!("pw-cli destroy failed for orphaned node {}: {}", id, e);
+        }
     }
 
     // Give PipeWire time to process the destructions

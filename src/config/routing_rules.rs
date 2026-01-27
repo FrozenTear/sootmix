@@ -4,10 +4,60 @@
 
 //! Auto-routing rules for automatic app-to-channel assignment.
 
-use regex::Regex;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use tracing::warn;
 use uuid::Uuid;
+
+/// Maximum allowed pattern length for regex and glob patterns.
+const MAX_PATTERN_LENGTH: usize = 1024;
+
+/// Maximum number of cached compiled regexes.
+const MAX_REGEX_CACHE_SIZE: usize = 64;
+
+/// Maximum recursion depth for glob matching.
+const MAX_GLOB_RECURSION_DEPTH: usize = 10;
+
+thread_local! {
+    /// Thread-local LRU cache for compiled regexes.
+    static REGEX_CACHE: RefCell<HashMap<String, Option<regex::Regex>>> = RefCell::new(HashMap::new());
+}
+
+/// Get a compiled regex from cache, or compile and cache it.
+fn get_cached_regex(pattern: &str) -> Option<regex::Regex> {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+
+        if let Some(cached) = cache.get(pattern) {
+            return cached.clone();
+        }
+
+        // Evict oldest entries if cache is full
+        if cache.len() >= MAX_REGEX_CACHE_SIZE {
+            // Simple eviction: clear half the cache
+            let keys_to_remove: Vec<String> = cache.keys().take(MAX_REGEX_CACHE_SIZE / 2).cloned().collect();
+            for key in keys_to_remove {
+                cache.remove(&key);
+            }
+        }
+
+        let result = RegexBuilder::new(pattern)
+            .size_limit(1 << 20)
+            .dfa_size_limit(1 << 20)
+            .build()
+            .ok();
+
+        if result.is_none() {
+            warn!("Invalid regex pattern: {:?}", pattern);
+        }
+
+        cache.insert(pattern.to_string(), result.clone());
+        result
+    })
+}
 
 /// How to match the app identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,6 +96,14 @@ impl MatchType {
 
     /// Check if a value matches this pattern.
     pub fn matches(&self, value: &str) -> bool {
+        let pattern = self.pattern();
+
+        // Reject overly long patterns to prevent DoS
+        if pattern.len() > MAX_PATTERN_LENGTH {
+            warn!("Rejecting pattern exceeding {} chars: {}...", MAX_PATTERN_LENGTH, &pattern[..64]);
+            return false;
+        }
+
         match self {
             MatchType::Contains(pattern) => {
                 value.to_lowercase().contains(&pattern.to_lowercase())
@@ -54,9 +112,9 @@ impl MatchType {
                 value.eq_ignore_ascii_case(pattern)
             }
             MatchType::Regex(pattern) => {
-                match Regex::new(pattern) {
-                    Ok(re) => re.is_match(value),
-                    Err(_) => false,
+                match get_cached_regex(pattern) {
+                    Some(re) => re.is_match(value),
+                    None => false,
                 }
             }
             MatchType::Glob(pattern) => {
@@ -302,10 +360,15 @@ impl RoutingRulesConfig {
 fn glob_match(pattern: &str, value: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let value = value.to_lowercase();
-    glob_match_impl(&pattern, &value)
+    glob_match_impl(&pattern, &value, 0)
 }
 
-fn glob_match_impl(pattern: &str, value: &str) -> bool {
+fn glob_match_impl(pattern: &str, value: &str, depth: usize) -> bool {
+    if depth > MAX_GLOB_RECURSION_DEPTH {
+        warn!("Glob match exceeded max recursion depth ({}), rejecting", MAX_GLOB_RECURSION_DEPTH);
+        return false;
+    }
+
     let mut pattern_chars = pattern.chars().peekable();
     let mut value_chars = value.chars().peekable();
 
@@ -324,7 +387,7 @@ fn glob_match_impl(pattern: &str, value: &str) -> bool {
                 // Try matching remaining pattern at each position
                 let remaining_value: String = value_chars.collect();
                 for i in 0..=remaining_value.len() {
-                    if glob_match_impl(&remaining_pattern, &remaining_value[i..]) {
+                    if glob_match_impl(&remaining_pattern, &remaining_value[i..], depth + 1) {
                         return true;
                     }
                 }

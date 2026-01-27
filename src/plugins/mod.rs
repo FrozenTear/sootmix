@@ -134,6 +134,10 @@ pub enum PluginLoadError {
     #[error("plugin initialization failed: {0}")]
     Initialization(String),
 
+    /// Plugin file has insecure permissions.
+    #[error("insecure permissions on plugin: {0}")]
+    InsecurePermissions(PathBuf),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

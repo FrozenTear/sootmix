@@ -719,6 +719,38 @@ impl DaemonService {
                     );
                     self.try_auto_route_pending_apps(channel_id);
                 }
+
+                // Check if this port belongs to a loopback output that needs routing
+                // to the hardware sink. This handles the timing issue where
+                // RouteChannelToDevice fires before the loopback output ports exist.
+                let loopback_route = self
+                    .state
+                    .channels
+                    .iter()
+                    .find(|c| c.pw_loopback_output_id == Some(port_node_id))
+                    .map(|c| (c.id, c.pw_loopback_output_id));
+
+                if let Some((_channel_id, Some(loopback_id))) = loopback_route {
+                    // Check if this loopback output already has links to a hardware sink
+                    let has_links = self
+                        .state
+                        .pw_graph
+                        .links
+                        .values()
+                        .any(|l| l.output_node == loopback_id);
+
+                    if !has_links {
+                        debug!(
+                            "Loopback output node {} has new ports but no links, retrying route to hardware",
+                            loopback_id
+                        );
+                        let target_device_id = self.get_master_output_device_id();
+                        self.send_pw_command(PwCommand::RouteChannelToDevice {
+                            loopback_output_node: loopback_id,
+                            target_device_id,
+                        });
+                    }
+                }
             }
             PwEvent::PortRemoved(id) => {
                 self.state.pw_graph.ports.remove(&id);
