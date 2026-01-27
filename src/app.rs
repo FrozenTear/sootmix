@@ -1069,27 +1069,29 @@ impl SootMix {
             }
 
             Message::TrayShowWindow => {
-                if let Some(window_id) = self.main_window_id {
-                    // Window exists but may be minimized — restore and focus
-                    info!("Tray: Restoring existing window");
-                    return Task::batch([
-                        iced::window::minimize(window_id, false),
-                        iced::window::gain_focus(window_id),
-                    ]);
-                } else {
-                    // Window was closed — open a new one
-                    info!("Tray: Opening new window");
-                    let (window_id, open_task) = iced::window::open(iced::window::Settings {
-                        size: iced::Size::new(900.0, 600.0),
-                        platform_specific: iced::window::settings::PlatformSpecific {
-                            application_id: "sootmix".to_string(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    });
-                    self.main_window_id = Some(window_id);
-                    return open_task.discard();
+                // Close any stale window handle before opening a fresh one.
+                // In daemon mode, minimize()/gain_focus() can silently fail on
+                // windows that the compositor considers gone (e.g. after close-to-
+                // tray or if the window never fully mapped).  Opening a new window
+                // is the only reliable way to guarantee visibility.
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(old_id) = self.main_window_id.take() {
+                    info!("Tray: Closing stale window before opening new one");
+                    tasks.push(iced::window::close(old_id));
                 }
+
+                info!("Tray: Opening new window");
+                let (window_id, open_task) = iced::window::open(iced::window::Settings {
+                    size: iced::Size::new(900.0, 600.0),
+                    platform_specific: iced::window::settings::PlatformSpecific {
+                        application_id: "sootmix".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                self.main_window_id = Some(window_id);
+                tasks.push(open_task.discard());
+                return Task::batch(tasks);
             }
 
             Message::TrayToggleMuteAll => {
