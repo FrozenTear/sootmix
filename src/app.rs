@@ -1045,9 +1045,10 @@ impl SootMix {
                 // Hide window to tray instead of quitting
                 // The daemon keeps running so audio continues
                 if self.tray_handle.is_some() {
-                    info!("Window close requested - hiding to tray (daemon keeps running)");
-                    self.main_window_id = None;
-                    return iced::window::close(window_id);
+                    info!("Window close requested - minimizing to tray (daemon keeps running)");
+                    // Minimize instead of close to keep subscriptions running
+                    // iced daemon mode stops processing when all windows are closed
+                    return iced::window::minimize(window_id, true);
                 } else {
                     // No tray available - actually quit
                     info!("Window close requested - no tray, exiting");
@@ -1057,26 +1058,14 @@ impl SootMix {
             }
 
             Message::TrayShowWindow => {
-                if self.main_window_id.is_some() {
-                    // Window is open, just focus it
-                    info!("Tray: Focusing existing window");
-                    return iced::window::oldest().and_then(|id| {
-                        iced::window::gain_focus(id)
-                    });
-                } else {
-                    // Window is closed, need to open a new one
-                    info!("Tray: Opening new window");
-                    let (id, open_task) = iced::window::open(iced::window::Settings {
-                        size: iced::Size::new(900.0, 600.0),
-                        platform_specific: iced::window::settings::PlatformSpecific {
-                            application_id: "sootmix".to_string(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    });
-                    self.main_window_id = Some(id);
-                    return open_task.discard();
-                }
+                // Restore minimized window and focus it
+                info!("Tray: Restoring window");
+                return iced::window::oldest().and_then(|id| {
+                    Task::batch([
+                        iced::window::minimize(id, false),
+                        iced::window::gain_focus(id),
+                    ])
+                });
             }
 
             Message::TrayToggleMuteAll => {
