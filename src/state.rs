@@ -9,6 +9,7 @@ use crate::config::RoutingRulesConfig;
 use crate::plugins::{PluginSlotConfig, PluginType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use tracing::debug;
 use uuid::Uuid;
 
 /// Which snapshot slot (A or B) for A/B comparison.
@@ -487,6 +488,15 @@ impl PwGraphState {
             .collect()
     }
 
+    /// Find all links TO a node (incoming links).
+    /// Used to disconnect existing input sources before routing a new one.
+    pub fn links_to_node(&self, node_id: u32) -> Vec<&PwLink> {
+        self.links
+            .values()
+            .filter(|l| l.input_node == node_id)
+            .collect()
+    }
+
     /// Get output ports for a node (ports that send audio out).
     pub fn output_ports_for_node(&self, node_id: u32) -> Vec<&PwPort> {
         self.ports
@@ -505,11 +515,28 @@ impl PwGraphState {
 
     /// Find matching port pairs for linking two nodes (matches by audio channel).
     /// Returns pairs of (output_port_id, input_port_id).
+    ///
+    /// Handles mono→stereo expansion: a single mono output port connects to both
+    /// FL and FR input ports so audio plays on both channels.
     pub fn find_port_pairs(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
         let output_ports = self.output_ports_for_node(output_node);
         let input_ports = self.input_ports_for_node(input_node);
 
         let mut pairs = Vec::new();
+
+        // Check for mono→stereo case: single output port, multiple input ports
+        let is_mono_source = output_ports.len() == 1;
+        let is_stereo_dest = input_ports.len() >= 2;
+
+        if is_mono_source && is_stereo_dest {
+            // Mono→stereo: connect the single output port to ALL input ports
+            // This ensures mono mic audio plays on both L and R channels
+            let out_port = &output_ports[0];
+            for in_port in &input_ports {
+                pairs.push((out_port.id, in_port.id));
+            }
+            return pairs;
+        }
 
         for out_port in &output_ports {
             // Try to find matching input port by channel
@@ -768,7 +795,32 @@ impl AppState {
 
     /// Update available input devices from PipeWire graph.
     pub fn update_available_inputs(&mut self) {
-        self.available_inputs = self
+        // Debug: log all nodes and their media classes to diagnose discovery issues
+        let total_nodes = self.pw_graph.nodes.len();
+        let audio_sources: Vec<_> = self.pw_graph.nodes.values()
+            .filter(|n| n.media_class == MediaClass::AudioSource)
+            .collect();
+        let potential_inputs: Vec<_> = self.pw_graph.nodes.values()
+            .filter(|n| n.name.contains("alsa_input") || n.name.contains("input"))
+            .collect();
+
+        if !potential_inputs.is_empty() || !audio_sources.is_empty() {
+            debug!(
+                "update_available_inputs: {} total nodes, {} Audio/Source nodes, {} potential inputs",
+                total_nodes, audio_sources.len(), potential_inputs.len()
+            );
+            for n in &audio_sources {
+                debug!("  Audio/Source: id={} name='{}' desc='{}'", n.id, n.name, n.description);
+            }
+            for n in &potential_inputs {
+                if n.media_class != MediaClass::AudioSource {
+                    debug!("  Potential input (wrong class): id={} name='{}' class={:?}",
+                           n.id, n.name, n.media_class);
+                }
+            }
+        }
+
+        let hw_inputs: Vec<InputDevice> = self
             .pw_graph
             .nodes
             .values()
@@ -784,6 +836,17 @@ impl AppState {
                 description: n.description.clone(),
             })
             .collect();
+
+        // Prepend "Default" synthetic entry (uses system default input)
+        let mut inputs = vec![InputDevice {
+            node_id: 0,
+            name: "system-default".to_string(),
+            description: "Default".to_string(),
+        }];
+        inputs.extend(hw_inputs);
+        self.available_inputs = inputs;
+
+        debug!("update_available_inputs: result = {} devices", self.available_inputs.len());
     }
 
     /// Update available outputs from PipeWire graph.

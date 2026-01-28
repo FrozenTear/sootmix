@@ -1405,6 +1405,14 @@ fn setup_registry_listener(
                         node.id, node.name, node.media_class
                     );
 
+                    // Extra debug for potential input devices
+                    if node.name.contains("alsa_input") || node.name.contains("input") {
+                        debug!("  Potential input device detected - props available:");
+                        debug!("    media.class from props: {:?}", props.get("media.class"));
+                        debug!("    node.description: {:?}", props.get("node.description"));
+                        debug!("    factory.name: {:?}", props.get("factory.name"));
+                    }
+
                     // Auto-bind nodes for native volume/mute control:
                     // - sootmix virtual sinks (our channel sinks)
                     // - hardware audio sinks (for master volume control)

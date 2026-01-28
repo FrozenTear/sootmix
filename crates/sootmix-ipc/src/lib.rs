@@ -113,6 +113,28 @@ impl OutputInfo {
     }
 }
 
+/// Information about an audio input device (microphone, line-in, etc).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct InputInfo {
+    /// Device name (node.name from PipeWire).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// PipeWire node ID.
+    pub node_id: u32,
+}
+
+impl InputInfo {
+    /// Get the display name for the device.
+    pub fn display_name(&self) -> &str {
+        if !self.description.is_empty() {
+            &self.description
+        } else {
+            &self.name
+        }
+    }
+}
+
 /// Plugin slot configuration for a channel.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PluginSlotInfo {

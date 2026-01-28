@@ -7,7 +7,7 @@
 use crate::audio::pipewire_thread::{PwCommand, PwEvent, PwThread};
 use crate::audio::types::{MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use crate::config::{ConfigManager, MixerConfig, RoutingRulesConfig, SavedChannel};
-use sootmix_ipc::{AppInfo, ChannelInfo, OutputInfo, RoutingRuleInfo};
+use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, OutputInfo, RoutingRuleInfo};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,14 @@ pub enum ServiceError {
     Config(#[from] crate::config::ConfigError),
 }
 
+/// Whether a channel handles output (app audio) or input (mic capture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelKind {
+    #[default]
+    Output,
+    Input,
+}
+
 /// Internal channel state.
 #[derive(Debug, Clone)]
 pub struct ChannelState {
@@ -52,6 +60,14 @@ pub struct ChannelState {
     pub pw_sink_id: Option<u32>,
     pub pw_loopback_output_id: Option<u32>,
     pub meter_levels: (f32, f32),
+    /// Whether this is an output or input channel.
+    pub kind: ChannelKind,
+    /// Input device name (for input channels).
+    pub input_device_name: Option<String>,
+    /// PipeWire source node ID (for input channels - the Audio/Source node).
+    pub pw_source_id: Option<u32>,
+    /// PipeWire loopback capture node ID (for input channels).
+    pub pw_loopback_capture_id: Option<u32>,
 }
 
 impl ChannelState {
@@ -70,6 +86,32 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
+            kind: ChannelKind::Output,
+            input_device_name: None,
+            pw_source_id: None,
+            pw_loopback_capture_id: None,
+        }
+    }
+
+    pub fn new_input(name: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            volume_db: 0.0,
+            muted: false,
+            eq_enabled: false,
+            eq_preset: "Flat".to_string(),
+            assigned_apps: Vec::new(),
+            is_managed: true,
+            sink_name: None,
+            output_device_name: None,
+            pw_sink_id: None,
+            pw_loopback_output_id: None,
+            meter_levels: (0.0, 0.0),
+            kind: ChannelKind::Input,
+            input_device_name: None,
+            pw_source_id: None,
+            pw_loopback_capture_id: None,
         }
     }
 
@@ -88,7 +130,16 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
+            kind: ChannelKind::Output, // TODO: load from saved config
+            input_device_name: None,
+            pw_source_id: None,
+            pw_loopback_capture_id: None,
         }
+    }
+
+    /// Whether this is an input (mic) channel.
+    pub fn is_input(&self) -> bool {
+        self.kind == ChannelKind::Input
     }
 
     pub fn to_channel_info(&self) -> ChannelInfo {
@@ -187,6 +238,21 @@ impl PwGraphState {
                     && !exclude_names.iter().any(|ex| n.name.contains(ex))
             })
             .map(|n| OutputInfo {
+                node_id: n.id,
+                name: n.name.clone(),
+                description: n.description.clone(),
+            })
+            .collect()
+    }
+
+    pub fn input_devices(&self, exclude_names: &[&str]) -> Vec<InputInfo> {
+        self.nodes
+            .values()
+            .filter(|n| {
+                n.media_class == MediaClass::AudioSource
+                    && !exclude_names.iter().any(|ex| n.name.contains(ex))
+            })
+            .map(|n| InputInfo {
                 node_id: n.id,
                 name: n.name.clone(),
                 description: n.description.clone(),
@@ -389,6 +455,12 @@ impl DaemonState {
         }];
         outputs.extend(self.pw_graph.output_devices(&exclude));
         outputs
+    }
+
+    pub fn get_inputs(&self) -> Vec<InputInfo> {
+        // Exclude sootmix virtual sources and loopback devices
+        let exclude = vec!["sootmix.", "LB-", "loopback"];
+        self.pw_graph.input_devices(&exclude)
     }
 
     pub fn update_available_apps(&mut self) {
@@ -971,6 +1043,25 @@ impl DaemonService {
                     }
                 }
             }
+            PwEvent::VirtualSourceCreated {
+                channel_id,
+                source_node_id,
+                loopback_capture_node_id,
+            } => {
+                if let Some(channel) = self
+                    .state
+                    .channels
+                    .iter_mut()
+                    .find(|c| c.id == channel_id)
+                {
+                    channel.pw_source_id = Some(source_node_id);
+                    channel.pw_loopback_capture_id = loopback_capture_node_id;
+                    info!(
+                        "Virtual source created for input channel '{}': source={}, capture={:?}",
+                        channel.name, source_node_id, loopback_capture_node_id
+                    );
+                }
+            }
             PwEvent::RecordingSourceCreated { name, node_id } => {
                 info!("Recording source created: {} (node {})", name, node_id);
                 self.state.master_recording_source_id = Some(node_id);
@@ -1054,21 +1145,49 @@ impl DaemonService {
         Ok(id.to_string())
     }
 
+    pub fn create_input_channel(&mut self, name: &str) -> Result<String, ServiceError> {
+        let channel = ChannelState::new_input(name.to_string());
+        let id = channel.id;
+
+        self.state.channels.push(channel);
+
+        self.send_pw_command(PwCommand::CreateVirtualSource {
+            channel_id: id,
+            name: name.to_string(),
+        });
+
+        self.save_config();
+        Ok(id.to_string())
+    }
+
     pub fn delete_channel(&mut self, channel_id: &str) -> Result<(), ServiceError> {
         let id = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let (sink_id, is_managed) = self
+        let channel = self
             .state
             .channels
             .iter()
             .find(|c| c.id == id)
-            .map(|c| (c.pw_sink_id, c.is_managed))
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        if let Some(sink_id) = sink_id {
-            if is_managed {
-                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: sink_id });
+        let is_input = channel.is_input();
+        let is_managed = channel.is_managed;
+
+        if is_input {
+            // Destroy virtual source for input channels
+            if let Some(source_id) = channel.pw_source_id {
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
+            }
+            if let Some(capture_id) = channel.pw_loopback_capture_id {
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: capture_id });
+            }
+        } else {
+            // Destroy virtual sink for output channels
+            if let Some(sink_id) = channel.pw_sink_id {
+                if is_managed {
+                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: sink_id });
+                }
             }
         }
 

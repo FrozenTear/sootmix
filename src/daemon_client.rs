@@ -4,7 +4,7 @@
 
 //! D-Bus client for communicating with the SootMix daemon.
 
-use sootmix_ipc::{AppInfo, ChannelInfo, MeterData, OutputInfo, RoutingRuleInfo};
+use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, MeterData, OutputInfo, RoutingRuleInfo};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -33,6 +33,7 @@ trait Daemon {
     fn get_channels(&self) -> ZbusResult<Vec<ChannelInfo>>;
     fn get_apps(&self) -> ZbusResult<Vec<AppInfo>>;
     fn get_outputs(&self) -> ZbusResult<Vec<OutputInfo>>;
+    fn get_inputs(&self) -> ZbusResult<Vec<InputInfo>>;
     fn get_master_volume(&self) -> ZbusResult<f64>;
     fn get_master_muted(&self) -> ZbusResult<bool>;
     fn get_master_output(&self) -> ZbusResult<String>;
@@ -74,6 +75,8 @@ trait Daemon {
     fn master_mute_changed(&self, muted: bool) -> ZbusResult<()>;
     #[zbus(signal)]
     fn outputs_changed(&self) -> ZbusResult<()>;
+    #[zbus(signal)]
+    fn inputs_changed(&self) -> ZbusResult<()>;
 }
 
 /// Events received from the daemon.
@@ -96,11 +99,13 @@ pub enum DaemonEvent {
     MasterVolumeChanged(f64),
     MasterMuteChanged(bool),
     OutputsChanged,
+    InputsChanged,
     /// Initial state snapshot after connection
     InitialState {
         channels: Vec<ChannelInfo>,
         apps: Vec<AppInfo>,
         outputs: Vec<OutputInfo>,
+        inputs: Vec<InputInfo>,
         master_volume: f64,
         master_muted: bool,
         master_output: String,
@@ -147,6 +152,8 @@ impl DaemonClient {
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))?;
         let outputs = self.proxy.get_outputs().await
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))?;
+        let inputs = self.proxy.get_inputs().await
+            .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))?;
         let master_volume = self.proxy.get_master_volume().await
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))?;
         let master_muted = self.proxy.get_master_muted().await
@@ -162,6 +169,7 @@ impl DaemonClient {
             channels,
             apps,
             outputs,
+            inputs,
             master_volume,
             master_muted,
             master_output,

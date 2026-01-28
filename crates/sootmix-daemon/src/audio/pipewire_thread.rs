@@ -27,6 +27,10 @@ pub enum PwCommand {
         channel_id: Uuid,
         name: String,
     },
+    CreateVirtualSource {
+        channel_id: Uuid,
+        name: String,
+    },
     DestroyVirtualSink {
         node_id: u32,
     },
@@ -87,6 +91,11 @@ pub enum PwEvent {
         channel_id: Uuid,
         node_id: u32,
         loopback_output_node_id: Option<u32>,
+    },
+    VirtualSourceCreated {
+        channel_id: Uuid,
+        source_node_id: u32,
+        loopback_capture_node_id: Option<u32>,
     },
     VirtualSinkDestroyed {
         node_id: u32,
@@ -508,6 +517,30 @@ fn handle_command(
                     Err(e) => {
                         let _ = event_tx.send(PwEvent::Error(format!(
                             "Failed to create virtual sink: {}",
+                            e
+                        )));
+                    }
+                }
+            });
+        }
+
+        PwCommand::CreateVirtualSource { channel_id, name } => {
+            debug!(
+                "Creating virtual source: '{}' for channel {}",
+                name, channel_id
+            );
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                match crate::audio::virtual_sink::create_virtual_source(&name) {
+                    Ok(result) => {
+                        let _ = event_tx.send(PwEvent::VirtualSourceCreated {
+                            channel_id,
+                            source_node_id: result.source_node_id,
+                            loopback_capture_node_id: result.capture_stream_node_id,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to create virtual source: {}",
                             e
                         )));
                     }

@@ -192,9 +192,11 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
     );
 
     // The "capture" side reads from the system — it's a Stream/Input/Audio
-    // that captures from the default (or specified) input device.
+    // that captures from the physical input device.
+    // IMPORTANT: We use node.autoconnect=false so we can explicitly link to
+    // the user's selected input device rather than the system default.
     let capture_props = format!(
-        "media.class=Stream/Input/Audio node.autoconnect=true audio.position=[FL FR] \
+        "media.class=Stream/Input/Audio node.autoconnect=false audio.position=[FL FR] \
          object.linger=true session.suspend-timeout-enabled=false"
     );
 
@@ -214,8 +216,8 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
     let pid = child.id();
     debug!("pw-loopback (source) spawned with PID: {}", pid);
 
-    // Poll for the Audio/Source node
-    let source_node_id = poll_for_node(&source_node_name, 4, 20)?;
+    // Poll for the Audio/Source node (NOT Audio/Sink!)
+    let source_node_id = poll_for_node_with_class(&source_node_name, "Audio/Source", 4, 20)?;
 
     // Find the loopback capture node
     let full_loopback_name = format!("capture.{}", loopback_node_name);

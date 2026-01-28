@@ -5,7 +5,7 @@
 //! D-Bus interface implementation for the daemon.
 
 use crate::service::DaemonService;
-use sootmix_ipc::{AppInfo, ChannelInfo, MeterData, OutputInfo, RoutingRuleInfo};
+use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, MeterData, OutputInfo, RoutingRuleInfo};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 use zbus::interface;
@@ -90,6 +90,41 @@ impl DaemonDbusService {
             service.process_pw_events();
             let id = service
                 .create_channel(name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Get the channel info to emit in the signal
+            let info = service
+                .state
+                .channels
+                .iter()
+                .find(|c| c.id.to_string() == id)
+                .map(|c| c.to_channel_info());
+            (id, info)
+        };
+
+        // Emit signal after releasing the lock
+        if let Some(info) = channel_info {
+            let _ = Self::channel_added(&ctx, info).await;
+        }
+
+        Ok(channel_id)
+    }
+
+    /// Create a new input (microphone) channel.
+    async fn create_input_channel(
+        &self,
+        #[zbus(signal_context)] ctx: zbus::SignalContext<'_>,
+        name: &str,
+    ) -> zbus::fdo::Result<String> {
+        validate::validate_channel_name(name)?;
+        debug!("D-Bus: create_input_channel({})", name);
+        let (channel_id, channel_info) = {
+            let mut service = self
+                .service
+                .lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            let id = service
+                .create_input_channel(name)
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             // Get the channel info to emit in the signal
             let info = service
@@ -503,6 +538,16 @@ impl DaemonDbusService {
         Ok(service.state.get_outputs())
     }
 
+    /// Get all input devices (microphones, line-in, etc).
+    async fn get_inputs(&self) -> zbus::fdo::Result<Vec<InputInfo>> {
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        service.process_pw_events();
+        Ok(service.state.get_inputs())
+    }
+
     /// Get master volume in dB.
     async fn get_master_volume(&self) -> zbus::fdo::Result<f64> {
         let service = self
@@ -627,6 +672,10 @@ impl DaemonDbusService {
     #[zbus(signal)]
     async fn outputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()>;
 
+    /// Emitted when input device list changes.
+    #[zbus(signal)]
+    async fn inputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()>;
+
     /// Emitted when a channel's properties change.
     #[zbus(signal)]
     async fn channel_updated(
@@ -680,6 +729,19 @@ pub async fn emit_outputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result
             ctx.path(),
             INTERFACE_NAME,
             "OutputsChanged",
+            &(),
+        )
+        .await
+}
+
+/// Emit InputsChanged signal.
+pub async fn emit_inputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "InputsChanged",
             &(),
         )
         .await

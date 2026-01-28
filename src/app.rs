@@ -2124,14 +2124,35 @@ impl SootMix {
         };
 
         // Find the input device node
-        let device_node_id = self.state.available_inputs.iter()
-            .find(|d| d.description == device_name || d.name == device_name)
-            .map(|d| d.node_id);
+        // "Default" or "system-default" means use the first available hardware input
+        let device_id = if device_name == "Default" || device_name == "system-default" {
+            // Find first hardware input (skip the synthetic "Default" entry with node_id=0)
+            self.state.available_inputs.iter()
+                .find(|d| d.node_id != 0)
+                .map(|d| d.node_id)
+        } else {
+            self.state.available_inputs.iter()
+                .find(|d| d.description == device_name || d.name == device_name)
+                .map(|d| d.node_id)
+                .filter(|&id| id != 0) // Ensure we don't use the synthetic entry
+        };
 
-        let Some(device_id) = device_node_id else {
+        let Some(device_id) = device_id else {
             warn!("Input device '{}' not found in available inputs", device_name);
             return;
         };
+
+        // Disconnect any existing links to the capture node before creating new ones.
+        // This handles the case where the user changes input device selection.
+        let existing_links: Vec<u32> = self.state.pw_graph
+            .links_to_node(capture_node_id)
+            .iter()
+            .map(|l| l.id)
+            .collect();
+        for link_id in existing_links {
+            debug!("Disconnecting existing input link {} before routing new device", link_id);
+            self.send_pw_command(PwCommand::DestroyLink { link_id });
+        }
 
         // Create links from input device -> loopback capture
         let port_pairs = self.state.pw_graph.find_port_pairs(device_id, capture_node_id);
@@ -2151,6 +2172,30 @@ impl SootMix {
 
     /// Delete a mixer channel.
     fn cmd_delete_channel(&mut self, channel_id: Uuid) {
+        info!("Deleting channel: {}, daemon_connected: {}", channel_id, self.daemon_connected);
+
+        // Check if this is an input channel - handle locally since daemon doesn't support input channels yet
+        let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
+        info!("Channel {} is_input: {}", channel_id, is_input);
+
+        if is_input {
+            // Input channels are managed locally, not by daemon
+            // Destroy virtual source for input channels
+            let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
+            info!("Input channel source_id: {:?}", source_id);
+            if let Some(node_id) = source_id {
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+            }
+            let capture_id = self.state.channel(channel_id).and_then(|c| c.pw_loopback_capture_id);
+            info!("Input channel capture_id: {:?}", capture_id);
+            if let Some(node_id) = capture_id {
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+            }
+            info!("Removing input channel {} from state", channel_id);
+            self.state.channels.retain(|c| c.id != channel_id);
+            return;
+        }
+
         if self.daemon_connected {
             if let Err(e) = daemon_client::send_daemon_command(
                 daemon_client::DaemonCommand::DeleteChannel(channel_id.to_string())
@@ -2158,21 +2203,6 @@ impl SootMix {
                 error!("Failed to send delete channel command to daemon: {}", e);
             }
         } else {
-            // Check if this is an input channel
-            let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
-            if is_input {
-                // Destroy virtual source for input channels
-                let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
-                if let Some(node_id) = source_id {
-                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-                }
-                let capture_id = self.state.channel(channel_id).and_then(|c| c.pw_loopback_capture_id);
-                if let Some(node_id) = capture_id {
-                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-                }
-                self.state.channels.retain(|c| c.id != channel_id);
-                return;
-            }
 
             // Get channel info before removing
             let channel_info = self.state.channel(channel_id).map(|c| {
@@ -2323,7 +2353,13 @@ impl SootMix {
             if let Some(channel) = self.state.channel_mut(channel_id) {
                 channel.volume_db = volume_db;
                 let linear = db_to_linear(if channel.muted { -60.0 } else { volume_db });
-                if let Some(node_id) = channel.pw_loopback_output_id {
+                // Use the appropriate node ID based on channel type
+                let node_id = if channel.is_input() {
+                    channel.pw_source_id
+                } else {
+                    channel.pw_loopback_output_id
+                };
+                if let Some(node_id) = node_id {
                     self.send_pw_command(PwCommand::SetVolume { node_id, volume: linear });
                 }
             }
@@ -2348,7 +2384,13 @@ impl SootMix {
         } else {
             if let Some(channel) = self.state.channel_mut(channel_id) {
                 channel.muted = muted;
-                if let Some(node_id) = channel.pw_loopback_output_id {
+                // Use the appropriate node ID based on channel type
+                let node_id = if channel.is_input() {
+                    channel.pw_source_id
+                } else {
+                    channel.pw_loopback_output_id
+                };
+                if let Some(node_id) = node_id {
                     self.send_pw_command(PwCommand::SetMute { node_id, muted });
                 }
             }
@@ -3567,6 +3609,7 @@ impl SootMix {
                 channels,
                 apps,
                 outputs,
+                inputs,
                 master_volume,
                 master_muted,
                 master_output,
@@ -3574,10 +3617,11 @@ impl SootMix {
                 recording_enabled,
             } => {
                 info!(
-                    "Received initial state from daemon: {} channels, {} apps, {} outputs",
+                    "Received initial state from daemon: {} channels, {} apps, {} outputs, {} inputs",
                     channels.len(),
                     apps.len(),
-                    outputs.len()
+                    outputs.len(),
+                    inputs.len()
                 );
 
                 // Update master state
@@ -3654,6 +3698,16 @@ impl SootMix {
                         node_id: output.node_id,
                         name: output.name,
                         description: output.description,
+                    });
+                }
+
+                // Sync inputs from daemon
+                self.state.available_inputs.clear();
+                for input in inputs {
+                    self.state.available_inputs.push(crate::audio::types::InputDevice {
+                        node_id: input.node_id,
+                        name: input.name,
+                        description: input.description,
                     });
                 }
 
@@ -3792,6 +3846,10 @@ impl SootMix {
             OutputsChanged => {
                 debug!("Output devices changed - will refresh on next state query");
                 // The full output list will be refreshed when needed
+            }
+            InputsChanged => {
+                debug!("Input devices changed - will refresh on next state query");
+                // The full input list will be refreshed when needed
             }
         }
     }

@@ -54,6 +54,14 @@ pub fn channel_strip<'a>(
     let name = channel.name.clone();
     let is_drop_target = dragging.is_some();
     let output_device_name = channel.output_device_name.clone();
+    let is_input = channel.kind == ChannelKind::Input;
+
+    // Input channel accent color (cyan) vs output channel (default)
+    let channel_accent = if is_input {
+        SOOTMIX_DARK.accent_primary  // Cyan for inputs
+    } else {
+        TEXT  // Default for outputs
+    };
 
     // Check if this channel is being edited
     let is_editing = editing.map(|(eid, _)| *eid == id).unwrap_or(false);
@@ -96,6 +104,22 @@ pub fn channel_strip<'a>(
             })
             .on_press(Message::StartEditingChannelName(id))
             .into()
+    };
+
+    // === CHANNEL TYPE BADGE (for input channels) ===
+    let type_badge: Element<Message> = if is_input {
+        container(
+            text("MIC").size(TEXT_CAPTION).color(SOOTMIX_DARK.canvas)
+        )
+        .padding([2.0, SPACING_XS])
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.accent_primary)),
+            border: Border::default().rounded(RADIUS_SM),
+            ..container::Style::default()
+        })
+        .into()
+    } else {
+        Space::new().width(0).height(0).into()
     };
 
     // === EQ BUTTON ===
@@ -151,7 +175,7 @@ pub fn channel_strip<'a>(
                 width: 24,
                 border_radius: RADIUS_SM.into(),
             },
-            background: Background::Color(if muted { MUTED_COLOR } else { TEXT }),
+            background: Background::Color(if muted { MUTED_COLOR } else { channel_accent }),
             border_width: 0.0,
             border_color: Color::TRANSPARENT,
         },
@@ -453,8 +477,8 @@ pub fn channel_strip<'a>(
 
     // === ASSEMBLE CHANNEL STRIP ===
     let content = column![
-        // Header: name + delete
-        row![name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
+        // Header: type badge (if input) + name + delete
+        row![type_badge, name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
         Space::new().height(SPACING_SM),
         // Controls: EQ + FX
         row![eq_button, Space::new().width(SPACING_SM), fx_btn,].align_y(Alignment::Center),
@@ -825,6 +849,11 @@ pub fn app_card(channel: &MixerChannel) -> Element<Message> {
     let id = channel.id;
     let assigned_apps = &channel.assigned_apps;
 
+    // Input channels show recording destinations instead of apps
+    if channel.kind == ChannelKind::Input {
+        return input_channel_card(channel);
+    }
+
     let (content, card_height): (Element<Message>, f32) = if assigned_apps.is_empty() {
         (
             text("No apps")
@@ -863,6 +892,54 @@ pub fn app_card(channel: &MixerChannel) -> Element<Message> {
     )
     .width(CHANNEL_STRIP_WIDTH)
     .height(card_height)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border::default()
+            .rounded(RADIUS_SM)
+            .color(SOOTMIX_DARK.border_subtle)
+            .width(1.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// Card shown below input channels (instead of app list).
+/// Shows input status and recording destinations.
+fn input_channel_card(channel: &MixerChannel) -> Element<'static, Message> {
+    let input_status = if let Some(ref device_name) = channel.input_device_name {
+        // Truncate long device names
+        let display_name = if device_name.len() > 20 {
+            format!("{}...", &device_name[..17])
+        } else {
+            device_name.clone()
+        };
+        column![
+            text("🎤").size(16.0),
+            text(display_name)
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM),
+        ]
+        .spacing(SPACING_XS)
+        .align_x(Alignment::Center)
+    } else {
+        column![
+            text("🎤").size(16.0).color(TEXT_DIM),
+            text("No input")
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM),
+        ]
+        .spacing(SPACING_XS)
+        .align_x(Alignment::Center)
+    };
+
+    container(
+        column![input_status]
+            .padding(PADDING_COMPACT)
+            .align_x(Alignment::Center),
+    )
+    .width(CHANNEL_STRIP_WIDTH)
+    .height(APP_CARD_MIN_HEIGHT)
+    .center(Length::Fill)
     .style(|_theme: &Theme| container::Style {
         background: Some(Background::Color(SURFACE)),
         border: Border::default()
