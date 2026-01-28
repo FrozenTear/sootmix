@@ -119,6 +119,13 @@ impl TrayHandle {
     }
 }
 
+impl Drop for TrayHandle {
+    fn drop(&mut self) {
+        info!("TrayHandle dropped — shutting down tray icon");
+        self.handle.shutdown();
+    }
+}
+
 /// Start the system tray icon.
 ///
 /// Returns a receiver for tray messages and a handle to update tray state.

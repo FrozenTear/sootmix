@@ -4,6 +4,7 @@
 
 //! Iced Application implementation for SootMix.
 
+use crate::audio::types::PwLink;
 use crate::audio::{filter_chain, MeterManager, PluginFilterManager, PluginProcessorManager, PwCommand, PwEvent, PwThread};
 use crate::config::eq_preset::EqPreset;
 use crate::config::{ConfigManager, MixerConfig, SavedChannel};
@@ -347,6 +348,73 @@ impl SootMix {
                 let name = format!("Channel {}", channel_num);
                 self.cmd_create_channel(&name);
                 self.save_config();
+            }
+
+            Message::NewInputChannelRequested => {
+                let input_count = self.state.channels.iter().filter(|c| c.is_input()).count() + 1;
+                let name = format!("Mic {}", input_count);
+                self.cmd_create_input_channel(&name);
+                self.save_config();
+            }
+
+            Message::ChannelInputDeviceChanged(channel_id, device_name) => {
+                info!("Input device changed for channel {}: {:?}", channel_id, device_name);
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.input_device_name = device_name.clone();
+                }
+                // Route the selected input device to the channel's loopback capture
+                if let Some(ref device_name) = device_name {
+                    self.route_input_device_to_channel(channel_id, device_name);
+                }
+                self.save_config();
+            }
+
+            Message::ChannelSidetoneToggled(channel_id) => {
+                let (sidetone_enabled, source_id) = self.state.channel(channel_id)
+                    .map(|c| (c.sidetone_enabled, c.pw_source_id))
+                    .unwrap_or((false, None));
+                let new_state = !sidetone_enabled;
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.sidetone_enabled = new_state;
+                }
+                // Sidetone: route the virtual source to the output device
+                if let Some(source_node_id) = source_id {
+                    if new_state {
+                        // Route source to default output
+                        if let Some(output_id) = self.get_output_device_node_id() {
+                            let port_pairs = self.state.pw_graph.find_port_pairs(source_node_id, output_id);
+                            for (out_port, in_port) in &port_pairs {
+                                self.send_pw_command(PwCommand::CreateLink {
+                                    output_port: *out_port,
+                                    input_port: *in_port,
+                                });
+                            }
+                        }
+                    } else {
+                        // Destroy sidetone links (source -> output)
+                        if let Some(output_id) = self.get_output_device_node_id() {
+                            let links: Vec<u32> = self.state.pw_graph.links.values()
+                                .filter(|l| l.output_node == source_node_id && l.input_node == output_id)
+                                .map(|l| l.id)
+                                .collect();
+                            for link_id in links {
+                                self.send_pw_command(PwCommand::DestroyLink { link_id });
+                            }
+                        }
+                    }
+                }
+                self.save_config();
+            }
+
+            Message::ChannelSidetoneVolumeChanged(channel_id, volume_db) => {
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.sidetone_volume_db = volume_db;
+                }
+                // Apply sidetone volume to the source node
+                if let Some(source_node_id) = self.state.channel(channel_id).and_then(|c| c.pw_source_id) {
+                    let linear = db_to_linear(volume_db);
+                    self.send_pw_command(PwCommand::SetVolume { node_id: source_node_id, volume: linear });
+                }
             }
 
             // ==================== App Drag & Drop ====================
@@ -917,9 +985,17 @@ impl SootMix {
             }
             Message::PwNodeAdded(node) => {
                 debug!("Node added: {} ({})", node.name, node.id);
+
+                // Check if a previously-saved output device has reappeared
+                // (USB reconnect, Bluetooth reconnect, etc.)
+                if self.state.startup_complete {
+                    self.handle_device_reappearance(&node);
+                }
+
                 self.state.pw_graph.nodes.insert(node.id, node);
                 self.state.update_available_apps();
                 self.state.update_available_outputs();
+                self.state.update_available_inputs();
 
                 // Check for auto-routing after startup is complete
                 if self.state.startup_complete {
@@ -931,9 +1007,19 @@ impl SootMix {
             }
             Message::PwNodeRemoved(id) => {
                 debug!("Node removed: {}", id);
+
+                // Clear from auto-routed tracking so the app can be re-routed
+                // when it restarts with a new node ID (e.g. game crash, browser restart)
+                self.state.auto_routed_apps.remove(&id);
+
+                // Check if a channel's output device was removed — if so, fall back
+                // to the default output device to keep audio flowing.
+                self.handle_device_removal(id);
+
                 self.state.pw_graph.nodes.remove(&id);
                 self.state.update_available_apps();
                 self.state.update_available_outputs();
+                self.state.update_available_inputs();
             }
             Message::PwNodeChanged(node) => {
                 self.state.pw_graph.nodes.insert(node.id, node);
@@ -945,6 +1031,11 @@ impl SootMix {
                 self.state.pw_graph.ports.remove(&id);
             }
             Message::PwLinkAdded(link) => {
+                // Detect WirePlumber conflicts: if an assigned app just got linked
+                // to a non-sootmix sink, destroy that link and re-route to our sink.
+                if self.state.startup_complete {
+                    self.fix_wireplumber_conflict(&link);
+                }
                 self.state.pw_graph.links.insert(link.id, link);
             }
             Message::PwLinkRemoved(id) => {
@@ -1857,13 +1948,14 @@ impl SootMix {
 
         // Build channel strip + app card columns
         let available_outputs = &self.state.available_outputs;
+        let available_inputs = &self.state.available_inputs;
         let channel_columns: Vec<Element<Message>> = self
             .state
             .channels
             .iter()
             .map(|c| {
                 let is_selected = selected_channel == Some(c.id);
-                let strip = channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, is_selected);
+                let strip = channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, available_inputs, is_selected);
                 let card = app_card(c);
                 column![strip, Space::new().height(SPACING_SM), card]
                     .align_x(Alignment::Center)
@@ -1922,6 +2014,17 @@ impl SootMix {
             })
             .on_press(Message::NewChannelRequested);
 
+        let add_input_button: Element<Message> = button(text("+ New Mic").size(14))
+            .padding([10, 20])
+            .style(|_theme: &Theme, _status| button::Style {
+                background: Some(Background::Color(SUCCESS)),
+                text_color: TEXT,
+                border: standard_border(),
+                ..button::Style::default()
+            })
+            .on_press(Message::NewInputChannelRequested)
+            .into();
+
         // Error display
         let error_text: Element<Message> = if let Some(ref err) = self.state.last_error {
             text(format!("Error: {}", err))
@@ -1934,6 +2037,8 @@ impl SootMix {
 
         row![
             add_button,
+            Space::new().width(SPACING),
+            add_input_button,
             Space::new().width(Fill),
             error_text,
         ]
@@ -1994,6 +2099,56 @@ impl SootMix {
         }
     }
 
+    /// Create a new input (microphone) channel.
+    fn cmd_create_input_channel(&mut self, name: &str) -> Option<Uuid> {
+        // Input channels only work in standalone mode for now
+        let channel = MixerChannel::new_input(name);
+        let id = channel.id;
+        self.state.channels.push(channel);
+        self.send_pw_command(PwCommand::CreateVirtualSource {
+            channel_id: id,
+            name: name.to_string(),
+        });
+        Some(id)
+    }
+
+    /// Route an input device to an input channel's loopback capture node.
+    fn route_input_device_to_channel(&mut self, channel_id: Uuid, device_name: &str) {
+        let (loopback_capture_id, _source_id) = self.state.channel(channel_id)
+            .map(|c| (c.pw_loopback_capture_id, c.pw_source_id))
+            .unwrap_or((None, None));
+
+        let Some(capture_node_id) = loopback_capture_id else {
+            warn!("Input channel {} has no loopback capture node yet", channel_id);
+            return;
+        };
+
+        // Find the input device node
+        let device_node_id = self.state.available_inputs.iter()
+            .find(|d| d.description == device_name || d.name == device_name)
+            .map(|d| d.node_id);
+
+        let Some(device_id) = device_node_id else {
+            warn!("Input device '{}' not found in available inputs", device_name);
+            return;
+        };
+
+        // Create links from input device -> loopback capture
+        let port_pairs = self.state.pw_graph.find_port_pairs(device_id, capture_node_id);
+        if port_pairs.is_empty() {
+            warn!("No matching ports between input device {} and capture node {}", device_id, capture_node_id);
+            return;
+        }
+        for (out_port, in_port) in &port_pairs {
+            self.send_pw_command(PwCommand::CreateLink {
+                output_port: *out_port,
+                input_port: *in_port,
+            });
+        }
+        info!("Routed input device '{}' (node {}) to channel {} capture node {}",
+              device_name, device_id, channel_id, capture_node_id);
+    }
+
     /// Delete a mixer channel.
     fn cmd_delete_channel(&mut self, channel_id: Uuid) {
         if self.daemon_connected {
@@ -2003,6 +2158,22 @@ impl SootMix {
                 error!("Failed to send delete channel command to daemon: {}", e);
             }
         } else {
+            // Check if this is an input channel
+            let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
+            if is_input {
+                // Destroy virtual source for input channels
+                let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
+                if let Some(node_id) = source_id {
+                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                }
+                let capture_id = self.state.channel(channel_id).and_then(|c| c.pw_loopback_capture_id);
+                if let Some(node_id) = capture_id {
+                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                }
+                self.state.channels.retain(|c| c.id != channel_id);
+                return;
+            }
+
             // Get channel info before removing
             let channel_info = self.state.channel(channel_id).map(|c| {
                 (c.pw_sink_id, c.assigned_apps.clone(), c.is_managed, c.pw_eq_node_id)
@@ -2659,14 +2830,21 @@ impl SootMix {
                 self.state.pw_connected = false;
             }
             PwEvent::NodeAdded(node) => {
+                if self.state.startup_complete {
+                    self.handle_device_reappearance(&node);
+                }
                 self.state.pw_graph.nodes.insert(node.id, node);
                 self.state.update_available_apps();
                 self.state.update_available_outputs();
+                self.state.update_available_inputs();
             }
             PwEvent::NodeRemoved(id) => {
+                self.state.auto_routed_apps.remove(&id);
+                self.handle_device_removal(id);
                 self.state.pw_graph.nodes.remove(&id);
                 self.state.update_available_apps();
                 self.state.update_available_outputs();
+                self.state.update_available_inputs();
             }
             PwEvent::NodeChanged(node) => {
                 self.state.pw_graph.nodes.insert(node.id, node);
@@ -2678,6 +2856,9 @@ impl SootMix {
                 self.state.pw_graph.ports.remove(&id);
             }
             PwEvent::LinkAdded(link) => {
+                if self.state.startup_complete {
+                    self.fix_wireplumber_conflict(&link);
+                }
                 self.state.pw_graph.links.insert(link.id, link);
             }
             PwEvent::LinkRemoved(id) => {
@@ -2866,6 +3047,24 @@ impl SootMix {
                     self.state.master_recording_enabled = false;
                 }
             }
+            PwEvent::VirtualSourceCreated { channel_id, source_node_id, loopback_capture_node_id } => {
+                info!("PwEvent: VirtualSourceCreated channel={} source={} loopback_capture={:?}",
+                    channel_id, source_node_id, loopback_capture_node_id);
+
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.pw_source_id = Some(source_node_id);
+                    channel.pw_loopback_capture_id = loopback_capture_node_id;
+                    info!("Updated input channel '{}' pw_source_id={}, loopback_capture_id={:?}",
+                          channel.name, source_node_id, loopback_capture_node_id);
+                }
+
+                // If an input device was already selected, route from it to the loopback capture
+                let input_device_name = self.state.channel(channel_id)
+                    .and_then(|c| c.input_device_name.clone());
+                if let Some(ref device_name) = input_device_name {
+                    self.route_input_device_to_channel(channel_id, device_name);
+                }
+            }
             PwEvent::Error(err) => {
                 self.state.last_error = Some(err);
             }
@@ -2877,6 +3076,147 @@ impl SootMix {
     }
 
     /// Save routing rules to disk.
+    /// Detect and fix WirePlumber link conflicts.
+    ///
+    /// When WirePlumber auto-links an app directly to a hardware sink but that app
+    /// is assigned to a sootmix channel, destroy the unwanted link and re-route
+    /// the app to its assigned virtual sink. This runs on every LinkAdded event.
+    fn fix_wireplumber_conflict(&mut self, link: &PwLink) {
+        let output_node = link.output_node;
+        let input_node = link.input_node;
+
+        // Only care about links TO non-sootmix sinks
+        let is_our_sink = self.state.channels.iter()
+            .any(|c| c.pw_sink_id == Some(input_node));
+        if is_our_sink {
+            return;
+        }
+
+        // Check if the input node is actually a sink
+        let is_sink = self.state.pw_graph.nodes.get(&input_node)
+            .map(|n| n.media_class == crate::audio::types::MediaClass::AudioSink)
+            .unwrap_or(false);
+        if !is_sink {
+            return;
+        }
+
+        // Check if the output node (app) is assigned to one of our channels
+        let app_identifier = self.state.available_apps.iter()
+            .find(|a| a.node_id == output_node)
+            .map(|a| a.identifier().to_string());
+
+        let app_id = match app_identifier {
+            Some(id) => id,
+            None => return,
+        };
+
+        let assigned_channel = self.state.channels.iter()
+            .find(|c| c.assigned_apps.contains(&app_id) && c.pw_sink_id.is_some())
+            .map(|c| (c.id, c.pw_sink_id.unwrap()));
+
+        if let Some((channel_id, sink_id)) = assigned_channel {
+            // This app is assigned to our channel but WirePlumber linked it elsewhere.
+            // Destroy the rogue link and re-route.
+            info!(
+                "WirePlumber conflict: app '{}' (node {}) linked to hardware sink {} instead of sootmix sink {}. Fixing.",
+                app_id, output_node, input_node, sink_id
+            );
+            self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+
+            // Re-route to our sink
+            let port_pairs = self.state.pw_graph.find_port_pairs(output_node, sink_id);
+            for (out_port, in_port) in port_pairs {
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port: out_port,
+                    input_port: in_port,
+                });
+            }
+        }
+    }
+
+    /// Handle removal of an output device node.
+    ///
+    /// When a device disappears (USB unplug, Bluetooth disconnect, HDMI removed),
+    /// any channels routed to that device must fall back to the default output so
+    /// audio keeps flowing.
+    fn handle_device_removal(&mut self, removed_node_id: u32) {
+        // Check if any channel was routed to this device
+        let affected: Vec<(Uuid, u32)> = self.state.channels.iter()
+            .filter(|c| c.output_device_id == Some(removed_node_id))
+            .filter_map(|c| c.pw_loopback_output_id.map(|lb| (c.id, lb)))
+            .collect();
+
+        if affected.is_empty() {
+            return;
+        }
+
+        info!(
+            "Output device {} removed, re-routing {} channel(s) to default",
+            removed_node_id,
+            affected.len()
+        );
+
+        for (channel_id, loopback_output_id) in affected {
+            // Clear the runtime device ID (keep output_device_name for re-routing later)
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.output_device_id = None;
+            }
+
+            // Route to default device (None = default)
+            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                loopback_output_node: loopback_output_id,
+                target_device_id: None,
+            });
+        }
+    }
+
+    /// Handle addition of an output device node.
+    ///
+    /// When a device reappears, check if any channels were previously routed to it
+    /// (by saved device name) and restore that routing.
+    fn handle_device_reappearance(&mut self, node: &crate::audio::types::PwNode) {
+        use crate::audio::types::MediaClass;
+
+        // Only care about audio sink devices
+        if node.media_class != MediaClass::AudioSink {
+            return;
+        }
+
+        // Check if any channel has this device saved as its output
+        let affected: Vec<(Uuid, u32)> = self.state.channels.iter()
+            .filter(|c| {
+                if let Some(ref saved_name) = c.output_device_name {
+                    // Match against the node description or name
+                    node.description == *saved_name || node.name == *saved_name
+                } else {
+                    false
+                }
+            })
+            .filter(|c| c.output_device_id.is_none()) // Only if not already routed
+            .filter_map(|c| c.pw_loopback_output_id.map(|lb| (c.id, lb)))
+            .collect();
+
+        if affected.is_empty() {
+            return;
+        }
+
+        info!(
+            "Output device '{}' (node {}) reappeared, re-routing {} channel(s)",
+            node.description, node.id, affected.len()
+        );
+
+        for (channel_id, loopback_output_id) in affected {
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.output_device_id = Some(node.id);
+            }
+
+            self.send_pw_command(PwCommand::RouteChannelToDevice {
+                loopback_output_node: loopback_output_id,
+                target_device_id: Some(node.id),
+            });
+        }
+    }
+
     fn save_routing_rules(&self) {
         if let Some(ref cm) = self.config_manager {
             if let Err(e) = cm.save_routing_rules(&self.state.routing_rules) {
@@ -3040,6 +3380,10 @@ impl SootMix {
                         assigned_apps: c.assigned_apps.clone(),
                         plugin_chain: c.plugin_chain.clone(),
                         output_device_name: c.output_device_name.clone(),
+                        kind: c.kind,
+                        input_device_name: c.input_device_name.clone(),
+                        sidetone_enabled: c.sidetone_enabled,
+                        sidetone_volume_db: c.sidetone_volume_db,
                     })
                     .collect(),
             };
@@ -3092,11 +3436,20 @@ impl SootMix {
 
             for saved in config.channels {
                 if saved.is_managed {
-                    // Managed channel - create new pw-loopback sink
-                    debug!("Restoring channel '{}' (id={}) with {} assigned apps: {:?}",
-                        saved.name, saved.id, saved.assigned_apps.len(), saved.assigned_apps);
+                    use crate::state::ChannelKind;
 
-                    let mut channel = MixerChannel::new(&saved.name);
+                    let is_input = saved.kind == ChannelKind::Input;
+                    debug!("Restoring {} channel '{}' (id={}) {}",
+                        if is_input { "input" } else { "output" },
+                        saved.name, saved.id,
+                        if is_input { format!("input_device={:?}", saved.input_device_name) }
+                        else { format!("assigned_apps={:?}", saved.assigned_apps) });
+
+                    let mut channel = if is_input {
+                        MixerChannel::new_input(&saved.name)
+                    } else {
+                        MixerChannel::new(&saved.name)
+                    };
                     channel.id = saved.id;
                     channel.volume_db = saved.volume_db;
                     channel.muted = saved.muted;
@@ -3105,6 +3458,9 @@ impl SootMix {
                     channel.assigned_apps = saved.assigned_apps;
                     channel.plugin_chain = saved.plugin_chain.clone();
                     channel.output_device_name = saved.output_device_name;
+                    channel.input_device_name = saved.input_device_name;
+                    channel.sidetone_enabled = saved.sidetone_enabled;
+                    channel.sidetone_volume_db = saved.sidetone_volume_db;
 
                     let id = channel.id;
                     let name = channel.name.clone();
@@ -3136,17 +3492,24 @@ impl SootMix {
 
                     self.state.channels.push(channel);
 
-                    info!("Created channel in state: id={}, name='{}', assigned_apps count={}, plugins={}",
+                    info!("Created channel in state: id={}, name='{}', kind={:?}",
                         id, name,
-                        self.state.channel(id).map(|c| c.assigned_apps.len()).unwrap_or(0),
-                        self.state.channel(id).map(|c| c.plugin_instances.len()).unwrap_or(0)
+                        if is_input { "Input" } else { "Output" }
                     );
 
-                    // Create the virtual sink (uses channel name for node.name, readable in Helvum)
-                    self.send_pw_command(PwCommand::CreateVirtualSink {
-                        channel_id: id,
-                        name,
-                    });
+                    if is_input {
+                        // Create virtual source for input channel
+                        self.send_pw_command(PwCommand::CreateVirtualSource {
+                            channel_id: id,
+                            name,
+                        });
+                    } else {
+                        // Create virtual sink for output channel
+                        self.send_pw_command(PwCommand::CreateVirtualSink {
+                            channel_id: id,
+                            name,
+                        });
+                    }
                 }
             }
 
@@ -3253,6 +3616,13 @@ impl SootMix {
                             } else {
                                 Some(ch_info.output_device)
                             },
+                            kind: crate::state::ChannelKind::default(),
+                            input_device_name: None,
+                            input_device_id: None,
+                            pw_source_id: None,
+                            pw_loopback_capture_id: None,
+                            sidetone_enabled: false,
+                            sidetone_volume_db: -20.0,
                         };
                         self.state.channels.push(channel);
                     }
@@ -3320,6 +3690,13 @@ impl SootMix {
                             } else {
                                 Some(ch_info.output_device)
                             },
+                            kind: crate::state::ChannelKind::default(),
+                            input_device_name: None,
+                            input_device_id: None,
+                            pw_source_id: None,
+                            pw_loopback_capture_id: None,
+                            sidetone_enabled: false,
+                            sidetone_volume_db: -20.0,
                         };
                         self.state.channels.push(channel);
                     }

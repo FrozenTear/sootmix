@@ -58,8 +58,16 @@ pub enum Message {
     /// Toggle master recording output.
     ToggleMasterRecording,
 
-    /// Request to create a new channel.
+    /// Request to create a new output channel.
     NewChannelRequested,
+    /// Request to create a new input (mic) channel.
+    NewInputChannelRequested,
+    /// Channel input device changed (channel_id, device_name or None for default).
+    ChannelInputDeviceChanged(Uuid, Option<String>),
+    /// Toggle sidetone (input monitoring) on an input channel.
+    ChannelSidetoneToggled(Uuid),
+    /// Sidetone volume changed (channel_id, volume_db).
+    ChannelSidetoneVolumeChanged(Uuid, f32),
     /// Global preset selected.
     PresetSelected(String),
     /// Save current configuration as preset.

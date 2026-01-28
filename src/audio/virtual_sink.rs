@@ -157,6 +157,84 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     })
 }
 
+/// Result of creating a virtual source (for mic/input channels).
+#[derive(Debug, Clone, Copy)]
+pub struct VirtualSourceResult {
+    /// The Audio/Source node ID (recording apps connect here).
+    pub source_node_id: u32,
+    /// The Stream/Input/Audio node ID (loopback capture from physical device).
+    pub loopback_capture_node_id: Option<u32>,
+}
+
+/// Create a virtual source using pw-loopback (reverse direction).
+///
+/// This creates a pw-loopback that:
+/// - Captures audio from a physical input device (mic)
+/// - Exposes an Audio/Source node that recording apps (Discord, OBS) can use
+///
+/// The capture side becomes the virtual source, and the playback side
+/// is a Stream/Input/Audio that reads from the physical device.
+pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSourceResult, VirtualSinkError> {
+    ensure_processes_map();
+
+    let safe_name: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let source_node_name = format!("sootmix.{}", safe_name);
+    let loopback_node_name = format!("sootmix.{}.capture", safe_name);
+
+    // The "playback" side of pw-loopback becomes our Audio/Source
+    // (apps record from this). We swap the media.class roles.
+    let playback_props = format!(
+        "media.class=Audio/Source node.name={} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
+        source_node_name, description
+    );
+
+    // The "capture" side reads from the system — it's a Stream/Input/Audio
+    // that captures from the default (or specified) input device.
+    let capture_props = format!(
+        "media.class=Stream/Input/Audio node.autoconnect=true audio.position=[FL FR] \
+         object.linger=true session.suspend-timeout-enabled=false"
+    );
+
+    info!("Creating virtual source: {} (description: {})", source_node_name, description);
+    debug!("playback_props (source): {}", playback_props);
+    debug!("capture_props (stream): {}", capture_props);
+
+    let child = Command::new("pw-loopback")
+        .arg("--name")
+        .arg(&loopback_node_name)
+        .arg("--capture-props")
+        .arg(&capture_props)
+        .arg("--playback-props")
+        .arg(&playback_props)
+        .spawn()?;
+
+    let pid = child.id();
+    debug!("pw-loopback (source) spawned with PID: {}", pid);
+
+    // Poll for the Audio/Source node
+    let source_node_id = poll_for_node(&source_node_name, 4, 20)?;
+
+    // Find the loopback capture node
+    let full_loopback_name = format!("capture.{}", loopback_node_name);
+    let loopback_capture_node_id = find_node_by_name_and_class(&full_loopback_name, "Stream/Input/Audio").ok();
+
+    // Track the process
+    if let Some(ref mut map) = *get_processes() {
+        map.insert(source_node_id, child);
+    }
+
+    info!("Created virtual source '{}' with source_id={}, loopback_capture_id={:?}",
+          source_node_name, source_node_id, loopback_capture_node_id);
+
+    Ok(VirtualSourceResult {
+        source_node_id,
+        loopback_capture_node_id,
+    })
+}
+
 /// Update the description of an existing node using pw-cli.
 ///
 /// This allows renaming a channel without recreating the virtual sink,
@@ -455,79 +533,7 @@ fn find_node_by_name_and_class(name: &str, target_class: &str) -> Result<u32, Vi
     Err(VirtualSinkError::NodeNotFound)
 }
 
-/// Result of creating a virtual source for recording.
-#[derive(Debug, Clone, Copy)]
-pub struct VirtualSourceResult {
-    /// The Audio/Source node ID (recording apps connect here).
-    pub source_node_id: u32,
-    /// The Stream/Input/Audio node ID (receives audio from master output).
-    pub capture_stream_node_id: Option<u32>,
-}
-
-/// Create a virtual source for recording using pw-loopback.
-///
-/// This creates an Audio/Source that recording applications can use as input.
-/// The capture side (Stream/Input/Audio) receives audio from the master output.
-///
-/// Returns both the source node ID and optionally the capture stream node ID.
-pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualSinkError> {
-    ensure_processes_map();
-
-    // Sanitize name for use in properties
-    let safe_name = name
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .collect::<String>();
-
-    // The source node name (what recording apps see)
-    let source_name = format!("sootmix.recording.{}", safe_name);
-
-    // Capture props: Stream/Input/Audio that receives from master output
-    // node.passive=true means it auto-connects to default sink monitor
-    let capture_props = format!(
-        "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]"
-    );
-
-    // Playback props: Audio/Source that recording apps connect to
-    let playback_props = format!(
-        "media.class=Audio/Source node.name={} node.description=\"SootMix Recording - {}\" audio.position=[FL FR]",
-        source_name, name
-    );
-
-    info!("Creating virtual source for recording: {}", name);
-    debug!("capture_props: {}", capture_props);
-    debug!("playback_props: {}", playback_props);
-
-    // Spawn pw-loopback as a background process
-    let child = Command::new("pw-loopback")
-        .arg("--capture-props")
-        .arg(&capture_props)
-        .arg("--playback-props")
-        .arg(&playback_props)
-        .spawn()?;
-
-    let pid = child.id();
-    debug!("pw-loopback (source) spawned with PID: {}", pid);
-
-    // Poll for node registration with exponential backoff
-    let source_node_id = poll_for_node_with_class(&source_name, "Audio/Source", 4, 20)?;
-
-    // Find the capture stream node ID (for routing if needed)
-    // Note: The capture stream auto-connects via node.passive=true, so we may not need this
-    let capture_stream_node_id = None; // Can be found later if needed
-
-    // Track the process (use source node ID as key)
-    if let Some(ref mut map) = *get_processes() {
-        map.insert(source_node_id, child);
-    }
-
-    info!("Created virtual source '{}' with source_id={}", name, source_node_id);
-
-    Ok(VirtualSourceResult {
-        source_node_id,
-        capture_stream_node_id,
-    })
-}
+// Note: VirtualSourceResult and create_virtual_source are defined above (near create_virtual_sink_full).
 
 /// Destroy a virtual source by killing its pw-loopback process.
 pub fn destroy_virtual_source(node_id: u32) -> Result<(), VirtualSinkError> {

@@ -233,3 +233,21 @@ impl OutputDevice {
         }
     }
 }
+
+/// Information about an input device (for microphone selection).
+#[derive(Debug, Clone)]
+pub struct InputDevice {
+    pub node_id: u32,
+    pub name: String,
+    pub description: String,
+}
+
+impl InputDevice {
+    pub fn display_name(&self) -> &str {
+        if !self.description.is_empty() {
+            &self.description
+        } else {
+            &self.name
+        }
+    }
+}

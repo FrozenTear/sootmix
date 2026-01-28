@@ -4,7 +4,7 @@
 
 //! Application state management.
 
-use crate::audio::types::{AudioChannel, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort};
+use crate::audio::types::{AudioChannel, InputDevice, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort};
 use crate::config::RoutingRulesConfig;
 use crate::plugins::{PluginSlotConfig, PluginType};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,17 @@ impl MeterDisplayState {
     }
 }
 
+/// Whether a channel handles output (app audio) or input (mic capture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ChannelKind {
+    /// Routes app audio through a virtual sink to the output device.
+    #[default]
+    Output,
+    /// Captures from a physical input device (mic) and exposes a virtual source
+    /// that recording apps (Discord, OBS) can use.
+    Input,
+}
+
 /// A virtual mixer channel created by SootMix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixerChannel {
@@ -178,14 +189,46 @@ pub struct MixerChannel {
     /// Shared with the audio processing thread for lock-free level updates.
     #[serde(skip)]
     pub meter_levels: Option<std::sync::Arc<crate::audio::meter_stream::AtomicMeterLevels>>,
+
+    // ==================== Input Channel Fields ====================
+
+    /// Whether this channel is an output (app routing) or input (mic capture) channel.
+    #[serde(default)]
+    pub kind: ChannelKind,
+    /// Input device name for persistence (description of the mic/input device).
+    /// Only used when kind == Input.
+    #[serde(default)]
+    pub input_device_name: Option<String>,
+    /// Runtime input device node ID (not serialized).
+    #[serde(skip)]
+    pub input_device_id: Option<u32>,
+    /// Runtime virtual source node ID (Audio/Source created by pw-loopback).
+    /// Apps (Discord, OBS) connect to this to get processed mic audio.
+    #[serde(skip)]
+    pub pw_source_id: Option<u32>,
+    /// Runtime loopback capture node ID for input channels.
+    /// This is the Stream/Input/Audio node that captures from the physical device.
+    #[serde(skip)]
+    pub pw_loopback_capture_id: Option<u32>,
+    /// Whether sidetone (input monitoring) is enabled.
+    /// Routes processed mic audio to the headphone output.
+    #[serde(default)]
+    pub sidetone_enabled: bool,
+    /// Sidetone volume in decibels (-60.0 to 0.0).
+    #[serde(default = "default_sidetone_db")]
+    pub sidetone_volume_db: f32,
 }
 
 fn default_is_managed() -> bool {
     true
 }
 
+fn default_sidetone_db() -> f32 {
+    -20.0
+}
+
 impl MixerChannel {
-    /// Create a new channel.
+    /// Create a new output channel (routes app audio to output device).
     pub fn new(name: impl Into<String>) -> Self {
         use crate::audio::meter_stream::AtomicMeterLevels;
         use std::sync::Arc;
@@ -210,7 +253,54 @@ impl MixerChannel {
             output_device_name: None,
             pw_loopback_output_id: None,
             meter_levels: Some(Arc::new(AtomicMeterLevels::new())),
+            kind: ChannelKind::Output,
+            input_device_name: None,
+            input_device_id: None,
+            pw_source_id: None,
+            pw_loopback_capture_id: None,
+            sidetone_enabled: false,
+            sidetone_volume_db: -20.0,
         }
+    }
+
+    /// Create a new input channel (captures from mic/input device).
+    pub fn new_input(name: impl Into<String>) -> Self {
+        use crate::audio::meter_stream::AtomicMeterLevels;
+        use std::sync::Arc;
+
+        let name = name.into();
+        Self {
+            id: Uuid::new_v4(),
+            sink_name: Some(format!("sootmix.{}", name)),
+            kind: ChannelKind::Input,
+            name,
+            volume_db: 0.0,
+            muted: false,
+            eq_enabled: false,
+            eq_preset: "Flat".to_string(),
+            assigned_apps: Vec::new(),
+            is_managed: true,
+            pw_sink_id: None,
+            pw_eq_node_id: None,
+            meter_display: MeterDisplayState::default(),
+            plugin_chain: Vec::new(),
+            plugin_instances: Vec::new(),
+            output_device_id: None,
+            output_device_name: None,
+            pw_loopback_output_id: None,
+            meter_levels: Some(Arc::new(AtomicMeterLevels::new())),
+            input_device_name: None,
+            input_device_id: None,
+            pw_source_id: None,
+            pw_loopback_capture_id: None,
+            sidetone_enabled: false,
+            sidetone_volume_db: -20.0,
+        }
+    }
+
+    /// Whether this is an input (mic) channel.
+    pub fn is_input(&self) -> bool {
+        self.kind == ChannelKind::Input
     }
 
     /// Convert volume in dB to linear scale (0.0 to ~4.0 for +12dB).
@@ -482,6 +572,8 @@ pub struct AppState {
     pub available_apps: Vec<AppInfo>,
     /// Available output devices (populated from PipeWire).
     pub available_outputs: Vec<OutputDevice>,
+    /// Available input devices (populated from PipeWire).
+    pub available_inputs: Vec<InputDevice>,
     /// Current PipeWire graph state.
     pub pw_graph: PwGraphState,
     /// Whether connected to PipeWire.
@@ -551,6 +643,7 @@ impl AppState {
             current_preset: "Default".to_string(),
             available_apps: Vec::new(),
             available_outputs: Vec::new(),
+            available_inputs: Vec::new(),
             pw_graph: PwGraphState::new(),
             pw_connected: false,
             eq_panel_channel: None,
@@ -669,6 +762,26 @@ impl AppState {
                     .unwrap_or_else(|| node.name.clone()),
                 binary: node.binary_name.clone(),
                 icon: None,
+            })
+            .collect();
+    }
+
+    /// Update available input devices from PipeWire graph.
+    pub fn update_available_inputs(&mut self) {
+        self.available_inputs = self
+            .pw_graph
+            .nodes
+            .values()
+            .filter(|n| {
+                n.media_class == MediaClass::AudioSource
+                    && !n.name.contains("sootmix.")
+                    && !n.name.starts_with("LB-")
+                    && !n.name.contains("loopback")
+            })
+            .map(|n| InputDevice {
+                node_id: n.id,
+                name: n.name.clone(),
+                description: n.description.clone(),
             })
             .collect();
     }

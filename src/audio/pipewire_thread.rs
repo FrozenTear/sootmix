@@ -36,7 +36,9 @@ pub enum PwCommand {
     /// Create a virtual sink for a channel.
     /// Uses channel name for node.name (readable in Helvum), description for display.
     CreateVirtualSink { channel_id: Uuid, name: String },
-    /// Destroy a virtual sink.
+    /// Create a virtual source for an input (mic) channel.
+    CreateVirtualSource { channel_id: Uuid, name: String },
+    /// Destroy a virtual sink or source.
     DestroyVirtualSink { node_id: u32 },
     /// Update the display name (node.description) of a virtual sink.
     /// This allows renaming without recreating the sink (no audio interruption).
@@ -166,6 +168,8 @@ pub enum PwEvent {
     LinkRemoved(u32),
     /// Virtual sink created successfully.
     VirtualSinkCreated { channel_id: Uuid, node_id: u32, loopback_output_node_id: Option<u32> },
+    /// Virtual source created successfully (for input/mic channels).
+    VirtualSourceCreated { channel_id: Uuid, source_node_id: u32, loopback_capture_node_id: Option<u32> },
     /// Virtual sink destroyed.
     VirtualSinkDestroyed { node_id: u32 },
     /// Recording source created successfully.
@@ -649,6 +653,27 @@ fn handle_command(
                     Err(e) => {
                         let _ = event_tx.send(PwEvent::Error(format!(
                             "Failed to create virtual sink: {}",
+                            e
+                        )));
+                    }
+                }
+            });
+        }
+
+        PwCommand::CreateVirtualSource { channel_id, name } => {
+            debug!("Creating virtual source: '{}' for channel {}", name, channel_id);
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                match crate::audio::virtual_sink::create_virtual_source(&name, &name) {
+                    Ok(result) => {
+                        let _ = event_tx.send(PwEvent::VirtualSourceCreated {
+                            channel_id,
+                            source_node_id: result.source_node_id,
+                            loopback_capture_node_id: result.loopback_capture_node_id,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(PwEvent::Error(format!(
+                            "Failed to create virtual source: {}",
                             e
                         )));
                     }
@@ -1186,7 +1211,7 @@ fn handle_command(
         PwCommand::CreateRecordingSource { name } => {
             info!("Creating recording source: {}", name);
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                match crate::audio::virtual_sink::create_virtual_source(&name) {
+                match crate::audio::virtual_sink::create_virtual_source(&name, &format!("SootMix Recording: {}", name)) {
                     Ok(result) => {
                         let node_id = result.source_node_id;
                         info!("Created recording source '{}' with node_id={}", name, node_id);
@@ -1523,44 +1548,79 @@ fn process_pending_meter_links(state: &Rc<RefCell<PwThreadState>>, added_port: &
             continue;
         }
 
-        // Find sink monitor FL port (we only need one link for interleaved stereo)
-        let sink_monitor_fl = {
+        // Find sink monitor ports (FL and FR) for stereo metering.
+        // PipeWire allows multiple output ports linked to one input port — it
+        // sums them, but with resample.peaks=true we get per-update peak values.
+        // Linking both channels lets each peak through independently when the
+        // stream negotiates stereo (2-channel interleaved) format.
+        let sink_monitor_ports = {
             let state_ref = state.borrow();
-            state_ref.ports.values()
-                .find(|p| {
+            let mut ports: Vec<(u32, String)> = state_ref.ports.values()
+                .filter(|p| {
                     p.node_id == pending.sink_node_id
                         && p.direction == PortDirection::Output
                         && p.name.starts_with("monitor_")
-                        && (p.name.contains("FL") || p.name.ends_with("_0"))
                 })
-                .map(|p| p.id)
+                .map(|p| (p.id, p.name.clone()))
+                .collect();
+            // Sort so FL/0 comes before FR/1
+            ports.sort_by(|a, b| a.1.cmp(&b.1));
+            ports
         };
 
-        // Find the single meter stream input port
-        // pw_stream creates only ONE port regardless of channel count - multi-channel
-        // data is handled as interleaved samples in the buffer, not separate ports
-        let meter_input_port = {
+        // Find all meter stream input ports.
+        // pw_stream may create one port (mono/interleaved) or two (stereo negotiated).
+        let meter_input_ports = {
             let state_ref = state.borrow();
-            state_ref.ports.values()
-                .find(|p| p.node_id == pending.meter_node_id && p.direction == PortDirection::Input)
-                .map(|p| p.id)
+            let mut ports: Vec<(u32, String)> = state_ref.ports.values()
+                .filter(|p| p.node_id == pending.meter_node_id && p.direction == PortDirection::Input)
+                .map(|p| (p.id, p.name.clone()))
+                .collect();
+            ports.sort_by(|a, b| a.1.cmp(&b.1));
+            ports
         };
 
-        // Create a single link from monitor_FL to the meter input
-        // The meter stream receives interleaved stereo data through this single link
-        if let (Some(monitor_fl), Some(input_port)) = (sink_monitor_fl, meter_input_port) {
-            info!(
-                "Creating meter link: sink {} (monitor_FL port {}) -> meter {} (input port {})",
-                pending.sink_name, monitor_fl,
-                pending.meter_name, input_port
-            );
+        if sink_monitor_ports.is_empty() || meter_input_ports.is_empty() {
+            continue;
+        }
 
-            if let Err(e) = crate::audio::routing::create_link(monitor_fl, input_port) {
-                warn!("Failed to create meter link: {:?}", e);
-            } else {
-                debug!("Created meter link: {} -> {}", monitor_fl, input_port);
+        // Link strategy:
+        // - If meter has 2+ input ports: link FL->input0, FR->input1 (true stereo)
+        // - If meter has 1 input port: link both FL and FR to it (PipeWire mixes,
+        //   giving us the combined peak — both meters show the same value)
+        let mut linked = false;
+        if meter_input_ports.len() >= 2 && sink_monitor_ports.len() >= 2 {
+            // True stereo: pair monitor ports with meter input ports
+            for (monitor, meter) in sink_monitor_ports.iter().zip(meter_input_ports.iter()) {
+                info!(
+                    "Creating stereo meter link: sink {} ({} port {}) -> meter {} ({} port {})",
+                    pending.sink_name, monitor.1, monitor.0,
+                    pending.meter_name, meter.1, meter.0,
+                );
+                if let Err(e) = crate::audio::routing::create_link(monitor.0, meter.0) {
+                    warn!("Failed to create meter link: {:?}", e);
+                } else {
+                    linked = true;
+                }
             }
+        } else {
+            // Single input port: link all monitor ports to it
+            let input_port = meter_input_ports[0].0;
+            for (monitor_id, monitor_name) in &sink_monitor_ports {
+                info!(
+                    "Creating meter link: sink {} ({} port {}) -> meter {} (input port {})",
+                    pending.sink_name, monitor_name, monitor_id,
+                    pending.meter_name, input_port,
+                );
+                if let Err(e) = crate::audio::routing::create_link(*monitor_id, input_port) {
+                    warn!("Failed to create meter link: {:?}", e);
+                } else {
+                    linked = true;
+                }
+            }
+        }
 
+        if linked {
             completed_indices.push(index);
         }
     }

@@ -5,6 +5,7 @@
 //! Application configuration (window settings, behavior).
 
 use crate::plugins::PluginSlotConfig;
+use crate::state::ChannelKind;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,6 +118,22 @@ pub struct SavedChannel {
     /// Output device name for per-channel routing (None = default output).
     #[serde(default)]
     pub output_device_name: Option<String>,
+    /// Channel kind (Output or Input). Defaults to Output for backwards compatibility.
+    #[serde(default)]
+    pub kind: ChannelKind,
+    /// Input device name (for input channels).
+    #[serde(default)]
+    pub input_device_name: Option<String>,
+    /// Whether sidetone (input monitoring) is enabled.
+    #[serde(default)]
+    pub sidetone_enabled: bool,
+    /// Sidetone volume in dB.
+    #[serde(default = "default_sidetone_db")]
+    pub sidetone_volume_db: f32,
+}
+
+fn default_sidetone_db() -> f32 {
+    -20.0
 }
 
 /// Master output configuration.

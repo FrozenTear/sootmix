@@ -12,9 +12,9 @@
 //! - Per-channel output routing
 //! - Drop target for drag-and-drop routing
 
-use crate::audio::types::OutputDevice;
+use crate::audio::types::{InputDevice, OutputDevice};
 use crate::message::Message;
-use crate::state::{MeterDisplayState, MixerChannel};
+use crate::state::{ChannelKind, MeterDisplayState, MixerChannel};
 use crate::ui::meter::vu_meter;
 use crate::ui::plugin_chain::fx_button;
 use crate::ui::theme::{self, *};
@@ -44,6 +44,7 @@ pub fn channel_strip<'a>(
     editing: Option<&'a (Uuid, String)>,
     has_active_snapshot: bool,
     available_outputs: &'a [OutputDevice],
+    available_inputs: &'a [InputDevice],
     is_selected: bool,
 ) -> Element<'a, Message> {
     let id = channel.id;
@@ -254,51 +255,45 @@ pub fn channel_strip<'a>(
     let plugin_count = channel.plugin_chain.len();
     let fx_btn = fx_button(id, plugin_count);
 
-    // === OUTPUT DEVICE PICKER ===
+    // === DEVICE PICKER (Output for output channels, Input for input channels) ===
+    let is_input = channel.kind == ChannelKind::Input;
     let max_display_chars = 12;
-    let output_options: Vec<String> = std::iter::once("Default".to_string())
-        .chain(
-            available_outputs
-                .iter()
-                .filter(|d| d.name != "system-default")
-                .map(|d| truncate_string(&d.description, max_display_chars)),
-        )
-        .collect();
 
-    let selected_output = output_device_name
-        .clone()
-        .map(|name| {
-            if name == "Default" {
-                name
-            } else {
-                // Find matching device and truncate its description
-                available_outputs
+    let device_picker: Element<'a, Message> = if is_input {
+        // Input channel: show input device picker + sidetone controls
+        let input_options: Vec<String> = std::iter::once("None".to_string())
+            .chain(
+                available_inputs
+                    .iter()
+                    .map(|d| truncate_string(&d.description, max_display_chars)),
+            )
+            .collect();
+
+        let selected_input = channel.input_device_name
+            .clone()
+            .map(|name| {
+                available_inputs
                     .iter()
                     .find(|d| d.description == name || d.name == name)
                     .map(|d| truncate_string(&d.description, max_display_chars))
                     .unwrap_or_else(|| truncate_string(&name, max_display_chars))
-            }
-        })
-        .or_else(|| Some("Default".to_string()));
+            })
+            .or_else(|| Some("None".to_string()));
 
-    let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
-    let output_picker: Element<'a, Message> = if !has_hw_outputs {
-        Space::new().width(0).height(0).into()
-    } else {
-        // Build a mapping from truncated display names back to full descriptions
-        let display_to_full: Vec<(String, String)> = available_outputs
+        let display_to_full: Vec<(String, String)> = available_inputs
             .iter()
-            .filter(|d| d.name != "system-default")
             .map(|d| (truncate_string(&d.description, max_display_chars), d.description.clone()))
             .collect();
 
-        column![
-            text("Output").size(TEXT_SMALL).color(TEXT_DIM),
-            pick_list(output_options, selected_output, move |selection: String| {
-                let device = if selection == "Default" {
+        let sidetone_enabled = channel.sidetone_enabled;
+        let sidetone_vol = channel.sidetone_volume_db;
+
+        let input_picker = column![
+            text("Input").size(TEXT_SMALL).color(TEXT_DIM),
+            pick_list(input_options, selected_input, move |selection: String| {
+                let device = if selection == "None" {
                     None
                 } else {
-                    // Map truncated display name back to full description
                     let full_name = display_to_full
                         .iter()
                         .find(|(trunc, _)| *trunc == selection)
@@ -306,8 +301,8 @@ pub fn channel_strip<'a>(
                         .unwrap_or(selection);
                     Some(full_name)
                 };
-                Message::ChannelOutputDeviceChanged(id, device)
-            },)
+                Message::ChannelInputDeviceChanged(id, device)
+            })
                 .text_size(TEXT_SMALL)
                 .padding([SPACING_SM, SPACING_SM])
                 .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
@@ -324,8 +319,136 @@ pub fn channel_strip<'a>(
                     }
                 }),
         ]
-        .spacing(SPACING_XS)
-        .into()
+        .spacing(SPACING_XS);
+
+        // Sidetone toggle
+        let sidetone_btn = button(text("MON").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(move |_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let bg_color = if sidetone_enabled {
+                    if is_hovered { lighten(SUCCESS, 0.15) } else { SUCCESS }
+                } else if is_hovered {
+                    SURFACE_LIGHT
+                } else {
+                    SURFACE
+                };
+                button::Style {
+                    background: Some(Background::Color(bg_color)),
+                    text_color: if sidetone_enabled { SOOTMIX_DARK.canvas } else { TEXT },
+                    border: Border::default()
+                        .rounded(RADIUS_SM)
+                        .color(if sidetone_enabled { SUCCESS } else { SURFACE_LIGHT })
+                        .width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ChannelSidetoneToggled(id));
+
+        let sidetone_row: Element<'a, Message> = if sidetone_enabled {
+            let sidetone_slider = slider(-60.0..=0.0, sidetone_vol, move |v| {
+                Message::ChannelSidetoneVolumeChanged(id, v)
+            })
+            .step(0.5)
+            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0 - 50.0))
+            .style(|_theme: &Theme, _status| slider::Style {
+                rail: slider::Rail {
+                    backgrounds: (
+                        Background::Color(SUCCESS),
+                        Background::Color(SLIDER_TRACK),
+                    ),
+                    width: 4.0,
+                    border: Border::default().rounded(2.0),
+                },
+                handle: slider::Handle {
+                    shape: slider::HandleShape::Rectangle {
+                        width: 12,
+                        border_radius: RADIUS_SM.into(),
+                    },
+                    background: Background::Color(TEXT),
+                    border_width: 0.0,
+                    border_color: Color::TRANSPARENT,
+                },
+            });
+            row![sidetone_btn, Space::new().width(SPACING_SM), sidetone_slider]
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            sidetone_btn.into()
+        };
+
+        column![input_picker, Space::new().height(SPACING_XS), sidetone_row]
+            .into()
+    } else {
+        // Output channel: show output device picker
+        let output_options: Vec<String> = std::iter::once("Default".to_string())
+            .chain(
+                available_outputs
+                    .iter()
+                    .filter(|d| d.name != "system-default")
+                    .map(|d| truncate_string(&d.description, max_display_chars)),
+            )
+            .collect();
+
+        let selected_output = output_device_name
+            .clone()
+            .map(|name| {
+                if name == "Default" {
+                    name
+                } else {
+                    available_outputs
+                        .iter()
+                        .find(|d| d.description == name || d.name == name)
+                        .map(|d| truncate_string(&d.description, max_display_chars))
+                        .unwrap_or_else(|| truncate_string(&name, max_display_chars))
+                }
+            })
+            .or_else(|| Some("Default".to_string()));
+
+        let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
+        if !has_hw_outputs {
+            Space::new().width(0).height(0).into()
+        } else {
+            let display_to_full: Vec<(String, String)> = available_outputs
+                .iter()
+                .filter(|d| d.name != "system-default")
+                .map(|d| (truncate_string(&d.description, max_display_chars), d.description.clone()))
+                .collect();
+
+            column![
+                text("Output").size(TEXT_SMALL).color(TEXT_DIM),
+                pick_list(output_options, selected_output, move |selection: String| {
+                    let device = if selection == "Default" {
+                        None
+                    } else {
+                        let full_name = display_to_full
+                            .iter()
+                            .find(|(trunc, _)| *trunc == selection)
+                            .map(|(_, full)| full.clone())
+                            .unwrap_or(selection);
+                        Some(full_name)
+                    };
+                    Message::ChannelOutputDeviceChanged(id, device)
+                },)
+                    .text_size(TEXT_SMALL)
+                    .padding([SPACING_SM, SPACING_SM])
+                    .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
+                    .style(|_theme: &Theme, _status| {
+                        pick_list::Style {
+                            text_color: TEXT,
+                            placeholder_color: TEXT_DIM,
+                            handle_color: SOOTMIX_DARK.text_muted,
+                            background: Background::Color(SOOTMIX_DARK.surface_raised),
+                            border: Border::default()
+                                .rounded(RADIUS_SM)
+                                .color(SOOTMIX_DARK.border_default)
+                                .width(1.0),
+                        }
+                    }),
+            ]
+            .spacing(SPACING_XS)
+            .into()
+        }
     };
 
     // === ASSEMBLE CHANNEL STRIP ===
@@ -345,8 +468,8 @@ pub fn channel_strip<'a>(
         // Mute + Save
         row![mute_button, Space::new().width(SPACING_SM), save_button,].align_y(Alignment::Center),
         Space::new().height(SPACING),
-        // Output picker
-        output_picker,
+        // Device picker (output or input)
+        device_picker,
     ]
     .align_x(Alignment::Center)
     .padding(PADDING)
@@ -691,7 +814,7 @@ pub fn master_strip<'a>(
 /// Each app is shown as a small colored tile with initials; hover for full name,
 /// click to unassign.
 /// Height of the app card when empty (text + padding).
-const APP_CARD_MIN_HEIGHT: f32 = 32.0;
+const APP_CARD_MIN_HEIGHT: f32 = 48.0;
 /// Tile size for app icons.
 const APP_TILE_SIZE: f32 = 32.0;
 /// Number of app icon tiles per row.

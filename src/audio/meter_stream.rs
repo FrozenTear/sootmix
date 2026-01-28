@@ -239,7 +239,7 @@ impl MeterCaptureStream {
         );
 
         // Connect as input (capturing audio from sink's monitor ports)
-        // AUTOCONNECT lets WirePlumber handle the actual connection
+        // AUTOCONNECT lets PipeWire/WirePlumber handle the actual connection
         let flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS | StreamFlags::AUTOCONNECT;
 
         self.stream.connect(
