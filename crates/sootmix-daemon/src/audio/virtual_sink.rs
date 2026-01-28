@@ -431,18 +431,26 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>();
 
-    let source_name = format!("sootmix.recording.{}", safe_name);
+    let source_name = format!("sootmix.{}", safe_name);
+    let loopback_node_name = format!("sootmix.{}.input", safe_name);
 
     let capture_props =
         "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string();
+    // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
+    // device.class=audio-input classifies it as a user-facing input device.
+    // Without these, the node won't appear in Helvum or other patchbays.
     let playback_props = format!(
-        "media.class=Audio/Source node.name={} node.description=\"SootMix Recording - {}\" audio.position=[FL FR]",
+        "media.class=Audio/Source node.name={} node.description=\"{}\" \
+         node.virtual=false device.class=audio-input \
+         audio.position=[FL FR] priority.session=2000",
         source_name, name
     );
 
-    info!("Creating virtual source for recording: {}", name);
+    info!("Creating virtual source: {} (description: {})", source_name, name);
 
     let child = Command::new("pw-loopback")
+        .arg("--name")
+        .arg(&loopback_node_name)
         .arg("--capture-props")
         .arg(&capture_props)
         .arg("--playback-props")

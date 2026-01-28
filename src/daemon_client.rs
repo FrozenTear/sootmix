@@ -19,6 +19,7 @@ use zbus::{proxy, Connection, Result as ZbusResult};
 trait Daemon {
     // Methods
     fn create_channel(&self, name: &str) -> ZbusResult<String>;
+    fn create_input_channel(&self, name: &str) -> ZbusResult<String>;
     fn delete_channel(&self, channel_id: &str) -> ZbusResult<()>;
     fn rename_channel(&self, channel_id: &str, name: &str) -> ZbusResult<()>;
     fn set_channel_volume(&self, channel_id: &str, volume_db: f64) -> ZbusResult<()>;
@@ -184,6 +185,13 @@ impl DaemonClient {
     pub async fn create_channel(&self, name: &str) -> Result<String, DaemonClientError> {
         debug!("Creating channel: {}", name);
         self.proxy.create_channel(name).await
+            .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
+    }
+
+    /// Create a new input (microphone) channel.
+    pub async fn create_input_channel(&self, name: &str) -> Result<String, DaemonClientError> {
+        debug!("Creating input channel: {}", name);
+        self.proxy.create_input_channel(name).await
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
     }
 
@@ -353,6 +361,7 @@ pub fn new_shared_client() -> SharedDaemonClient {
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
     CreateChannel(String),
+    CreateInputChannel(String),
     DeleteChannel(String),
     RenameChannel { id: String, name: String },
     SetChannelVolume { id: String, volume_db: f64 },
@@ -683,6 +692,9 @@ async fn handle_daemon_command(
     match cmd {
         DaemonCommand::CreateChannel(name) => {
             client.create_channel(&name).await?;
+        }
+        DaemonCommand::CreateInputChannel(name) => {
+            client.create_input_channel(&name).await?;
         }
         DaemonCommand::DeleteChannel(id) => {
             client.delete_channel(&id).await?;

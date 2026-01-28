@@ -645,17 +645,35 @@ impl DaemonService {
 
     /// Restore channels from config.
     pub fn restore_channels(&mut self) -> Result<(), ServiceError> {
-        let channels_to_create: Vec<(Uuid, String)> = self
+        // Restore output channels (virtual sinks)
+        let sinks_to_create: Vec<(Uuid, String)> = self
             .state
             .channels
             .iter()
-            .filter(|c| c.is_managed && c.pw_sink_id.is_none())
+            .filter(|c| c.is_managed && !c.is_input() && c.pw_sink_id.is_none())
             .map(|c| (c.id, c.name.clone()))
             .collect();
 
-        for (id, name) in channels_to_create {
-            info!("Restoring channel: {} ({})", name, id);
+        for (id, name) in sinks_to_create {
+            info!("Restoring output channel: {} ({})", name, id);
             self.send_pw_command(PwCommand::CreateVirtualSink {
+                channel_id: id,
+                name,
+            });
+        }
+
+        // Restore input channels (virtual sources)
+        let sources_to_create: Vec<(Uuid, String)> = self
+            .state
+            .channels
+            .iter()
+            .filter(|c| c.is_input() && c.pw_source_id.is_none())
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+
+        for (id, name) in sources_to_create {
+            info!("Restoring input channel: {} ({})", name, id);
+            self.send_pw_command(PwCommand::CreateVirtualSource {
                 channel_id: id,
                 name,
             });
@@ -1233,7 +1251,7 @@ impl DaemonService {
         let id = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let (volume, loopback_id) = {
+        let (volume, node_id) = {
             let channel = self
                 .state
                 .channels
@@ -1242,12 +1260,19 @@ impl DaemonService {
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
             channel.volume_db = volume_db as f32;
-            (channel.volume_linear(), channel.pw_loopback_output_id)
+            let target_node = if channel.is_input() {
+                // For input channels, control volume on the Audio/Source node
+                channel.pw_source_id
+            } else {
+                // For output channels, control volume on the loopback output stream
+                channel.pw_loopback_output_id
+            };
+            (channel.volume_linear(), target_node)
         };
 
-        if let Some(loopback_id) = loopback_id {
+        if let Some(node_id) = node_id {
             self.send_pw_command(PwCommand::SetVolume {
-                node_id: loopback_id,
+                node_id,
                 volume,
             });
         }
@@ -1259,7 +1284,7 @@ impl DaemonService {
         let id = Uuid::parse_str(channel_id)
             .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        let loopback_id = {
+        let node_id = {
             let channel = self
                 .state
                 .channels
@@ -1268,12 +1293,16 @@ impl DaemonService {
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
             channel.muted = muted;
-            channel.pw_loopback_output_id
+            if channel.is_input() {
+                channel.pw_source_id
+            } else {
+                channel.pw_loopback_output_id
+            }
         };
 
-        if let Some(loopback_id) = loopback_id {
+        if let Some(node_id) = node_id {
             self.send_pw_command(PwCommand::SetMute {
-                node_id: loopback_id,
+                node_id,
                 muted,
             });
         }

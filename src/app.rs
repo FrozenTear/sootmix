@@ -2101,15 +2101,26 @@ impl SootMix {
 
     /// Create a new input (microphone) channel.
     fn cmd_create_input_channel(&mut self, name: &str) -> Option<Uuid> {
-        // Input channels only work in standalone mode for now
-        let channel = MixerChannel::new_input(name);
-        let id = channel.id;
-        self.state.channels.push(channel);
-        self.send_pw_command(PwCommand::CreateVirtualSource {
-            channel_id: id,
-            name: name.to_string(),
-        });
-        Some(id)
+        if self.daemon_connected {
+            // In daemon mode, send command via D-Bus
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::CreateInputChannel(name.to_string())
+            ) {
+                error!("Failed to send create input channel command to daemon: {}", e);
+            }
+            // Channel will be added via ChannelAdded signal
+            None
+        } else {
+            // In standalone mode, create channel locally
+            let channel = MixerChannel::new_input(name);
+            let id = channel.id;
+            self.state.channels.push(channel);
+            self.send_pw_command(PwCommand::CreateVirtualSource {
+                channel_id: id,
+                name: name.to_string(),
+            });
+            Some(id)
+        }
     }
 
     /// Route an input device to an input channel's loopback capture node.

@@ -186,8 +186,13 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
 
     // The "playback" side of pw-loopback becomes our Audio/Source
     // (apps record from this). We swap the media.class roles.
+    // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
+    // device.class=audio-input classifies it as a user-facing input device.
+    // Without these, the node won't appear in Helvum or other patchbays.
     let playback_props = format!(
-        "media.class=Audio/Source node.name={} node.description=\"{}\" audio.position=[FL FR] priority.session=2000",
+        "media.class=Audio/Source node.name={} node.description=\"{}\" \
+         node.virtual=false device.class=audio-input \
+         audio.position=[FL FR] priority.session=2000",
         source_node_name, description
     );
 
