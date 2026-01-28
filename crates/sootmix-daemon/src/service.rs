@@ -194,6 +194,52 @@ impl PwGraphState {
             .collect()
     }
 
+    /// Find the best fallback sink, preferring analog/speaker outputs over HDMI/DisplayPort.
+    ///
+    /// Scoring: built-in speakers/analog get priority, HDMI/DisplayPort are deprioritized.
+    /// Falls back to WirePlumber's default if no hardware sinks are in the graph.
+    pub fn best_fallback_sink(&self, exclude_names: &[&str]) -> Option<u32> {
+        let mut candidates: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.media_class == MediaClass::AudioSink
+                    && !exclude_names.iter().any(|ex| n.name.contains(ex))
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        candidates.sort_by_key(|n| {
+            let name_lower = n.name.to_lowercase();
+            let desc_lower = n.description.to_lowercase();
+            let combined = format!("{} {}", name_lower, desc_lower);
+
+            if combined.contains("hdmi") || combined.contains("displayport") {
+                // Deprioritize HDMI/DisplayPort
+                2
+            } else if combined.contains("speaker")
+                || combined.contains("analog")
+                || combined.contains("headphone")
+            {
+                // Prefer built-in speakers and analog outputs
+                0
+            } else {
+                // Everything else (Bluetooth, USB, etc.) is neutral
+                1
+            }
+        });
+
+        let chosen = candidates[0];
+        debug!(
+            "Best fallback sink: id={}, name='{}', desc='{}'",
+            chosen.id, chosen.name, chosen.description
+        );
+        Some(chosen.id)
+    }
+
     pub fn find_port_pairs(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
         use crate::audio::types::AudioChannel;
 
@@ -1407,12 +1453,23 @@ impl DaemonService {
                 return Some(output.node_id);
             }
             debug!(
-                "Configured master output '{}' not found, falling back to system default",
+                "Configured master output '{}' not found, falling back to best available sink",
                 name
             );
         }
 
-        // Fall back to WirePlumber default sink
+        // Use smart fallback: prefer speakers/analog over HDMI/DisplayPort
+        let exclude: Vec<&str> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| c.pw_sink_id.map(|_| c.name.as_str()))
+            .collect();
+        if let Some(id) = self.state.pw_graph.best_fallback_sink(&exclude) {
+            return Some(id);
+        }
+
+        // Last resort: WirePlumber default
         crate::audio::routing::get_default_sink_id()
     }
 
