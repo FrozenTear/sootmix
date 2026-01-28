@@ -13,7 +13,7 @@ use crate::plugins::{PluginFilter, PluginManager, PluginSlotConfig, PluginType};
 use crate::state::{db_to_linear, AppState, EditingRule, MixerChannel, SnapshotSlot};
 use crate::tray::{TrayHandle, TrayMessage};
 use crate::ui::apps_panel::apps_panel;
-use crate::ui::channel_strip::{channel_strip, master_strip};
+use crate::ui::channel_strip::{app_card, channel_strip, master_strip};
 use crate::ui::routing_rules_panel::routing_rules_panel;
 use crate::ui::theme::{self, *};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
@@ -124,7 +124,7 @@ impl SootMix {
         // Open the initial window (daemon mode doesn't open one by default)
         let (window_id, open_window) = iced::window::open(iced::window::Settings {
             size: iced::Size::new(900.0, 700.0),
-            min_size: Some(iced::Size::new(480.0, 700.0)),
+            min_size: Some(iced::Size::new(480.0, 760.0)),
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: "sootmix".to_string(),
                 ..Default::default()
@@ -1084,7 +1084,7 @@ impl SootMix {
                 info!("Tray: Opening new window");
                 let (window_id, open_task) = iced::window::open(iced::window::Settings {
                     size: iced::Size::new(900.0, 700.0),
-                    min_size: Some(iced::Size::new(480.0, 700.0)),
+                    min_size: Some(iced::Size::new(480.0, 760.0)),
                     platform_specific: iced::window::settings::PlatformSpecific {
                         application_id: "sootmix".to_string(),
                         ..Default::default()
@@ -1855,15 +1855,19 @@ impl SootMix {
         let has_active_snapshot = self.state.active_snapshot.is_some();
         let selected_channel = self.state.selected_channel;
 
-        // Build channel strip widgets
+        // Build channel strip + app card columns
         let available_outputs = &self.state.available_outputs;
-        let channel_strips: Vec<Element<Message>> = self
+        let channel_columns: Vec<Element<Message>> = self
             .state
             .channels
             .iter()
             .map(|c| {
                 let is_selected = selected_channel == Some(c.id);
-                channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, is_selected)
+                let strip = channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, is_selected);
+                let card = app_card(c);
+                column![strip, Space::new().height(SPACING_SM), card]
+                    .align_x(Alignment::Center)
+                    .into()
             })
             .collect();
 
@@ -1877,6 +1881,10 @@ impl SootMix {
             self.state.master_recording_enabled,
         );
 
+        // Master column with spacer below to match app card area
+        let master_column = column![master]
+            .align_x(Alignment::Center);
+
         // Separator between master and channel strips
         let separator: Element<Message> = container(Space::new().width(2))
             .height(Fill)
@@ -1886,8 +1894,8 @@ impl SootMix {
             })
             .into();
 
-        // Channel strips in a scrollable row
-        let channels_row = row(channel_strips)
+        // Channel columns in a scrollable row
+        let channels_row = row(channel_columns)
             .spacing(SPACING)
             .align_y(Alignment::Start);
 
@@ -1896,7 +1904,7 @@ impl SootMix {
                 scrollable::Scrollbar::default(),
             ));
 
-        row![master, separator, scrollable_channels]
+        row![master_column, separator, scrollable_channels]
             .spacing(SPACING)
             .align_y(Alignment::Start)
             .into()

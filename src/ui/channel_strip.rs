@@ -19,7 +19,8 @@ use crate::ui::meter::vu_meter;
 use crate::ui::plugin_chain::fx_button;
 use crate::ui::theme::{self, *};
 use iced::widget::{
-    button, column, container, pick_list, row, slider, text, text_input, vertical_slider, Space,
+    button, column, container, pick_list, row, slider, text, text_input, tooltip, vertical_slider,
+    Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
@@ -50,7 +51,6 @@ pub fn channel_strip<'a>(
     let muted = channel.muted;
     let eq_enabled = channel.eq_enabled;
     let name = channel.name.clone();
-    let assigned_apps = channel.assigned_apps.clone();
     let is_drop_target = dragging.is_some();
     let output_device_name = channel.output_device_name.clone();
 
@@ -225,64 +225,6 @@ pub fn channel_strip<'a>(
         Space::new().width(0).height(0).into()
     };
 
-    // === ASSIGNED APPS LIST ===
-    let apps_list: Element<Message> = if is_drop_target {
-        container(
-            text("+ Drop here")
-                .size(TEXT_SMALL)
-                .color(SOOTMIX_DARK.accent_warm),
-        )
-        .padding(SPACING_SM)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color {
-                a: 0.1,
-                ..SOOTMIX_DARK.accent_warm
-            })),
-            border: Border::default()
-                .rounded(RADIUS_SM)
-                .color(SOOTMIX_DARK.accent_warm)
-                .width(1.0),
-            ..container::Style::default()
-        })
-        .into()
-    } else if assigned_apps.is_empty() {
-        text("No apps").size(TEXT_CAPTION).color(TEXT_DIM).into()
-    } else {
-        let app_buttons: Vec<Element<Message>> = assigned_apps
-            .iter()
-            .take(3)
-            .map(|app_id| {
-                let app_id_clone = app_id.clone();
-                button(text(format!("\u{00D7} {}", truncate_string(app_id, 8))).size(TEXT_CAPTION))
-                    .padding([SPACING_XS, SPACING_SM])
-                    .style(|_theme: &Theme, status| {
-                        let is_hovered =
-                            matches!(status, button::Status::Hovered | button::Status::Pressed);
-                        button::Style {
-                            background: Some(Background::Color(if is_hovered {
-                                Color {
-                                    a: 0.2,
-                                    ..MUTED_COLOR
-                                }
-                            } else {
-                                SURFACE
-                            })),
-                            text_color: if is_hovered { TEXT } else { TEXT_DIM },
-                            border: Border::default().rounded(RADIUS_SM),
-                            ..button::Style::default()
-                        }
-                    })
-                    .on_press(Message::AppUnassigned(id, app_id_clone))
-                    .into()
-            })
-            .collect();
-
-        column(app_buttons)
-            .spacing(SPACING_XS)
-            .align_x(Alignment::Center)
-            .into()
-    };
-
     // === DELETE BUTTON ===
     let delete_button = button(text("\u{00D7}").size(TEXT_BODY).color(TEXT_DIM))
         .padding([SPACING_XS, SPACING_SM])
@@ -403,9 +345,6 @@ pub fn channel_strip<'a>(
         // Mute + Save
         row![mute_button, Space::new().width(SPACING_SM), save_button,].align_y(Alignment::Center),
         Space::new().height(SPACING),
-        // Apps
-        apps_list,
-        Space::new().height(SPACING_SM),
         // Output picker
         output_picker,
     ]
@@ -740,6 +679,189 @@ pub fn master_strip<'a>(
             ..container::Style::default()
         })
         .into()
+}
+
+// ============================================================================
+// APP CARD
+// ============================================================================
+
+/// Render a compact icon grid showing which apps are assigned to this channel.
+///
+/// Displayed below the channel strip, aligned to the same width.
+/// Each app is shown as a small colored tile with initials; hover for full name,
+/// click to unassign.
+/// Height of the app card when empty (text + padding).
+const APP_CARD_MIN_HEIGHT: f32 = 32.0;
+/// Tile size for app icons.
+const APP_TILE_SIZE: f32 = 32.0;
+/// Number of app icon tiles per row.
+const APP_ICONS_PER_ROW: usize = 3;
+
+
+pub fn app_card(channel: &MixerChannel) -> Element<Message> {
+    let id = channel.id;
+    let assigned_apps = &channel.assigned_apps;
+
+    let (content, card_height): (Element<Message>, f32) = if assigned_apps.is_empty() {
+        (
+            text("No apps")
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM)
+                .into(),
+            APP_CARD_MIN_HEIGHT,
+        )
+    } else {
+        let total = assigned_apps.len();
+        let num_rows = (total + APP_ICONS_PER_ROW - 1) / APP_ICONS_PER_ROW;
+        let mut grid_rows: Vec<Element<Message>> = Vec::new();
+        let mut i = 0;
+        while i < total {
+            let end = (i + APP_ICONS_PER_ROW).min(total);
+            let row_tiles: Vec<Element<Message>> = assigned_apps[i..end]
+                .iter()
+                .map(|app_id| app_icon_tile(id, app_id))
+                .collect();
+            grid_rows.push(row(row_tiles).spacing(SPACING_XS).into());
+            i = end;
+        }
+
+        // tile rows + spacing between rows + padding top/bottom
+        let h = (num_rows as f32 * APP_TILE_SIZE)
+            + ((num_rows.saturating_sub(1)) as f32 * SPACING_XS)
+            + PADDING_COMPACT * 2.0;
+
+        (column(grid_rows).spacing(SPACING_XS).into(), h)
+    };
+
+    container(
+        column![content]
+            .padding(PADDING_COMPACT)
+            .spacing(SPACING_XS),
+    )
+    .width(CHANNEL_STRIP_WIDTH)
+    .height(card_height)
+    .style(|_theme: &Theme| container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border::default()
+            .rounded(RADIUS_SM)
+            .color(SOOTMIX_DARK.border_subtle)
+            .width(1.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// A single app icon tile: colored square with 2-char initials.
+fn app_icon_tile(channel_id: Uuid, app_id: &str) -> Element<Message> {
+    let initials = app_initials(app_id);
+    let color = app_color(app_id);
+    let app_id_owned = app_id.to_string();
+    let display_name = app_id.to_string();
+
+    let tile_size: f32 = 32.0;
+
+    let icon = button(
+        container(
+            text(initials)
+                .size(TEXT_CAPTION)
+                .color(TEXT)
+                .center(),
+        )
+        .center(tile_size),
+    )
+    .width(tile_size)
+    .height(tile_size)
+    .padding(0)
+    .style(move |_theme: &Theme, status| {
+        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if is_hovered {
+                Color {
+                    a: 0.5,
+                    ..MUTED_COLOR
+                }
+            } else {
+                color
+            })),
+            text_color: TEXT,
+            border: Border::default().rounded(RADIUS_SM),
+            ..button::Style::default()
+        }
+    })
+    .on_press(Message::AppUnassigned(channel_id, app_id_owned));
+
+    tooltip(
+        icon,
+        container(
+            text(display_name).size(TEXT_CAPTION).color(TEXT),
+        )
+        .padding([SPACING_XS, SPACING_SM])
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.surface_overlay)),
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(SOOTMIX_DARK.border_default)
+                .width(1.0),
+            ..container::Style::default()
+        }),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .into()
+}
+
+/// Get 2-character initials from an app identifier.
+fn app_initials(app_id: &str) -> String {
+    let cleaned = app_id
+        .replace('-', " ")
+        .replace('_', " ")
+        .replace('.', " ");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    match words.len() {
+        0 => "??".to_string(),
+        1 => {
+            let w = words[0];
+            let mut chars = w.chars();
+            let first = chars.next().unwrap_or('?');
+            let second = chars.next().unwrap_or(' ');
+            format!("{}{}", first, second).to_uppercase()
+        }
+        _ => {
+            let a = words[0].chars().next().unwrap_or('?');
+            let b = words[1].chars().next().unwrap_or('?');
+            format!("{}{}", a, b).to_uppercase()
+        }
+    }
+}
+
+/// Generate a deterministic muted color from an app identifier.
+fn app_color(app_id: &str) -> Color {
+    let hash: u32 = app_id.bytes().fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
+    let hue = (hash % 360) as f32;
+    // Convert HSL (hue, 0.35 saturation, 0.25 lightness) to RGB for a muted dark tone
+    hsl_to_color(hue, 0.35, 0.25)
+}
+
+/// Convert HSL to iced Color.
+fn hsl_to_color(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h2 = h / 60.0;
+    let x = c * (1.0 - (h2 % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = if h2 < 1.0 {
+        (c, x, 0.0)
+    } else if h2 < 2.0 {
+        (x, c, 0.0)
+    } else if h2 < 3.0 {
+        (0.0, c, x)
+    } else if h2 < 4.0 {
+        (0.0, x, c)
+    } else if h2 < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = l - c / 2.0;
+    Color::from_rgb(r1 + m, g1 + m, b1 + m)
 }
 
 // ============================================================================
