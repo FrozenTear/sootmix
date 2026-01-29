@@ -65,8 +65,8 @@ fn generate_noise_filter_config(
     plugin_label: &str,
     vad_threshold: f32,
 ) -> String {
-    // Use .ns suffix to distinguish from the regular loopback's node name
-    let source_node_name = format!("sootmix.{}.ns", channel_name);
+    // Use same node name as regular loopback so apps don't need to reselect
+    let source_node_name = format!("sootmix.{}", channel_name);
 
     // Build the filter chain configuration
     let mut config = String::new();
@@ -105,7 +105,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = {vad_threshold}
+                            "VAD Threshold" = {vad_threshold}
                         }}
                     }}
                 ]
@@ -155,8 +155,8 @@ fn generate_noise_filter_config_stereo(
     plugin_label: &str,
     vad_threshold: f32,
 ) -> String {
-    // Use .ns suffix to distinguish from the regular loopback's node name
-    let source_node_name = format!("sootmix.{}.ns", channel_name);
+    // Use same node name as regular loopback so apps don't need to reselect
+    let source_node_name = format!("sootmix.{}", channel_name);
 
     let mut config = String::new();
 
@@ -194,7 +194,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = {vad_threshold}
+                            "VAD Threshold" = {vad_threshold}
                         }}
                     }}
                     {{
@@ -203,7 +203,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = {vad_threshold}
+                            "VAD Threshold" = {vad_threshold}
                         }}
                     }}
                 ]
@@ -396,8 +396,8 @@ pub fn create_noise_filter(
     // Give it time to register with PipeWire
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // Find the source node ID (uses .ns suffix to distinguish from loopback)
-    let source_node_name = format!("sootmix.{}.ns", safe_name);
+    // Find the source node ID (same name as regular loopback)
+    let source_node_name = format!("sootmix.{}", safe_name);
     let source_node_id = find_node_by_name(&source_node_name, "Audio/Source")?;
 
     // Store the instance

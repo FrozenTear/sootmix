@@ -101,7 +101,7 @@ static NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"SootMix RNNo
 static MAKER: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"SootMix (nnnoiseless)\0") };
 static COPYRIGHT: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"MPL-2.0\0") };
 
-static PORT_NAME_VAD: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"VAD Threshold (%)\0") };
+static PORT_NAME_VAD: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"VAD Threshold\0") };
 static PORT_NAME_INPUT: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"Input\0") };
 static PORT_NAME_OUTPUT: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"Output\0") };
 
