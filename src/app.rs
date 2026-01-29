@@ -24,6 +24,11 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Default window size on open.
+const DEFAULT_WINDOW_SIZE: iced::Size = iced::Size::new(900.0, 700.0);
+/// Minimum window size.
+const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(900, 700.0);
+
 /// Main application state.
 pub struct SootMix {
     /// Application state.
@@ -124,8 +129,8 @@ impl SootMix {
 
         // Open the initial window (daemon mode doesn't open one by default)
         let (window_id, open_window) = iced::window::open(iced::window::Settings {
-            size: iced::Size::new(900.0, 700.0),
-            min_size: Some(iced::Size::new(480.0, 600.0)),
+            size: DEFAULT_WINDOW_SIZE,
+            min_size: Some(MIN_WINDOW_SIZE),
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: "sootmix".to_string(),
                 ..Default::default()
@@ -1192,8 +1197,8 @@ impl SootMix {
 
                 info!("Tray: Opening new window");
                 let (window_id, open_task) = iced::window::open(iced::window::Settings {
-                    size: iced::Size::new(900.0, 700.0),
-                    min_size: Some(iced::Size::new(480.0, 600.0)),
+                    size: DEFAULT_WINDOW_SIZE,
+                    min_size: Some(MIN_WINDOW_SIZE),
                     platform_specific: iced::window::settings::PlatformSpecific {
                         application_id: "sootmix".to_string(),
                         ..Default::default()
