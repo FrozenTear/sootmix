@@ -17,7 +17,7 @@ use crate::ui::apps_panel::apps_panel;
 use crate::ui::channel_strip::{app_card, channel_strip, master_strip};
 use crate::ui::routing_rules_panel::routing_rules_panel;
 use crate::ui::theme::{self, *};
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, slider, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Subscription, Task, Theme};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -125,7 +125,7 @@ impl SootMix {
         // Open the initial window (daemon mode doesn't open one by default)
         let (window_id, open_window) = iced::window::open(iced::window::Settings {
             size: iced::Size::new(900.0, 700.0),
-            min_size: Some(iced::Size::new(480.0, 820.0)),
+            min_size: Some(iced::Size::new(480.0, 600.0)),
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: "sootmix".to_string(),
                 ..Default::default()
@@ -424,6 +424,15 @@ impl SootMix {
                 info!("Toggling noise suppression to {} for channel {}",
                     new_enabled, channel_id);
                 self.cmd_set_channel_noise_suppression(channel_id, new_enabled);
+            }
+
+            Message::ChannelVADThresholdChanged(channel_id, threshold) => {
+                // Update local state
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.vad_threshold = threshold;
+                }
+                // Send to daemon
+                self.cmd_set_channel_vad_threshold(channel_id, threshold);
             }
 
             // ==================== App Drag & Drop ====================
@@ -1184,7 +1193,7 @@ impl SootMix {
                 info!("Tray: Opening new window");
                 let (window_id, open_task) = iced::window::open(iced::window::Settings {
                     size: iced::Size::new(900.0, 700.0),
-                    min_size: Some(iced::Size::new(480.0, 820.0)),
+                    min_size: Some(iced::Size::new(480.0, 600.0)),
                     platform_specific: iced::window::settings::PlatformSpecific {
                         application_id: "sootmix".to_string(),
                         ..Default::default()
@@ -1426,6 +1435,13 @@ impl SootMix {
         let routing_section = Self::view_bottom_routing_section(channel);
         let apps_section = Self::view_bottom_apps_section(channel);
 
+        // Noise suppression section (only for input channels)
+        let ns_section: Element<'_, Message> = if channel.is_input() {
+            Self::view_bottom_ns_section(channel)
+        } else {
+            Space::new().width(0).height(0).into()
+        };
+
         // Mute button
         let muted = channel.muted;
         let mute_btn = button(
@@ -1452,6 +1468,7 @@ impl SootMix {
         let content_row = row![
             eq_section,
             Space::new().width(SPACING),
+            ns_section,
             plugins_section,
             Space::new().width(SPACING),
             routing_section,
@@ -1592,6 +1609,74 @@ impl SootMix {
         .style(|_| container::Style {
             background: Some(Background::Color(BACKGROUND)),
             border: Border::default().rounded(RADIUS).color(SOOTMIX_DARK.border_subtle).width(1.0),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
+    /// Noise suppression section for bottom panel (input channels only).
+    fn view_bottom_ns_section(channel: &MixerChannel) -> Element<'_, Message> {
+        let id = channel.id;
+        let ns_enabled = channel.noise_suppression_enabled;
+        let vad_threshold = channel.vad_threshold;
+
+        let toggle_btn = button(
+            text(if ns_enabled { "ON" } else { "OFF" })
+                .size(TEXT_CAPTION)
+                .color(if ns_enabled { TEXT } else { TEXT_DIM }),
+        )
+        .padding([SPACING_XS, SPACING_SM])
+        .style(move |_: &Theme, _| button::Style {
+            background: Some(Background::Color(if ns_enabled {
+                SOOTMIX_DARK.semantic_success.scale_alpha(0.3)
+            } else {
+                SURFACE
+            })),
+            border: Border::default().rounded(RADIUS_SM),
+            ..button::Style::default()
+        })
+        .on_press(Message::ChannelNoiseSuppressionToggled(id));
+
+        // VAD threshold slider (only shown when NS is enabled)
+        let vad_control: Element<'_, Message> = if ns_enabled {
+            let vad_label = text(format!("VAD: {}%", vad_threshold as i32))
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM);
+            let vad_slider = slider(0.0..=100.0, vad_threshold, move |v| {
+                Message::ChannelVADThresholdChanged(id, v)
+            })
+            .width(80)
+            .step(1.0);
+
+            column![vad_label, vad_slider]
+                .spacing(SPACING_XS)
+                .align_x(Alignment::Center)
+                .into()
+        } else {
+            text("Enable for VAD control")
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM)
+                .into()
+        };
+
+        container(
+            column![
+                text("Noise Suppression").size(TEXT_SMALL).color(TEXT_DIM),
+                Space::new().height(SPACING_XS),
+                toggle_btn,
+                Space::new().height(SPACING_XS),
+                vad_control,
+            ]
+            .align_x(Alignment::Center),
+        )
+        .padding(SPACING)
+        .width(Length::Fixed(140.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(BACKGROUND)),
+            border: Border::default()
+                .rounded(RADIUS)
+                .color(SOOTMIX_DARK.border_subtle)
+                .width(1.0),
             ..container::Style::default()
         })
         .into()
@@ -2447,6 +2532,29 @@ impl SootMix {
                 channel.noise_suppression_enabled = enabled;
             }
         }
+        self.save_config();
+    }
+
+    /// Set VAD threshold for noise suppression on an input channel.
+    fn cmd_set_channel_vad_threshold(&mut self, channel_id: Uuid, threshold: f32) {
+        // Only input channels support noise suppression / VAD
+        let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
+        if !is_input {
+            warn!("VAD threshold is only available on input channels");
+            return;
+        }
+
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelVadThreshold {
+                    channel_id: channel_id.to_string(),
+                    threshold: threshold as f64,
+                }
+            ) {
+                error!("Failed to send set VAD threshold command to daemon: {}", e);
+            }
+        }
+        // Note: local state is already updated in the message handler
         self.save_config();
     }
 
@@ -3726,6 +3834,7 @@ impl SootMix {
                             sidetone_enabled: false,
                             sidetone_volume_db: -20.0,
                             noise_suppression_enabled: false,
+                            vad_threshold: 95.0,
                         };
                         self.state.channels.push(channel);
                     }
@@ -3816,6 +3925,7 @@ impl SootMix {
                             sidetone_enabled: false,
                             sidetone_volume_db: -20.0,
                             noise_suppression_enabled: false,
+                            vad_threshold: 95.0,
                         };
                         self.state.channels.push(channel);
                     }

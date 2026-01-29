@@ -37,6 +37,10 @@ const PLUGIN_UNIQUE_ID: c_ulong = 0x534D5252; // "SMRR" in hex
 // RNNoise frame size
 const FRAME_SIZE: usize = DenoiseState::FRAME_SIZE; // 480 samples
 
+// nnnoiseless expects audio in 16-bit PCM range [-32768, 32767], not [-1.0, 1.0]
+const SCALE_IN: f32 = 32767.0;
+const SCALE_OUT: f32 = 1.0 / 32767.0;
+
 /// LADSPA port range hint
 #[repr(C)]
 struct LadspaPortRangeHint {
@@ -189,11 +193,11 @@ extern "C" fn run(instance: *mut PluginInstance, sample_count: c_ulong) {
     let input = unsafe { std::slice::from_raw_parts(instance.input, sample_count) };
     let output = unsafe { std::slice::from_raw_parts_mut(instance.output, sample_count) };
 
-    // Get VAD threshold (not currently used by nnnoiseless, but kept for API compatibility)
-    let _vad_threshold = if !instance.vad_threshold.is_null() {
-        unsafe { *instance.vad_threshold }
+    // Get VAD threshold (0-100%) and convert to probability (0.0-1.0)
+    let vad_threshold = if !instance.vad_threshold.is_null() {
+        (unsafe { *instance.vad_threshold } / 100.0).clamp(0.0, 1.0)
     } else {
-        50.0
+        0.5 // Default 50%
     };
 
     let mut out_idx = 0;
@@ -211,23 +215,28 @@ extern "C" fn run(instance: *mut PluginInstance, sample_count: c_ulong) {
         instance.output_pos = 0;
     }
 
-    // Process input samples
+    // Process input samples (scale from [-1.0, 1.0] to [-32768, 32767] for nnnoiseless)
     for &sample in input {
-        instance.input_buffer.push(sample);
+        instance.input_buffer.push(sample * SCALE_IN);
 
         // When we have a full frame, process it
         if instance.input_buffer.len() >= FRAME_SIZE {
             let mut frame_out = [0.0f32; FRAME_SIZE];
-            instance.denoiser.process_frame(&mut frame_out, &instance.input_buffer[..FRAME_SIZE]);
+            // process_frame returns VAD probability (0.0 = noise, 1.0 = voice)
+            let vad_prob = instance.denoiser.process_frame(&mut frame_out, &instance.input_buffer[..FRAME_SIZE]);
 
-            // Output processed samples
+            // Apply VAD gating: if voice probability is below threshold, output silence
+            let output_frame = vad_prob >= vad_threshold;
+
+            // Output processed samples (scale back to [-1.0, 1.0] for LADSPA)
             for &s in &frame_out {
+                let scaled = if output_frame { s * SCALE_OUT } else { 0.0 };
                 if out_idx < sample_count {
-                    output[out_idx] = s;
+                    output[out_idx] = scaled;
                     out_idx += 1;
                 } else {
                     // Buffer overflow samples for next run
-                    instance.output_buffer.push(s);
+                    instance.output_buffer.push(scaled);
                 }
             }
 

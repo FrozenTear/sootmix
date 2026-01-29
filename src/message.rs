@@ -70,6 +70,8 @@ pub enum Message {
     ChannelSidetoneVolumeChanged(Uuid, f32),
     /// Toggle noise suppression on an input channel.
     ChannelNoiseSuppressionToggled(Uuid),
+    /// VAD threshold changed for noise suppression (channel_id, threshold 0-100%).
+    ChannelVADThresholdChanged(Uuid, f32),
     /// Global preset selected.
     PresetSelected(String),
     /// Save current configuration as preset.

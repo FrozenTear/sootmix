@@ -12,8 +12,9 @@ use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::state::MixerChannel;
 use crate::ui::theme::*;
+use crate::state::ChannelKind;
 use iced::widget::{
-    button, column, container, row, scrollable, text, Space,
+    button, column, container, row, scrollable, slider, text, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 use uuid::Uuid;
@@ -48,6 +49,13 @@ pub fn focus_panel<'a>(
     // === EQ SECTION ===
     let eq_section = eq_section(channel);
 
+    // === NOISE SUPPRESSION SECTION (input channels only) ===
+    let noise_section: Element<Message> = if channel.kind == ChannelKind::Input {
+        noise_suppression_section(channel)
+    } else {
+        Space::new().width(0).height(0).into()
+    };
+
     // === PLUGIN CHAIN SECTION ===
     let plugins = plugin_chain_section(id, plugin_chain);
 
@@ -76,6 +84,8 @@ pub fn focus_panel<'a>(
         inputs,
         Space::new().height(SPACING),
         eq_section,
+        Space::new().height(SPACING),
+        noise_section,
         Space::new().height(SPACING),
         plugins,
         Space::new().height(SPACING),
@@ -330,6 +340,113 @@ fn eq_section<'a>(channel: &'a MixerChannel) -> Element<'a, Message> {
         preset_label,
         Space::new().height(SPACING_SM),
         eq_visual,
+    ]
+    .into()
+}
+
+/// Noise suppression section for input channels.
+fn noise_suppression_section<'a>(channel: &'a MixerChannel) -> Element<'a, Message> {
+    let id = channel.id;
+    let ns_enabled = channel.noise_suppression_enabled;
+    let vad_threshold = channel.vad_threshold;
+
+    let section_title = text("Noise Suppression")
+        .size(TEXT_SMALL)
+        .color(TEXT_DIM);
+
+    // NS toggle button
+    let ns_toggle = button(
+        text(if ns_enabled { "ON" } else { "OFF" })
+            .size(TEXT_SMALL)
+            .color(if ns_enabled { TEXT } else { TEXT_DIM }),
+    )
+    .padding([SPACING_XS, SPACING_SM])
+    .style(move |_: &Theme, status| {
+        let is_hovered = matches!(status, button::Status::Hovered);
+        let bg = if ns_enabled {
+            if is_hovered {
+                PRIMARY
+            } else {
+                PRIMARY.scale_alpha(0.7)
+            }
+        } else if is_hovered {
+            SURFACE_LIGHT
+        } else {
+            SURFACE
+        };
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: if ns_enabled { TEXT } else { TEXT_DIM },
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(if ns_enabled { PRIMARY } else { SOOTMIX_DARK.border_subtle })
+                .width(1.0),
+            ..button::Style::default()
+        }
+    })
+    .on_press(Message::ChannelNoiseSuppressionToggled(id));
+
+    // VAD threshold slider (only show when NS is enabled)
+    let vad_section: Element<Message> = if ns_enabled {
+        let vad_label = text("Voice Threshold")
+            .size(TEXT_SMALL)
+            .color(TEXT_DIM);
+
+        let vad_value = text(format!("{}%", vad_threshold as i32))
+            .size(TEXT_SMALL)
+            .color(TEXT);
+
+        let vad_slider = slider(0.0..=100.0, vad_threshold, move |v| {
+            Message::ChannelVADThresholdChanged(id, v)
+        })
+        .step(1.0)
+        .width(Length::Fill)
+        .style(|_theme: &Theme, _status| slider::Style {
+            rail: slider::Rail {
+                backgrounds: (
+                    Background::Color(PRIMARY),
+                    Background::Color(SLIDER_TRACK),
+                ),
+                width: 4.0,
+                border: Border::default().rounded(2.0),
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Rectangle {
+                    width: 12,
+                    border_radius: RADIUS_SM.into(),
+                },
+                background: Background::Color(TEXT),
+                border_width: 0.0,
+                border_color: Color::TRANSPARENT,
+            },
+        });
+
+        let help_text = text("Higher = more aggressive noise filtering")
+            .size(TEXT_CAPTION)
+            .color(TEXT_DIM);
+
+        column![
+            Space::new().height(SPACING_SM),
+            row![vad_label, Space::new().width(Fill), vad_value,].align_y(Alignment::Center),
+            Space::new().height(SPACING_XS),
+            vad_slider,
+            Space::new().height(SPACING_XS),
+            help_text,
+        ]
+        .into()
+    } else {
+        column![
+            Space::new().height(SPACING_XS),
+            text("Enable to adjust voice threshold")
+                .size(TEXT_CAPTION)
+                .color(TEXT_DIM),
+        ]
+        .into()
+    };
+
+    column![
+        row![section_title, Space::new().width(Fill), ns_toggle,].align_y(Alignment::Center),
+        vad_section,
     ]
     .into()
 }

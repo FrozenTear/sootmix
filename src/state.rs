@@ -213,6 +213,13 @@ pub struct MixerChannel {
     /// Whether RNNoise noise suppression is enabled for this input channel.
     #[serde(default)]
     pub noise_suppression_enabled: bool,
+    /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+}
+
+fn default_vad_threshold() -> f32 {
+    95.0
 }
 
 fn default_is_managed() -> bool {
@@ -257,6 +264,7 @@ impl MixerChannel {
             sidetone_enabled: false,
             sidetone_volume_db: -20.0,
             noise_suppression_enabled: false,
+            vad_threshold: 95.0,
         }
     }
 
@@ -293,6 +301,7 @@ impl MixerChannel {
             sidetone_enabled: false,
             sidetone_volume_db: -20.0,
             noise_suppression_enabled: false,
+            vad_threshold: 95.0,
         }
     }
 

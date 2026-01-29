@@ -63,6 +63,7 @@ fn generate_noise_filter_config(
     input_device_name: Option<&str>,
     plugin_path: &str,
     plugin_label: &str,
+    vad_threshold: f32,
 ) -> String {
     // Use .ns suffix to distinguish from the regular loopback's node name
     let source_node_name = format!("sootmix.{}.ns", channel_name);
@@ -104,7 +105,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = 50.0
+                            "VAD Threshold (%)" = {vad_threshold}
                         }}
                     }}
                 ]
@@ -152,6 +153,7 @@ fn generate_noise_filter_config_stereo(
     input_device_name: Option<&str>,
     plugin_path: &str,
     plugin_label: &str,
+    vad_threshold: f32,
 ) -> String {
     // Use .ns suffix to distinguish from the regular loopback's node name
     let source_node_name = format!("sootmix.{}.ns", channel_name);
@@ -192,7 +194,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = 50.0
+                            "VAD Threshold (%)" = {vad_threshold}
                         }}
                     }}
                     {{
@@ -201,7 +203,7 @@ context.modules = [
                         plugin = "{plugin_path}"
                         label = {plugin_label}
                         control = {{
-                            "VAD Threshold (%)" = 50.0
+                            "VAD Threshold (%)" = {vad_threshold}
                         }}
                     }}
                 ]
@@ -343,6 +345,7 @@ pub fn create_noise_filter(
     channel_name: &str,
     input_device_name: Option<&str>,
     stereo: bool,
+    vad_threshold: f32,
 ) -> Result<u32, NoiseFilterError> {
     ensure_processes_map();
 
@@ -362,9 +365,9 @@ pub fn create_noise_filter(
 
     // Generate config
     let config_content = if stereo {
-        generate_noise_filter_config_stereo(&safe_name, input_device_name, &plugin_path, plugin_label)
+        generate_noise_filter_config_stereo(&safe_name, input_device_name, &plugin_path, plugin_label, vad_threshold)
     } else {
-        generate_noise_filter_config(&safe_name, input_device_name, &plugin_path, plugin_label)
+        generate_noise_filter_config(&safe_name, input_device_name, &plugin_path, plugin_label, vad_threshold)
     };
     debug!("Generated noise filter config:\n{}", config_content);
 

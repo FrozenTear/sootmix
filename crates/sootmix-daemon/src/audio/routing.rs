@@ -130,10 +130,64 @@ pub fn set_stream_target(stream_node_id: u32, target_sink_id: u32) -> Result<(),
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         debug!("pw-metadata set target.node failed: {}", stderr);
-        // Not a fatal error - the link creation should still work
+        // Continue anyway - the link creation may still work
+    }
+
+    // Give WirePlumber time to process the metadata change before we manipulate links.
+    // Without this delay, WirePlumber may race with our link creation and re-route
+    // the stream to a different sink.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Verify the metadata was actually set
+    if let Some(current_target) = get_stream_target(stream_node_id) {
+        if current_target != target_sink_id {
+            debug!(
+                "Warning: stream {} target is {} but we set {}, retrying",
+                stream_node_id, current_target, target_sink_id
+            );
+            // Retry once
+            let _ = Command::new("pw-metadata")
+                .args([
+                    "-n",
+                    "default",
+                    &stream_node_id.to_string(),
+                    "target.node",
+                    &target_sink_id.to_string(),
+                ])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
     }
 
     Ok(())
+}
+
+/// Get the current target sink for a stream node from WirePlumber metadata.
+pub fn get_stream_target(stream_node_id: u32) -> Option<u32> {
+    let output = Command::new("pw-metadata")
+        .args(["-n", "default", &stream_node_id.to_string(), "target.node"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // Output format: "found 'target.node' '42'"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("target.node") {
+            // Extract the value after the last single quote pair
+            if let Some(start) = line.rfind('\'') {
+                let before_end = &line[..start];
+                if let Some(value_start) = before_end.rfind('\'') {
+                    let value_str = &before_end[value_start + 1..];
+                    return value_str.trim().parse().ok();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Get the WirePlumber default audio sink node ID.

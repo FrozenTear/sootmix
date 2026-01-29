@@ -435,14 +435,15 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
     let source_name = format!("sootmix.{}", safe_name);
     let loopback_node_name = format!("sootmix.{}.input", safe_name);
 
-    // Build capture props with optional target device
+    // Build capture props - ALWAYS disable autoconnect to prevent WirePlumber from
+    // linking the capture stream to all available sources. We'll manage links ourselves.
     let capture_props = if let Some(device) = target_device {
         format!(
-            "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR] target.object=\"{}\"",
+            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[FL FR] target.object=\"{}\"",
             device
         )
     } else {
-        "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string()
+        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[FL FR]".to_string()
     };
 
     // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
@@ -473,18 +474,22 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
 
     let source_node_id = find_node_by_name_and_class(&source_name, "Audio/Source")?;
 
+    // Find the capture stream node (the input side that captures from the mic)
+    let input_node_name = format!("input.{}", loopback_node_name);
+    let capture_stream_node_id = find_node_by_name_and_class(&input_node_name, "Stream/Input/Audio").ok();
+
     if let Some(ref mut map) = *get_processes() {
         map.insert(source_node_id, child);
     }
 
     info!(
-        "Created virtual source '{}' with source_id={}",
-        name, source_node_id
+        "Created virtual source '{}' with source_id={}, capture_stream_id={:?}",
+        name, source_node_id, capture_stream_node_id
     );
 
     Ok(VirtualSourceResult {
         source_node_id,
-        capture_stream_node_id: None,
+        capture_stream_node_id,
     })
 }
 

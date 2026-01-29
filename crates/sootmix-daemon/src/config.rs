@@ -63,6 +63,13 @@ pub struct SavedChannel {
     /// Input device name (for input channels - the microphone).
     #[serde(default)]
     pub input_device_name: Option<String>,
+    /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+}
+
+fn default_vad_threshold() -> f32 {
+    95.0
 }
 
 fn default_true() -> bool {

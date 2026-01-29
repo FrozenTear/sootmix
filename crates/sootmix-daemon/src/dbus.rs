@@ -275,6 +275,27 @@ impl DaemonDbusService {
         Ok(())
     }
 
+    /// Set the VAD threshold for noise suppression on an input channel.
+    async fn set_channel_vad_threshold(
+        &self,
+        channel_id: &str,
+        threshold: f64,
+    ) -> zbus::fdo::Result<()> {
+        debug!(
+            "D-Bus: set_channel_vad_threshold({}, {})",
+            channel_id, threshold
+        );
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        service.process_pw_events();
+        service
+            .set_channel_vad_threshold(channel_id, threshold as f32)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Set master volume in dB.
     async fn set_master_volume(
         &self,

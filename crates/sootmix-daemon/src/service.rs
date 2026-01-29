@@ -62,6 +62,8 @@ pub struct ChannelState {
     pub pw_loopback_capture_id: Option<u32>,
     /// Whether noise suppression is enabled for this input channel.
     pub noise_suppression_enabled: bool,
+    /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
+    pub vad_threshold: f32,
 }
 
 impl ChannelState {
@@ -85,6 +87,7 @@ impl ChannelState {
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: false,
+            vad_threshold: 95.0,
         }
     }
 
@@ -108,6 +111,7 @@ impl ChannelState {
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: false,
+            vad_threshold: 95.0,
         }
     }
 
@@ -131,6 +135,7 @@ impl ChannelState {
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: false,
+            vad_threshold: saved.vad_threshold,
         }
     }
 
@@ -1020,7 +1025,11 @@ impl DaemonService {
                 self.state.pw_graph.ports.remove(&id);
             }
             PwEvent::LinkAdded(link) => {
-                self.state.pw_graph.links.insert(link.id, link);
+                self.state.pw_graph.links.insert(link.id, link.clone());
+
+                // Check if this is a link from an assigned app to the wrong sink.
+                // WirePlumber may create these links competing with our routing.
+                self.check_and_fix_rogue_link(&link);
             }
             PwEvent::LinkRemoved(id) => {
                 self.state.pw_graph.links.remove(&id);
@@ -1089,7 +1098,8 @@ impl DaemonService {
                 source_node_id,
                 loopback_capture_node_id,
             } => {
-                if let Some(channel) = self
+                // Get channel info and update state
+                let (target_mic, capture_id) = if let Some(channel) = self
                     .state
                     .channels
                     .iter_mut()
@@ -1101,6 +1111,17 @@ impl DaemonService {
                         "Virtual source created for input channel '{}': source={}, capture={:?}",
                         channel.name, source_node_id, loopback_capture_node_id
                     );
+                    (channel.input_device_name.clone(), loopback_capture_node_id)
+                } else {
+                    (None, None)
+                };
+
+                // If we have a target mic and a capture node, create the link
+                if let (Some(mic_name), Some(capture_node_id)) = (target_mic, capture_id) {
+                    self.send_pw_command(PwCommand::LinkInputChannelToMic {
+                        capture_node_id,
+                        target_mic_name: mic_name,
+                    });
                 }
             }
             PwEvent::RecordingSourceCreated { name, node_id } => {
@@ -1189,6 +1210,7 @@ impl DaemonService {
                     output_device_name: c.output_device_name.clone(),
                     kind: c.kind,
                     input_device_name: c.input_device_name.clone(),
+                    vad_threshold: c.vad_threshold,
                 })
                 .collect(),
         };
@@ -1399,6 +1421,7 @@ impl DaemonService {
         let target_mic = channel.input_device_name.clone();
         let existing_source_id = channel.pw_source_id;
         let already_enabled = channel.noise_suppression_enabled;
+        let vad_threshold = channel.vad_threshold;
 
         // Skip if state isn't actually changing
         if enabled == already_enabled {
@@ -1425,6 +1448,7 @@ impl DaemonService {
                 channel_id: id,
                 name: channel_name,
                 target_mic,
+                vad_threshold,
             });
         } else {
             info!("Disabling noise suppression for channel '{}'", channel_name);
@@ -1440,6 +1464,71 @@ impl DaemonService {
             });
         }
 
+        Ok(())
+    }
+
+    /// Set the VAD threshold for noise suppression on an input channel.
+    ///
+    /// If noise suppression is currently enabled, the filter will be recreated
+    /// with the new threshold.
+    pub fn set_channel_vad_threshold(
+        &mut self,
+        channel_id: &str,
+        threshold: f32,
+    ) -> Result<(), ServiceError> {
+        let id = Uuid::parse_str(channel_id)
+            .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        let channel = self
+            .state
+            .channels
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        if !channel.is_input() {
+            return Err(ServiceError::ChannelNotFound(
+                "VAD threshold is only available on input channels".to_string(),
+            ));
+        }
+
+        // Clamp to valid range
+        let threshold = threshold.clamp(0.0, 100.0);
+
+        // Skip if threshold hasn't changed
+        if (channel.vad_threshold - threshold).abs() < 0.01 {
+            return Ok(());
+        }
+
+        let was_enabled = channel.noise_suppression_enabled;
+        let channel_name = channel.name.clone();
+        let target_mic = channel.input_device_name.clone();
+
+        // Update the threshold
+        channel.vad_threshold = threshold;
+
+        // If noise suppression is enabled, recreate the filter with new threshold
+        if was_enabled {
+            info!(
+                "Updating VAD threshold to {}% for channel '{}', recreating filter",
+                threshold, channel_name
+            );
+
+            // Destroy the existing filter
+            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter {
+                channel_id: id,
+            });
+
+            // Create new filter with updated threshold
+            self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
+                channel_id: id,
+                name: channel_name,
+                target_mic,
+                vad_threshold: threshold,
+            });
+        }
+
+        self.save_config();
         Ok(())
     }
 
@@ -1550,6 +1639,61 @@ impl DaemonService {
 
         self.save_config();
         Ok(())
+    }
+
+    /// Check if a newly-created link goes from an assigned app to the wrong sink.
+    /// If so, destroy it. This handles WirePlumber race conditions where it
+    /// creates links to the default sink while we're trying to route to our sink.
+    fn check_and_fix_rogue_link(&mut self, link: &PwLink) {
+        // Get all our sink IDs
+        let our_sinks: Vec<u32> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| c.pw_sink_id)
+            .collect();
+
+        // If the link goes to one of our sinks, it's fine
+        if our_sinks.contains(&link.input_node) {
+            return;
+        }
+
+        // Check if the source node is an app that's assigned to one of our channels
+        let app_node_id = link.output_node;
+        let app = self.state.apps.iter().find(|a| a.node_id == app_node_id);
+        if app.is_none() {
+            return; // Not an app we're tracking
+        }
+
+        let app_identifier = app.unwrap().identifier();
+
+        // Check if this app is assigned to any of our channels
+        let assigned_to_channel = self
+            .state
+            .channels
+            .iter()
+            .find(|c| c.assigned_apps.contains(&app_identifier.to_string()));
+
+        if let Some(channel) = assigned_to_channel {
+            // This app is assigned to one of our channels, but this link goes elsewhere!
+            // This is a "rogue" link created by WirePlumber - destroy it.
+            warn!(
+                "Detected rogue link: app '{}' (node {}) linked to node {} instead of channel '{}' sink {:?}. Destroying.",
+                app_identifier, app_node_id, link.input_node, channel.name, channel.pw_sink_id
+            );
+            self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+
+            // Re-establish the correct link
+            if let Some(sink_id) = channel.pw_sink_id {
+                let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_id);
+                for (output_port, input_port) in port_pairs {
+                    self.send_pw_command(PwCommand::CreateLink {
+                        output_port,
+                        input_port,
+                    });
+                }
+            }
+        }
     }
 
     pub fn unassign_app(&mut self, app_id: &str, channel_id: &str) -> Result<(), ServiceError> {

@@ -25,6 +25,7 @@ trait Daemon {
     fn set_channel_volume(&self, channel_id: &str, volume_db: f64) -> ZbusResult<()>;
     fn set_channel_mute(&self, channel_id: &str, muted: bool) -> ZbusResult<()>;
     fn set_channel_noise_suppression(&self, channel_id: &str, enabled: bool) -> ZbusResult<()>;
+    fn set_channel_vad_threshold(&self, channel_id: &str, threshold: f64) -> ZbusResult<()>;
     fn set_master_volume(&self, volume_db: f64) -> ZbusResult<()>;
     fn set_master_mute(&self, muted: bool) -> ZbusResult<()>;
     fn assign_app(&self, app_id: &str, channel_id: &str) -> ZbusResult<()>;
@@ -232,6 +233,13 @@ impl DaemonClient {
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
     }
 
+    /// Set the VAD threshold for noise suppression on an input channel.
+    pub async fn set_channel_vad_threshold(&self, channel_id: &str, threshold: f64) -> Result<(), DaemonClientError> {
+        debug!("Setting channel {} VAD threshold to {}%", channel_id, threshold);
+        self.proxy.set_channel_vad_threshold(channel_id, threshold).await
+            .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
+    }
+
     /// Set master volume in dB.
     pub async fn set_master_volume(&self, volume_db: f64) -> Result<(), DaemonClientError> {
         self.proxy.set_master_volume(volume_db).await
@@ -382,6 +390,7 @@ pub enum DaemonCommand {
     SetMasterOutput(String),
     SetMasterRecording(bool),
     SetChannelNoiseSuppression { channel_id: String, enabled: bool },
+    SetChannelVadThreshold { channel_id: String, threshold: f64 },
 }
 
 /// Global command sender for the daemon subscription.
@@ -740,6 +749,9 @@ async fn handle_daemon_command(
         }
         DaemonCommand::SetChannelNoiseSuppression { channel_id, enabled } => {
             client.set_channel_noise_suppression(&channel_id, enabled).await?;
+        }
+        DaemonCommand::SetChannelVadThreshold { channel_id, threshold } => {
+            client.set_channel_vad_threshold(&channel_id, threshold).await?;
         }
     }
     Ok(())

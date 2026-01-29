@@ -84,10 +84,20 @@ pub enum PwCommand {
         channel_id: Uuid,
         name: String,
         target_mic: Option<String>,
+        vad_threshold: f32,
     },
     /// Destroy a native noise filter.
     DestroyNativeNoiseFilter {
         channel_id: Uuid,
+    },
+    /// Link an input channel's capture stream to a target microphone.
+    /// This is needed because we use node.autoconnect=false to prevent WirePlumber
+    /// from linking the capture stream to ALL available mics.
+    LinkInputChannelToMic {
+        /// The capture stream node (input side of the loopback)
+        capture_node_id: u32,
+        /// Target mic node name (description or node.name)
+        target_mic_name: String,
     },
     Shutdown,
 }
@@ -721,11 +731,12 @@ fn handle_command(
 
         PwCommand::DestroyLink { link_id } => {
             debug!("Destroying link: {}", link_id);
-            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                    let _ = event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
-                }
-            });
+            // Destroy links SYNCHRONOUSLY to avoid race conditions with WirePlumber.
+            // If we destroy async and create sync, WirePlumber can re-route the stream
+            // to a different sink during the window between destroy and create.
+            if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                let _ = state.borrow().event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
+            }
         }
 
         PwCommand::BindNode { node_id } => {
@@ -992,10 +1003,10 @@ fn handle_command(
             });
         }
 
-        PwCommand::CreateNativeNoiseFilter { channel_id, name, target_mic } => {
+        PwCommand::CreateNativeNoiseFilter { channel_id, name, target_mic, vad_threshold } => {
             info!(
-                "Creating noise filter (CLI) for channel {} (name={}, target={:?})",
-                channel_id, name, target_mic
+                "Creating noise filter (CLI) for channel {} (name={}, target={:?}, vad={}%)",
+                channel_id, name, target_mic, vad_threshold
             );
 
             // Use CLI-based filter-chain with RNNoise LADSPA plugin
@@ -1005,6 +1016,7 @@ fn handle_command(
                     &name,
                     target_mic.as_deref(),
                     false, // mono
+                    vad_threshold,
                 ) {
                     Ok(source_node_id) => {
                         info!(
@@ -1036,6 +1048,60 @@ fn handle_command(
                 }
                 let _ = event_tx.send(PwEvent::NativeNoiseFilterDestroyed { channel_id });
             });
+        }
+
+        PwCommand::LinkInputChannelToMic { capture_node_id, target_mic_name } => {
+            info!(
+                "Linking capture stream {} to mic '{}'",
+                capture_node_id, target_mic_name
+            );
+
+            // Find the mic node by name/description
+            let mic_node_id = {
+                let st = state.borrow();
+                st.nodes.values().find(|n| {
+                    n.media_class == MediaClass::AudioSource
+                        && (n.name == target_mic_name || n.description == target_mic_name)
+                }).map(|n| n.id)
+            };
+
+            if let Some(mic_id) = mic_node_id {
+                // Get ports for both nodes
+                let (mic_output_ports, capture_input_ports) = {
+                    let st = state.borrow();
+                    let mic_ports: Vec<_> = st.ports.values()
+                        .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
+                        .cloned()
+                        .collect();
+                    let capture_ports: Vec<_> = st.ports.values()
+                        .filter(|p| p.node_id == capture_node_id && p.direction == PortDirection::Input)
+                        .cloned()
+                        .collect();
+                    (mic_ports, capture_ports)
+                };
+
+                // Create links between matching channels (FL->FL, FR->FR, or MONO->FL/FR)
+                for mic_port in &mic_output_ports {
+                    for capture_port in &capture_input_ports {
+                        // Match by channel name suffix (FL, FR, MONO)
+                        let mic_ch = mic_port.name.rsplit('_').next().unwrap_or("");
+                        let cap_ch = capture_port.name.rsplit('_').next().unwrap_or("");
+
+                        // Link if channels match, or if mic is mono (link to both)
+                        if mic_ch == cap_ch || mic_ch == "MONO" {
+                            debug!(
+                                "Creating link: mic port {} ({}) -> capture port {} ({})",
+                                mic_port.id, mic_port.name, capture_port.id, capture_port.name
+                            );
+                            if let Err(e) = crate::audio::routing::create_link(mic_port.id, capture_port.id) {
+                                warn!("Failed to link mic to capture stream: {}", e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("Could not find mic '{}' to link to capture stream", target_mic_name);
+            }
         }
     }
 }
