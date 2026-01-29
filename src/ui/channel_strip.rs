@@ -311,6 +311,7 @@ pub fn channel_strip<'a>(
 
         let sidetone_enabled = channel.sidetone_enabled;
         let sidetone_vol = channel.sidetone_volume_db;
+        let noise_suppression_enabled = channel.noise_suppression_enabled;
 
         let input_picker = column![
             text("Input").size(TEXT_SMALL).color(TEXT_DIM),
@@ -369,12 +370,36 @@ pub fn channel_strip<'a>(
             })
             .on_press(Message::ChannelSidetoneToggled(id));
 
+        // Noise suppression toggle (RNNoise)
+        let ns_btn = button(text("NS").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(move |_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                let bg_color = if noise_suppression_enabled {
+                    if is_hovered { lighten(PRIMARY, 0.15) } else { PRIMARY }
+                } else if is_hovered {
+                    SURFACE_LIGHT
+                } else {
+                    SURFACE
+                };
+                button::Style {
+                    background: Some(Background::Color(bg_color)),
+                    text_color: if noise_suppression_enabled { SOOTMIX_DARK.canvas } else { TEXT },
+                    border: Border::default()
+                        .rounded(RADIUS_SM)
+                        .color(if noise_suppression_enabled { PRIMARY } else { SURFACE_LIGHT })
+                        .width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ChannelNoiseSuppressionToggled(id));
+
         let sidetone_row: Element<'a, Message> = if sidetone_enabled {
             let sidetone_slider = slider(-60.0..=0.0, sidetone_vol, move |v| {
                 Message::ChannelSidetoneVolumeChanged(id, v)
             })
             .step(0.5)
-            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0 - 50.0))
+            .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0 - 90.0)) // Adjusted for NS button
             .style(|_theme: &Theme, _status| slider::Style {
                 rail: slider::Rail {
                     backgrounds: (
@@ -394,11 +419,13 @@ pub fn channel_strip<'a>(
                     border_color: Color::TRANSPARENT,
                 },
             });
-            row![sidetone_btn, Space::new().width(SPACING_SM), sidetone_slider]
+            row![sidetone_btn, Space::new().width(SPACING_XS), ns_btn, Space::new().width(SPACING_SM), sidetone_slider]
                 .align_y(Alignment::Center)
                 .into()
         } else {
-            sidetone_btn.into()
+            row![sidetone_btn, Space::new().width(SPACING_XS), ns_btn]
+                .align_y(Alignment::Center)
+                .into()
         };
 
         column![input_picker, Space::new().height(SPACING_XS), sidetone_row]
@@ -939,7 +966,8 @@ fn input_channel_card(channel: &MixerChannel) -> Element<'static, Message> {
     )
     .width(CHANNEL_STRIP_WIDTH)
     .height(APP_CARD_MIN_HEIGHT)
-    .center(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(APP_CARD_MIN_HEIGHT)
     .style(|_theme: &Theme| container::Style {
         background: Some(Background::Color(SURFACE)),
         border: Border::default()

@@ -256,8 +256,8 @@ pub const CHANNEL_STRIP_WIDTH: f32 = 128.0;
 /// Compact channel strip width (for many channels)
 pub const CHANNEL_STRIP_WIDTH_COMPACT: f32 = 96.0;
 
-/// Channel strip height
-pub const CHANNEL_STRIP_HEIGHT: f32 = 420.0;
+/// Channel strip height (sized to fit input channels with device picker + sidetone controls)
+pub const CHANNEL_STRIP_HEIGHT: f32 = 480.0;
 
 /// Volume slider height (vertical fader)
 pub const VOLUME_SLIDER_HEIGHT: f32 = 200.0;

@@ -4,6 +4,7 @@
 
 //! PipeWire thread management and event handling.
 
+use crate::audio::native_loopback::NativeLoopback;
 use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use pipewire::link::Link;
 use pipewire::node::{Node, NodeListener};
@@ -26,10 +27,14 @@ pub enum PwCommand {
     CreateVirtualSink {
         channel_id: Uuid,
         name: String,
+        /// Target device name for routing (uses system default if None)
+        target_device: Option<String>,
     },
     CreateVirtualSource {
         channel_id: Uuid,
         name: String,
+        /// Target input device name (uses system default if None)
+        target_device: Option<String>,
     },
     DestroyVirtualSink {
         node_id: u32,
@@ -65,6 +70,8 @@ pub enum PwCommand {
     RouteChannelToDevice {
         loopback_output_node: u32,
         target_device_id: Option<u32>,
+        /// Channel ID for native loopback lookup
+        channel_id: Option<Uuid>,
     },
     CreateRecordingSource {
         name: String,
@@ -153,6 +160,14 @@ struct PwThreadState {
     /// Node IDs currently being processed by CLI background threads.
     /// Prevents concurrent CLI operations on the same node.
     cli_in_flight: Arc<Mutex<HashSet<u32>>>,
+    /// Native loopback instances (replacing pw-loopback CLI).
+    native_loopbacks: HashMap<Uuid, NativeLoopback>,
+    /// Pending loopback node discovery: node_name -> (channel_id, is_main_node)
+    /// Used to match nodes created by native loopbacks once they appear in registry.
+    pending_loopback_nodes: HashMap<String, (Uuid, bool)>,
+    /// Discovered node IDs for pending loopbacks: channel_id -> (main_node_id, secondary_node_id)
+    /// For sinks: (sink_id, output_id), for sources: (source_id, capture_id)
+    discovered_loopback_nodes: HashMap<Uuid, (Option<u32>, Option<u32>)>,
 }
 
 impl PwThreadState {
@@ -168,6 +183,9 @@ impl PwThreadState {
             cli_last_cmd: HashMap::new(),
             pending_cli_cmds: HashMap::new(),
             cli_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            native_loopbacks: HashMap::new(),
+            pending_loopback_nodes: HashMap::new(),
+            discovered_loopback_nodes: HashMap::new(),
         }
     }
 
@@ -498,13 +516,12 @@ fn handle_command(
             }
         }
 
-        PwCommand::CreateVirtualSink { channel_id, name } => {
+        PwCommand::CreateVirtualSink { channel_id, name, target_device: _ } => {
             debug!(
-                "Creating virtual sink: '{}' for channel {}",
+                "Creating virtual sink via pw-loopback: '{}' for channel {}",
                 name, channel_id
             );
-            // Virtual sink creation spawns pw-loopback and polls for the node,
-            // which blocks for 200-300ms. Run on a background thread.
+            // Use pw-loopback CLI which properly handles adapter for FL/FR ports
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                 match crate::audio::virtual_sink::create_virtual_sink_full(&name, &name) {
                     Ok(result) => {
@@ -524,13 +541,14 @@ fn handle_command(
             });
         }
 
-        PwCommand::CreateVirtualSource { channel_id, name } => {
+        PwCommand::CreateVirtualSource { channel_id, name, target_device } => {
             debug!(
-                "Creating virtual source: '{}' for channel {}",
-                name, channel_id
+                "Creating virtual source via pw-loopback: '{}' for channel {} (target: {:?})",
+                name, channel_id, target_device
             );
+            // Use pw-loopback CLI which properly handles adapter for FL/FR ports
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                match crate::audio::virtual_sink::create_virtual_source(&name) {
+                match crate::audio::virtual_sink::create_virtual_source(&name, target_device.as_deref()) {
                     Ok(result) => {
                         let _ = event_tx.send(PwEvent::VirtualSourceCreated {
                             channel_id,
@@ -563,19 +581,42 @@ fn handle_command(
         }
 
         PwCommand::DestroyVirtualSink { node_id } => {
-            debug!("Destroying virtual sink: {}", node_id);
+            debug!("Destroying virtual sink/source with node_id: {}", node_id);
             state.borrow_mut().bound_nodes.remove(&node_id);
             state
                 .borrow_mut()
                 .virtual_sinks
                 .retain(|_, &mut id| id != node_id);
-            // Kill the pw-loopback process on a background thread to avoid blocking.
-            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
-                    warn!("Failed to destroy virtual sink {}: {}", node_id, e);
+
+            // Find and remove native loopback by node ID
+            let channel_to_remove: Option<Uuid> = {
+                let state_ref = state.borrow();
+                state_ref
+                    .native_loopbacks
+                    .iter()
+                    .find(|(_, loopback)| loopback.main_node_id() == node_id)
+                    .map(|(id, _)| *id)
+            };
+
+            if let Some(channel_id) = channel_to_remove {
+                if let Some(loopback) = state.borrow_mut().native_loopbacks.remove(&channel_id) {
+                    if let Err(e) = loopback.disconnect() {
+                        warn!("Failed to disconnect loopback: {}", e);
+                    }
+                    // Loopback is dropped here, cleaning up streams
+                    info!("Destroyed native loopback for channel {}", channel_id);
                 }
-                let _ = event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
-            });
+            } else {
+                // Fallback to CLI destroy for legacy loopbacks
+                warn!("No native loopback found for node {}, trying CLI destroy", node_id);
+                spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                    if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
+                        warn!("Failed to destroy virtual sink {}: {}", node_id, e);
+                    }
+                });
+            }
+
+            let _ = state.borrow().event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
         }
 
         PwCommand::CreateLink {
@@ -732,29 +773,18 @@ fn handle_command(
         PwCommand::RouteChannelToDevice {
             loopback_output_node,
             target_device_id,
+            channel_id,
         } => {
             info!(
-                "Routing loopback output {} to device {:?}",
-                loopback_output_node, target_device_id
+                "Routing loopback output {} to device {:?} (channel={:?})",
+                loopback_output_node, target_device_id, channel_id
             );
 
-            // Collect all state data on the PW thread (non-blocking reads)
-            let links_to_destroy: Vec<u32> = {
-                let s = state.borrow();
-                s.links
-                    .values()
-                    .filter(|l| l.output_node == loopback_output_node)
-                    .map(|l| l.id)
-                    .collect()
-            };
-
+            // Resolve the target device ID
             let target_node_id = target_device_id.or_else(|| {
-                // Use the WirePlumber default sink as fallback instead of
-                // picking an arbitrary AudioSink (which could be a sootmix
-                // virtual sink or the wrong device).
+                // Use the WirePlumber default sink as fallback
                 crate::audio::routing::get_default_sink_id().and_then(|id| {
                     let s = state.borrow();
-                    // Verify it exists in our graph and isn't a sootmix sink
                     if s.nodes.get(&id).map_or(false, |n| {
                         n.media_class == MediaClass::AudioSink
                             && !n.name.starts_with("sootmix.")
@@ -765,6 +795,52 @@ fn handle_command(
                     }
                 })
             });
+
+            // Check if this is a native loopback - if so, use native re-routing
+            let is_native = channel_id
+                .map(|id| state.borrow().native_loopbacks.contains_key(&id))
+                .unwrap_or(false);
+
+            if is_native {
+                // Native loopback: use WirePlumber metadata for re-routing
+                // This lets WirePlumber handle format conversion properly
+                if let Some(ch_id) = channel_id {
+                    let reroute_result = {
+                        let st = state.borrow();
+                        if let Some(loopback) = st.native_loopbacks.get(&ch_id) {
+                            Some(loopback.reroute_to_device(target_node_id))
+                        } else {
+                            None
+                        }
+                    };
+
+                    match reroute_result {
+                        Some(Ok(())) => {
+                            info!("Native loopback {} re-routed to {:?}", ch_id, target_node_id);
+                        }
+                        Some(Err(e)) => {
+                            // Don't try CLI fallback - pw-link would fail due to format mismatch
+                            warn!("Native re-route failed: {}", e);
+                        }
+                        None => {
+                            warn!("Native loopback not found for channel {}", ch_id);
+                        }
+                    }
+                }
+                // Native routing via metadata doesn't require manual link creation
+                // WirePlumber will handle it
+                return;
+            }
+
+            // Legacy CLI-based routing for non-native loopbacks
+            let links_to_destroy: Vec<u32> = {
+                let s = state.borrow();
+                s.links
+                    .values()
+                    .filter(|l| l.output_node == loopback_output_node)
+                    .map(|l| l.id)
+                    .collect()
+            };
 
             let port_pairs: Vec<(u32, u32)> = if let Some(target_id) = target_node_id {
                 let s = state.borrow();
@@ -832,7 +908,7 @@ fn handle_command(
                 Vec::new()
             };
 
-            // Dispatch all CLI link operations to a background thread
+            // Dispatch CLI link operations to a background thread
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                 for link_id in links_to_destroy {
                     debug!("Destroying existing link {} from loopback output", link_id);
@@ -865,7 +941,7 @@ fn handle_command(
         PwCommand::CreateRecordingSource { name } => {
             info!("Creating recording source: {}", name);
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                match crate::audio::virtual_sink::create_virtual_source(&name) {
+                match crate::audio::virtual_sink::create_virtual_source(&name, None) {
                     Ok(result) => {
                         let _ = event_tx.send(PwEvent::RecordingSourceCreated {
                             name,
@@ -990,6 +1066,63 @@ fn setup_registry_listener(
                     }
 
                     state_add.borrow_mut().nodes.insert(global.id, node.clone());
+
+                    // Check if this node matches a pending native loopback
+                    let pending_match = state_add.borrow().pending_loopback_nodes.get(&node.name).cloned();
+                    if let Some((channel_id, is_main)) = pending_match {
+                        debug!(
+                            "Matched pending loopback node: {} -> channel {} (is_main={})",
+                            node.name, channel_id, is_main
+                        );
+
+                        // Record the discovered node ID
+                        {
+                            let mut st = state_add.borrow_mut();
+                            let entry = st.discovered_loopback_nodes.entry(channel_id).or_insert((None, None));
+                            if is_main {
+                                entry.0 = Some(node.id);
+                            } else {
+                                entry.1 = Some(node.id);
+                            }
+                            st.pending_loopback_nodes.remove(&node.name);
+                        }
+
+                        // Check if we have both nodes for this channel
+                        let discovered = state_add.borrow().discovered_loopback_nodes.get(&channel_id).cloned();
+                        if let Some((Some(main_id), Some(secondary_id))) = discovered {
+                            // Determine if this is a sink or source by checking if we have the loopback
+                            let is_source = state_add.borrow().native_loopbacks
+                                .get(&channel_id)
+                                .map(|lb| lb.is_source)
+                                .unwrap_or(false);
+
+                            if is_source {
+                                info!(
+                                    "Native virtual source ready: channel={}, source={}, capture={}",
+                                    channel_id, main_id, secondary_id
+                                );
+                                let _ = event_tx_add.send(PwEvent::VirtualSourceCreated {
+                                    channel_id,
+                                    source_node_id: main_id,
+                                    loopback_capture_node_id: Some(secondary_id),
+                                });
+                            } else {
+                                info!(
+                                    "Native virtual sink ready: channel={}, sink={}, output={}",
+                                    channel_id, main_id, secondary_id
+                                );
+                                let _ = event_tx_add.send(PwEvent::VirtualSinkCreated {
+                                    channel_id,
+                                    node_id: main_id,
+                                    loopback_output_node_id: Some(secondary_id),
+                                });
+                            }
+
+                            // Clean up
+                            state_add.borrow_mut().discovered_loopback_nodes.remove(&channel_id);
+                        }
+                    }
+
                     let _ = event_tx_add.send(PwEvent::NodeAdded(node));
                 }
                 ObjectType::Port => {

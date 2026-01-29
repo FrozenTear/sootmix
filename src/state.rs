@@ -122,16 +122,8 @@ impl MeterDisplayState {
     }
 }
 
-/// Whether a channel handles output (app audio) or input (mic capture).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ChannelKind {
-    /// Routes app audio through a virtual sink to the output device.
-    #[default]
-    Output,
-    /// Captures from a physical input device (mic) and exposes a virtual source
-    /// that recording apps (Discord, OBS) can use.
-    Input,
-}
+// Re-export ChannelKind from the IPC crate for consistency.
+pub use sootmix_ipc::ChannelKind;
 
 /// A virtual mixer channel created by SootMix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +210,9 @@ pub struct MixerChannel {
     /// Sidetone volume in decibels (-60.0 to 0.0).
     #[serde(default = "default_sidetone_db")]
     pub sidetone_volume_db: f32,
+    /// Whether RNNoise noise suppression is enabled for this input channel.
+    #[serde(default)]
+    pub noise_suppression_enabled: bool,
 }
 
 fn default_is_managed() -> bool {
@@ -261,6 +256,7 @@ impl MixerChannel {
             pw_loopback_capture_id: None,
             sidetone_enabled: false,
             sidetone_volume_db: -20.0,
+            noise_suppression_enabled: false,
         }
     }
 
@@ -296,6 +292,7 @@ impl MixerChannel {
             pw_loopback_capture_id: None,
             sidetone_enabled: false,
             sidetone_volume_db: -20.0,
+            noise_suppression_enabled: false,
         }
     }
 

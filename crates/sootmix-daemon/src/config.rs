@@ -57,6 +57,9 @@ pub struct SavedChannel {
     pub plugin_chain: Vec<PluginSlotConfig>,
     #[serde(default)]
     pub output_device_name: Option<String>,
+    /// Channel kind (Output or Input). Defaults to Output for backwards compatibility.
+    #[serde(default)]
+    pub kind: sootmix_ipc::ChannelKind,
 }
 
 fn default_true() -> bool {

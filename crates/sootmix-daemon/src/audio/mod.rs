@@ -4,6 +4,8 @@
 
 //! Audio subsystem for the daemon - PipeWire integration.
 
+pub mod native_loopback;
+pub mod noise_filter;
 pub mod pipewire_thread;
 pub mod routing;
 pub mod types;

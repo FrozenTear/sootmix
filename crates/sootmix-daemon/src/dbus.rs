@@ -254,6 +254,27 @@ impl DaemonDbusService {
         Ok(())
     }
 
+    /// Enable or disable noise suppression on an input channel.
+    async fn set_channel_noise_suppression(
+        &self,
+        channel_id: &str,
+        enabled: bool,
+    ) -> zbus::fdo::Result<()> {
+        debug!(
+            "D-Bus: set_channel_noise_suppression({}, {})",
+            channel_id, enabled
+        );
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        service.process_pw_events();
+        service
+            .set_channel_noise_suppression(channel_id, enabled)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Set master volume in dB.
     async fn set_master_volume(
         &self,

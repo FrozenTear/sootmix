@@ -45,3 +45,6 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Temp files for filter configs
+tempfile = "3"

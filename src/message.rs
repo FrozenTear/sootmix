@@ -68,6 +68,8 @@ pub enum Message {
     ChannelSidetoneToggled(Uuid),
     /// Sidetone volume changed (channel_id, volume_db).
     ChannelSidetoneVolumeChanged(Uuid, f32),
+    /// Toggle noise suppression on an input channel.
+    ChannelNoiseSuppressionToggled(Uuid),
     /// Global preset selected.
     PresetSelected(String),
     /// Save current configuration as preset.

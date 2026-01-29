@@ -7,7 +7,7 @@
 use crate::audio::pipewire_thread::{PwCommand, PwEvent, PwThread};
 use crate::audio::types::{MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use crate::config::{ConfigManager, MixerConfig, RoutingRulesConfig, SavedChannel};
-use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, OutputInfo, RoutingRuleInfo};
+use sootmix_ipc::{AppInfo, ChannelInfo, ChannelKind, InputInfo, OutputInfo, RoutingRuleInfo};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -34,14 +34,6 @@ pub enum ServiceError {
     AppNotFound(String),
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
-}
-
-/// Whether a channel handles output (app audio) or input (mic capture).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChannelKind {
-    #[default]
-    Output,
-    Input,
 }
 
 /// Internal channel state.
@@ -130,7 +122,7 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
-            kind: ChannelKind::Output, // TODO: load from saved config
+            kind: saved.kind,
             input_device_name: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,
@@ -154,6 +146,7 @@ impl ChannelState {
             assigned_apps: self.assigned_apps.clone(),
             output_device: self.output_device_name.clone().unwrap_or_default(),
             meter_levels: (left_db as f64, right_db as f64),
+            kind: self.kind,
         }
     }
 
@@ -655,10 +648,20 @@ impl DaemonService {
             .collect();
 
         for (id, name) in sinks_to_create {
-            info!("Restoring output channel: {} ({})", name, id);
+            // Get target device for this channel (per-channel or master)
+            let target_device = self
+                .state
+                .channels
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.output_device_name.clone())
+                .or_else(|| self.state.master_output.clone());
+
+            info!("Restoring output channel: {} ({}) target={:?}", name, id, target_device);
             self.send_pw_command(PwCommand::CreateVirtualSink {
                 channel_id: id,
                 name,
+                target_device,
             });
         }
 
@@ -672,10 +675,19 @@ impl DaemonService {
             .collect();
 
         for (id, name) in sources_to_create {
-            info!("Restoring input channel: {} ({})", name, id);
+            // Get target input device for this channel
+            let target_device = self
+                .state
+                .channels
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.output_device_name.clone()); // For input channels, this is the mic
+
+            info!("Restoring input channel: {} ({}) target={:?}", name, id, target_device);
             self.send_pw_command(PwCommand::CreateVirtualSource {
                 channel_id: id,
                 name,
+                target_device,
             });
         }
 
@@ -828,7 +840,7 @@ impl DaemonService {
                 self.update_apps_and_emit_signals();
 
                 // Check if this was a channel's sink or loopback output and clear stale IDs
-                let mut channels_to_recreate: Vec<(Uuid, String)> = Vec::new();
+                let mut channels_to_recreate: Vec<(Uuid, String, Option<String>)> = Vec::new();
                 for channel in &mut self.state.channels {
                     if channel.pw_sink_id == Some(id) {
                         warn!(
@@ -838,7 +850,9 @@ impl DaemonService {
                         channel.pw_sink_id = None;
                         channel.pw_loopback_output_id = None;
                         if channel.is_managed {
-                            channels_to_recreate.push((channel.id, channel.name.clone()));
+                            let target = channel.output_device_name.clone()
+                                .or_else(|| self.state.master_output.clone());
+                            channels_to_recreate.push((channel.id, channel.name.clone(), target));
                         }
                     } else if channel.pw_loopback_output_id == Some(id) {
                         warn!(
@@ -850,11 +864,12 @@ impl DaemonService {
                 }
 
                 // Auto-recreate managed virtual sinks that were killed externally
-                for (channel_id, name) in channels_to_recreate {
+                for (channel_id, name, target_device) in channels_to_recreate {
                     info!("Recreating virtual sink for channel '{}' after external removal", name);
                     self.send_pw_command(PwCommand::CreateVirtualSink {
                         channel_id,
                         name,
+                        target_device,
                     });
                 }
 
@@ -923,7 +938,7 @@ impl DaemonService {
                     .find(|c| c.pw_loopback_output_id == Some(port_node_id))
                     .map(|c| (c.id, c.pw_loopback_output_id));
 
-                if let Some((_channel_id, Some(loopback_id))) = loopback_route {
+                if let Some((channel_id, Some(loopback_id))) = loopback_route {
                     // Check if this loopback output already has links to a hardware sink
                     let has_links = self
                         .state
@@ -941,6 +956,7 @@ impl DaemonService {
                         self.send_pw_command(PwCommand::RouteChannelToDevice {
                             loopback_output_node: loopback_id,
                             target_device_id,
+                            channel_id: Some(channel_id),
                         });
                     }
                 }
@@ -962,7 +978,7 @@ impl DaemonService {
                 if is_hw_sink {
                     // Find channels whose loopback output should be linked to this
                     // sink but currently has no links (routing raced ahead of ports).
-                    let orphaned_loopbacks: Vec<u32> = self
+                    let orphaned_loopbacks: Vec<(Uuid, u32)> = self
                         .state
                         .channels
                         .iter()
@@ -975,14 +991,14 @@ impl DaemonService {
                                 .values()
                                 .any(|l| l.output_node == loopback_id);
                             if !has_links {
-                                Some(loopback_id)
+                                Some((c.id, loopback_id))
                             } else {
                                 None
                             }
                         })
                         .collect();
 
-                    for loopback_id in orphaned_loopbacks {
+                    for (channel_id, loopback_id) in orphaned_loopbacks {
                         debug!(
                             "Hardware sink {} got new port, retrying route for orphaned loopback {}",
                             port_node_id, loopback_id
@@ -990,6 +1006,7 @@ impl DaemonService {
                         self.send_pw_command(PwCommand::RouteChannelToDevice {
                             loopback_output_node: loopback_id,
                             target_device_id: Some(port_node_id),
+                            channel_id: Some(channel_id),
                         });
                     }
                 }
@@ -1044,6 +1061,7 @@ impl DaemonService {
                     self.send_pw_command(PwCommand::RouteChannelToDevice {
                         loopback_output_node: loopback_id,
                         target_device_id,
+                        channel_id: Some(channel_id),
                     });
                 }
 
@@ -1136,6 +1154,7 @@ impl DaemonService {
                     assigned_apps: c.assigned_apps.clone(),
                     plugin_chain: Vec::new(),
                     output_device_name: c.output_device_name.clone(),
+                    kind: c.kind,
                 })
                 .collect(),
         };
@@ -1152,11 +1171,15 @@ impl DaemonService {
         channel.sink_name = Some(format!("sootmix.{}", name));
         let id = channel.id;
 
+        // Use master output as target device for new channels
+        let target_device = self.state.master_output.clone();
+
         self.state.channels.push(channel);
 
         self.send_pw_command(PwCommand::CreateVirtualSink {
             channel_id: id,
             name: name.to_string(),
+            target_device,
         });
 
         self.save_config();
@@ -1169,9 +1192,11 @@ impl DaemonService {
 
         self.state.channels.push(channel);
 
+        // Input channels use system default mic initially
         self.send_pw_command(PwCommand::CreateVirtualSource {
             channel_id: id,
             name: name.to_string(),
+            target_device: None,
         });
 
         self.save_config();
@@ -1308,6 +1333,42 @@ impl DaemonService {
         }
 
         self.save_config();
+        Ok(())
+    }
+
+    /// Enable or disable noise suppression on an input channel.
+    ///
+    /// Note: Noise suppression requires the RNNoise LADSPA plugin to be installed.
+    /// This is currently a stub - full implementation pending native API migration.
+    pub fn set_channel_noise_suppression(
+        &mut self,
+        channel_id: &str,
+        enabled: bool,
+    ) -> Result<(), ServiceError> {
+        let id = Uuid::parse_str(channel_id)
+            .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        let channel = self
+            .state
+            .channels
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        if !channel.is_input() {
+            return Err(ServiceError::ChannelNotFound(
+                "Noise suppression is only available on input channels".to_string(),
+            ));
+        }
+
+        // TODO: Implement noise suppression with native PipeWire API
+        // See NATIVE_PIPEWIRE_MIGRATION.md Phase 3
+        tracing::warn!(
+            "Noise suppression not yet implemented (channel={}, enabled={})",
+            channel_id,
+            enabled
+        );
+
         Ok(())
     }
 
@@ -1509,15 +1570,8 @@ impl DaemonService {
             Some(device_name.to_string())
         };
 
-        let outputs = self.state.get_outputs();
-        let target_device_id = device_name_opt.as_ref().and_then(|name| {
-            outputs
-                .iter()
-                .find(|d| d.description == *name || d.name == *name)
-                .map(|d| d.node_id)
-        });
-
-        let loopback_id = {
+        // Get channel info to determine if it's input or output
+        let (channel_kind, channel_name, sink_id, loopback_id) = {
             let channel = self
                 .state
                 .channels
@@ -1525,15 +1579,40 @@ impl DaemonService {
                 .find(|c| c.id == channel_uuid)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-            channel.output_device_name = device_name_opt;
-            channel.pw_loopback_output_id
+            channel.output_device_name = device_name_opt.clone();
+            (channel.kind, channel.name.clone(), channel.pw_sink_id, channel.pw_loopback_output_id)
         };
 
-        if let Some(loopback_id) = loopback_id {
-            self.send_pw_command(PwCommand::RouteChannelToDevice {
-                loopback_output_node: loopback_id,
-                target_device_id,
+        if channel_kind == ChannelKind::Input {
+            // For input channels, we need to recreate the virtual source with the new target
+            // Destroy the existing one first
+            if let Some(source_id) = sink_id {
+                info!("Recreating input channel '{}' with new mic: {:?}", channel_name, device_name_opt);
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
+            }
+            // Create new virtual source with the target mic
+            self.send_pw_command(PwCommand::CreateVirtualSource {
+                channel_id: channel_uuid,
+                name: channel_name,
+                target_device: device_name_opt,
             });
+        } else {
+            // For output channels, route the loopback output to the new device
+            let outputs = self.state.get_outputs();
+            let target_device_id = device_name_opt.as_ref().and_then(|name| {
+                outputs
+                    .iter()
+                    .find(|d| d.description == *name || d.name == *name)
+                    .map(|d| d.node_id)
+            });
+
+            if let Some(loopback_id) = loopback_id {
+                self.send_pw_command(PwCommand::RouteChannelToDevice {
+                    loopback_output_node: loopback_id,
+                    target_device_id,
+                    channel_id: Some(channel_uuid),
+                });
+            }
         }
 
         self.save_config();
@@ -1558,18 +1637,19 @@ impl DaemonService {
         }
 
         // Re-route all existing channels to the new master output
-        let loopback_ids: Vec<u32> = self
+        let loopback_info: Vec<(Uuid, u32)> = self
             .state
             .channels
             .iter()
             .filter(|c| c.output_device_name.is_none())
-            .filter_map(|c| c.pw_loopback_output_id)
+            .filter_map(|c| c.pw_loopback_output_id.map(|lid| (c.id, lid)))
             .collect();
 
-        for loopback_id in loopback_ids {
+        for (channel_id, loopback_id) in loopback_info {
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id,
+                channel_id: Some(channel_id),
             });
         }
 
@@ -1817,7 +1897,7 @@ impl DaemonService {
     fn try_fallback_orphaned_channels(&mut self) {
         let target_device_id = self.get_master_output_device_id();
 
-        let orphaned_loopbacks: Vec<(u32, String)> = self
+        let orphaned_loopbacks: Vec<(Uuid, u32, String)> = self
             .state
             .channels
             .iter()
@@ -1830,7 +1910,7 @@ impl DaemonService {
                     .values()
                     .any(|l| l.output_node == loopback_id);
                 if !has_links {
-                    Some((loopback_id, c.name.clone()))
+                    Some((c.id, loopback_id, c.name.clone()))
                 } else {
                     None
                 }
@@ -1841,7 +1921,7 @@ impl DaemonService {
             return;
         }
 
-        for (loopback_id, channel_name) in orphaned_loopbacks {
+        for (channel_id, loopback_id, channel_name) in orphaned_loopbacks {
             info!(
                 "Fallback: re-routing orphaned channel '{}' (loopback {}) to device {:?}",
                 channel_name, loopback_id, target_device_id
@@ -1849,6 +1929,7 @@ impl DaemonService {
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id,
+                channel_id: Some(channel_id),
             });
         }
     }
@@ -1893,7 +1974,7 @@ impl DaemonService {
             device_name, device_desc, self.state.master_output, master_matches
         );
 
-        let mut loopbacks_to_route: Vec<(u32, String, Option<u32>)> = Vec::new();
+        let mut loopbacks_to_route: Vec<(Uuid, u32, String, Option<u32>)> = Vec::new();
 
         for c in &self.state.channels {
             let loopback_id = match c.pw_loopback_output_id {
@@ -1911,6 +1992,7 @@ impl DaemonService {
             if let Some(ref dev_name) = c.output_device_name {
                 if matches_device(dev_name) {
                     loopbacks_to_route.push((
+                        c.id,
                         loopback_id,
                         c.name.clone(),
                         Some(device_node_id),
@@ -1928,7 +2010,7 @@ impl DaemonService {
                 } else {
                     Some(device_node_id)
                 };
-                loopbacks_to_route.push((loopback_id, c.name.clone(), target));
+                loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), target));
                 continue;
             }
 
@@ -1949,7 +2031,7 @@ impl DaemonService {
                 );
 
                 if !has_links {
-                    loopbacks_to_route.push((loopback_id, c.name.clone(), None));
+                    loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), None));
                 }
             }
         }
@@ -1958,7 +2040,7 @@ impl DaemonService {
             info!("try_reroute_channels_to_device: no channels need re-routing");
         }
 
-        for (loopback_id, channel_name, target) in loopbacks_to_route {
+        for (channel_id, loopback_id, channel_name, target) in loopbacks_to_route {
             let target_id = target.or_else(|| self.get_master_output_device_id());
             info!(
                 "Re-routing channel '{}' loopback output to device node {:?} (trigger: '{}' node {})",
@@ -1967,6 +2049,7 @@ impl DaemonService {
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id: target_id,
+                channel_id: Some(channel_id),
             });
         }
     }

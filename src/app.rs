@@ -125,7 +125,7 @@ impl SootMix {
         // Open the initial window (daemon mode doesn't open one by default)
         let (window_id, open_window) = iced::window::open(iced::window::Settings {
             size: iced::Size::new(900.0, 700.0),
-            min_size: Some(iced::Size::new(480.0, 760.0)),
+            min_size: Some(iced::Size::new(480.0, 820.0)),
             platform_specific: iced::window::settings::PlatformSpecific {
                 application_id: "sootmix".to_string(),
                 ..Default::default()
@@ -415,6 +415,15 @@ impl SootMix {
                     let linear = db_to_linear(volume_db);
                     self.send_pw_command(PwCommand::SetVolume { node_id: source_node_id, volume: linear });
                 }
+            }
+
+            Message::ChannelNoiseSuppressionToggled(channel_id) => {
+                let new_enabled = self.state.channel(channel_id)
+                    .map(|c| !c.noise_suppression_enabled)
+                    .unwrap_or(false);
+                info!("Toggling noise suppression to {} for channel {}",
+                    new_enabled, channel_id);
+                self.cmd_set_channel_noise_suppression(channel_id, new_enabled);
             }
 
             // ==================== App Drag & Drop ====================
@@ -1175,7 +1184,7 @@ impl SootMix {
                 info!("Tray: Opening new window");
                 let (window_id, open_task) = iced::window::open(iced::window::Settings {
                     size: iced::Size::new(900.0, 700.0),
-                    min_size: Some(iced::Size::new(480.0, 760.0)),
+                    min_size: Some(iced::Size::new(480.0, 820.0)),
                     platform_specific: iced::window::settings::PlatformSpecific {
                         application_id: "sootmix".to_string(),
                         ..Default::default()
@@ -2406,6 +2415,39 @@ impl SootMix {
                 }
             }
         }
+    }
+
+    /// Toggle noise suppression on an input channel.
+    fn cmd_set_channel_noise_suppression(&mut self, channel_id: Uuid, enabled: bool) {
+        // Only input channels support noise suppression
+        let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
+        if !is_input {
+            warn!("Noise suppression is only available on input channels");
+            return;
+        }
+
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelNoiseSuppression {
+                    channel_id: channel_id.to_string(),
+                    enabled,
+                }
+            ) {
+                error!("Failed to send set noise suppression command to daemon: {}", e);
+            }
+            // Update local state immediately for responsive UI
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.noise_suppression_enabled = enabled;
+            }
+        } else {
+            // In standalone mode, noise suppression isn't supported yet
+            // (would require implementing filter-chain in the GUI's audio thread)
+            warn!("Noise suppression is only available when connected to daemon");
+            if let Some(channel) = self.state.channel_mut(channel_id) {
+                channel.noise_suppression_enabled = enabled;
+            }
+        }
+        self.save_config();
     }
 
     /// Set master volume in dB.
@@ -3666,18 +3708,24 @@ impl SootMix {
                             plugin_instances: Vec::new(),
                             meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
                             output_device_id: None,
-                            output_device_name: if ch_info.output_device.is_empty() {
-                                None
+                            output_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Output && !ch_info.output_device.is_empty() {
+                                Some(ch_info.output_device.clone())
                             } else {
-                                Some(ch_info.output_device)
+                                None
                             },
-                            kind: crate::state::ChannelKind::default(),
-                            input_device_name: None,
+                            kind: ch_info.kind,
+                            // For input channels, output_device contains the mic device name
+                            input_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Input && !ch_info.output_device.is_empty() {
+                                Some(ch_info.output_device)
+                            } else {
+                                None
+                            },
                             input_device_id: None,
                             pw_source_id: None,
                             pw_loopback_capture_id: None,
                             sidetone_enabled: false,
                             sidetone_volume_db: -20.0,
+                            noise_suppression_enabled: false,
                         };
                         self.state.channels.push(channel);
                     }
@@ -3750,18 +3798,24 @@ impl SootMix {
                             plugin_instances: Vec::new(),
                             meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
                             output_device_id: None,
-                            output_device_name: if ch_info.output_device.is_empty() {
-                                None
+                            output_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Output && !ch_info.output_device.is_empty() {
+                                Some(ch_info.output_device.clone())
                             } else {
-                                Some(ch_info.output_device)
+                                None
                             },
-                            kind: crate::state::ChannelKind::default(),
-                            input_device_name: None,
+                            kind: ch_info.kind,
+                            // For input channels, output_device contains the mic device name
+                            input_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Input && !ch_info.output_device.is_empty() {
+                                Some(ch_info.output_device)
+                            } else {
+                                None
+                            },
                             input_device_id: None,
                             pw_source_id: None,
                             pw_loopback_capture_id: None,
                             sidetone_enabled: false,
                             sidetone_volume_db: -20.0,
+                            noise_suppression_enabled: false,
                         };
                         self.state.channels.push(channel);
                     }

@@ -29,6 +29,7 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod builtin;
 pub mod host;
 pub mod manager;
 pub mod native;

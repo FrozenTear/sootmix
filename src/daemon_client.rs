@@ -24,6 +24,7 @@ trait Daemon {
     fn rename_channel(&self, channel_id: &str, name: &str) -> ZbusResult<()>;
     fn set_channel_volume(&self, channel_id: &str, volume_db: f64) -> ZbusResult<()>;
     fn set_channel_mute(&self, channel_id: &str, muted: bool) -> ZbusResult<()>;
+    fn set_channel_noise_suppression(&self, channel_id: &str, enabled: bool) -> ZbusResult<()>;
     fn set_master_volume(&self, volume_db: f64) -> ZbusResult<()>;
     fn set_master_mute(&self, muted: bool) -> ZbusResult<()>;
     fn assign_app(&self, app_id: &str, channel_id: &str) -> ZbusResult<()>;
@@ -224,6 +225,13 @@ impl DaemonClient {
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
     }
 
+    /// Enable or disable noise suppression on an input channel.
+    pub async fn set_channel_noise_suppression(&self, channel_id: &str, enabled: bool) -> Result<(), DaemonClientError> {
+        debug!("Setting channel {} noise suppression to {}", channel_id, enabled);
+        self.proxy.set_channel_noise_suppression(channel_id, enabled).await
+            .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
+    }
+
     /// Set master volume in dB.
     pub async fn set_master_volume(&self, volume_db: f64) -> Result<(), DaemonClientError> {
         self.proxy.set_master_volume(volume_db).await
@@ -373,6 +381,7 @@ pub enum DaemonCommand {
     SetChannelOutput { channel_id: String, device_name: String },
     SetMasterOutput(String),
     SetMasterRecording(bool),
+    SetChannelNoiseSuppression { channel_id: String, enabled: bool },
 }
 
 /// Global command sender for the daemon subscription.
@@ -728,6 +737,9 @@ async fn handle_daemon_command(
         }
         DaemonCommand::SetMasterRecording(enabled) => {
             client.set_master_recording(enabled).await?;
+        }
+        DaemonCommand::SetChannelNoiseSuppression { channel_id, enabled } => {
+            client.set_channel_noise_suppression(&channel_id, enabled).await?;
         }
     }
     Ok(())

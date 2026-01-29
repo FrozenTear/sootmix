@@ -423,7 +423,8 @@ pub struct VirtualSourceResult {
 }
 
 /// Create a virtual source for recording.
-pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualSinkError> {
+/// If `target_device` is Some, the capture stream will target that device (mic).
+pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<VirtualSourceResult, VirtualSinkError> {
     ensure_processes_map();
 
     let safe_name = name
@@ -434,8 +435,16 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
     let source_name = format!("sootmix.{}", safe_name);
     let loopback_node_name = format!("sootmix.{}.input", safe_name);
 
-    let capture_props =
-        "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string();
+    // Build capture props with optional target device
+    let capture_props = if let Some(device) = target_device {
+        format!(
+            "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR] target.object=\"{}\"",
+            device
+        )
+    } else {
+        "media.class=Stream/Input/Audio node.passive=true audio.position=[FL FR]".to_string()
+    };
+
     // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
     // device.class=audio-input classifies it as a user-facing input device.
     // Without these, the node won't appear in Helvum or other patchbays.
@@ -446,7 +455,7 @@ pub fn create_virtual_source(name: &str) -> Result<VirtualSourceResult, VirtualS
         source_name, name
     );
 
-    info!("Creating virtual source: {} (description: {})", source_name, name);
+    info!("Creating virtual source: {} (description: {}, target: {:?})", source_name, name, target_device);
 
     let child = Command::new("pw-loopback")
         .arg("--name")

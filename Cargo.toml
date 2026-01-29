@@ -54,6 +54,9 @@ thiserror = "2"
 tempfile = "3"
 parking_lot = "0.12"
 
+# Audio processing
+nnnoiseless = "0.5"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

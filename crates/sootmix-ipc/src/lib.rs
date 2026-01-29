@@ -20,6 +20,14 @@ pub const DBUS_PATH: &str = "/com/sootmix/Daemon";
 /// D-Bus interface name.
 pub const DBUS_INTERFACE: &str = "com.sootmix.Daemon";
 
+/// Channel kind - output (for playback) or input (for recording/mic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+pub enum ChannelKind {
+    #[default]
+    Output,
+    Input,
+}
+
 /// Information about a mixer channel.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ChannelInfo {
@@ -41,6 +49,8 @@ pub struct ChannelInfo {
     pub output_device: String,
     /// Current meter levels (left, right) in dB.
     pub meter_levels: (f64, f64),
+    /// Channel kind (Output or Input).
+    pub kind: ChannelKind,
 }
 
 impl ChannelInfo {
@@ -56,6 +66,7 @@ impl ChannelInfo {
             assigned_apps: Vec::new(),
             output_device: String::new(),
             meter_levels: (-60.0, -60.0),
+            kind: ChannelKind::Output,
         }
     }
 
