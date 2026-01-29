@@ -25,9 +25,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Default window size on open.
-const DEFAULT_WINDOW_SIZE: iced::Size = iced::Size::new(900.0, 700.0);
+const DEFAULT_WINDOW_SIZE: iced::Size = iced::Size::new(900.0, 900.0);
 /// Minimum window size.
-const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(900, 700.0);
+const MIN_WINDOW_SIZE: iced::Size = iced::Size::new(900.0, 900.0);
 
 /// Main application state.
 pub struct SootMix {
