@@ -79,6 +79,16 @@ pub enum PwCommand {
     DestroyRecordingSource {
         node_id: u32,
     },
+    /// Create a native noise filter for an input channel.
+    CreateNativeNoiseFilter {
+        channel_id: Uuid,
+        name: String,
+        target_mic: Option<String>,
+    },
+    /// Destroy a native noise filter.
+    DestroyNativeNoiseFilter {
+        channel_id: Uuid,
+    },
     Shutdown,
 }
 
@@ -113,6 +123,20 @@ pub enum PwEvent {
     },
     RecordingSourceDestroyed {
         node_id: u32,
+    },
+    /// Native noise filter was created successfully.
+    NativeNoiseFilterCreated {
+        channel_id: Uuid,
+        source_node_id: u32,
+    },
+    /// Native noise filter was destroyed.
+    NativeNoiseFilterDestroyed {
+        channel_id: Uuid,
+    },
+    /// Native noise filter creation failed.
+    NativeNoiseFilterFailed {
+        channel_id: Uuid,
+        error: String,
     },
     Error(String),
 }
@@ -965,6 +989,52 @@ fn handle_command(
                     warn!("Failed to destroy recording source {}: {}", node_id, e);
                 }
                 let _ = event_tx.send(PwEvent::RecordingSourceDestroyed { node_id });
+            });
+        }
+
+        PwCommand::CreateNativeNoiseFilter { channel_id, name, target_mic } => {
+            info!(
+                "Creating noise filter (CLI) for channel {} (name={}, target={:?})",
+                channel_id, name, target_mic
+            );
+
+            // Use CLI-based filter-chain with RNNoise LADSPA plugin
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                match crate::audio::noise_filter::create_noise_filter(
+                    channel_id,
+                    &name,
+                    target_mic.as_deref(),
+                    false, // mono
+                ) {
+                    Ok(source_node_id) => {
+                        info!(
+                            "Noise filter created for {}: source_node={}",
+                            channel_id, source_node_id
+                        );
+                        let _ = event_tx.send(PwEvent::NativeNoiseFilterCreated {
+                            channel_id,
+                            source_node_id,
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to create noise filter: {}", e);
+                        let _ = event_tx.send(PwEvent::NativeNoiseFilterFailed {
+                            channel_id,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
+        PwCommand::DestroyNativeNoiseFilter { channel_id } => {
+            info!("Destroying noise filter (CLI) for channel {}", channel_id);
+            // Use CLI-based destroy - kills the pipewire filter-chain process
+            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                if let Err(e) = crate::audio::noise_filter::destroy_noise_filter(channel_id) {
+                    warn!("Error destroying noise filter: {}", e);
+                }
+                let _ = event_tx.send(PwEvent::NativeNoiseFilterDestroyed { channel_id });
             });
         }
     }

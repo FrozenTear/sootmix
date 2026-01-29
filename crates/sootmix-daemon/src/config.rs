@@ -60,6 +60,9 @@ pub struct SavedChannel {
     /// Channel kind (Output or Input). Defaults to Output for backwards compatibility.
     #[serde(default)]
     pub kind: sootmix_ipc::ChannelKind,
+    /// Input device name (for input channels - the microphone).
+    #[serde(default)]
+    pub input_device_name: Option<String>,
 }
 
 fn default_true() -> bool {

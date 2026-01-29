@@ -60,6 +60,8 @@ pub struct ChannelState {
     pub pw_source_id: Option<u32>,
     /// PipeWire loopback capture node ID (for input channels).
     pub pw_loopback_capture_id: Option<u32>,
+    /// Whether noise suppression is enabled for this input channel.
+    pub noise_suppression_enabled: bool,
 }
 
 impl ChannelState {
@@ -82,6 +84,7 @@ impl ChannelState {
             input_device_name: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,
+            noise_suppression_enabled: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl ChannelState {
             input_device_name: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,
+            noise_suppression_enabled: false,
         }
     }
 
@@ -123,9 +127,10 @@ impl ChannelState {
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
             kind: saved.kind,
-            input_device_name: None,
+            input_device_name: saved.input_device_name.clone(),
             pw_source_id: None,
             pw_loopback_capture_id: None,
+            noise_suppression_enabled: false,
         }
     }
 
@@ -681,7 +686,7 @@ impl DaemonService {
                 .channels
                 .iter()
                 .find(|c| c.id == id)
-                .and_then(|c| c.output_device_name.clone()); // For input channels, this is the mic
+                .and_then(|c| c.input_device_name.clone());
 
             info!("Restoring input channel: {} ({}) target={:?}", name, id, target_device);
             self.send_pw_command(PwCommand::CreateVirtualSource {
@@ -1108,6 +1113,34 @@ impl DaemonService {
                     self.state.master_recording_enabled = false;
                 }
             }
+            PwEvent::NativeNoiseFilterCreated { channel_id, source_node_id } => {
+                info!(
+                    "Native noise filter created for channel {}: source_node={}",
+                    channel_id, source_node_id
+                );
+                // Update channel state - apps should connect to the noise-filtered source
+                if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
+                    channel.noise_suppression_enabled = true;
+                    channel.pw_source_id = Some(source_node_id);
+                    // Clear the old loopback capture ID since we destroyed it
+                    channel.pw_loopback_capture_id = None;
+                }
+            }
+            PwEvent::NativeNoiseFilterDestroyed { channel_id } => {
+                info!("Native noise filter destroyed for channel {}", channel_id);
+                if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
+                    channel.noise_suppression_enabled = false;
+                }
+            }
+            PwEvent::NativeNoiseFilterFailed { channel_id, error } => {
+                error!(
+                    "Native noise filter failed for channel {}: {}",
+                    channel_id, error
+                );
+                if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
+                    channel.noise_suppression_enabled = false;
+                }
+            }
             PwEvent::Error(msg) => {
                 error!("PipeWire error: {}", msg);
             }
@@ -1155,6 +1188,7 @@ impl DaemonService {
                     plugin_chain: Vec::new(),
                     output_device_name: c.output_device_name.clone(),
                     kind: c.kind,
+                    input_device_name: c.input_device_name.clone(),
                 })
                 .collect(),
         };
@@ -1361,13 +1395,50 @@ impl DaemonService {
             ));
         }
 
-        // TODO: Implement noise suppression with native PipeWire API
-        // See NATIVE_PIPEWIRE_MIGRATION.md Phase 3
-        tracing::warn!(
-            "Noise suppression not yet implemented (channel={}, enabled={})",
-            channel_id,
-            enabled
-        );
+        let channel_name = channel.name.clone();
+        let target_mic = channel.input_device_name.clone();
+        let existing_source_id = channel.pw_source_id;
+        let already_enabled = channel.noise_suppression_enabled;
+
+        // Skip if state isn't actually changing
+        if enabled == already_enabled {
+            debug!(
+                "Noise suppression already {} for channel '{}', skipping",
+                if enabled { "enabled" } else { "disabled" },
+                channel_name
+            );
+            return Ok(());
+        }
+
+        if enabled {
+            info!(
+                "Enabling noise suppression for channel '{}' (target_mic: {:?})",
+                channel_name, target_mic
+            );
+            // First destroy the existing loopback to avoid node name conflicts
+            if let Some(source_id) = existing_source_id {
+                info!("Destroying existing loopback source {} before creating noise filter", source_id);
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
+            }
+            // Then create the noise filter (which creates its own Audio/Source)
+            self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
+                channel_id: id,
+                name: channel_name,
+                target_mic,
+            });
+        } else {
+            info!("Disabling noise suppression for channel '{}'", channel_name);
+            // First destroy the noise filter
+            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter {
+                channel_id: id,
+            });
+            // Then recreate the regular loopback
+            self.send_pw_command(PwCommand::CreateVirtualSource {
+                channel_id: id,
+                name: channel_name,
+                target_device: target_mic,
+            });
+        }
 
         Ok(())
     }
@@ -1579,7 +1650,12 @@ impl DaemonService {
                 .find(|c| c.id == channel_uuid)
                 .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-            channel.output_device_name = device_name_opt.clone();
+            // Store device name in the appropriate field based on channel kind
+            if channel.is_input() {
+                channel.input_device_name = device_name_opt.clone();
+            } else {
+                channel.output_device_name = device_name_opt.clone();
+            }
             (channel.kind, channel.name.clone(), channel.pw_sink_id, channel.pw_loopback_output_id)
         };
 

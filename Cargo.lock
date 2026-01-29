@@ -3699,10 +3699,12 @@ name = "sootmix-daemon"
 version = "0.1.1"
 dependencies = [
  "abi_stable",
+ "bytemuck",
  "directories",
  "futures",
  "libloading 0.8.9",
  "libspa",
+ "nnnoiseless",
  "parking_lot 0.12.5",
  "pipewire",
  "regex",
@@ -3736,6 +3738,13 @@ version = "0.1.1"
 dependencies = [
  "abi_stable",
  "serde",
+]
+
+[[package]]
+name = "sootmix-rnnoise-ladspa"
+version = "0.1.0"
+dependencies = [
+ "nnnoiseless",
 ]
 
 [[package]]

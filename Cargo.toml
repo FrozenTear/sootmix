@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/sootmix-plugin-api", "crates/sootmix-ipc", "crates/sootmix-daemon"]
+members = [".", "crates/sootmix-plugin-api", "crates/sootmix-ipc", "crates/sootmix-daemon", "crates/sootmix-rnnoise-ladspa"]
 resolver = "2"
 
 [package]

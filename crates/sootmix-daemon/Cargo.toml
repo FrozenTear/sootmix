@@ -48,3 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Temp files for filter configs
 tempfile = "3"
+
+# Audio processing
+nnnoiseless = "0.5"
+bytemuck = { version = "1", features = ["derive"] }
