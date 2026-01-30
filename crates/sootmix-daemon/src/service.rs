@@ -134,7 +134,7 @@ impl ChannelState {
             input_device_name: saved.input_device_name.clone(),
             pw_source_id: None,
             pw_loopback_capture_id: None,
-            noise_suppression_enabled: false,
+            noise_suppression_enabled: saved.noise_suppression_enabled,
             vad_threshold: saved.vad_threshold,
         }
     }
@@ -676,29 +676,33 @@ impl DaemonService {
         }
 
         // Restore input channels (virtual sources)
-        let sources_to_create: Vec<(Uuid, String)> = self
+        let sources_to_create: Vec<(Uuid, String, Option<String>, bool, f32)> = self
             .state
             .channels
             .iter()
             .filter(|c| c.is_input() && c.pw_source_id.is_none())
-            .map(|c| (c.id, c.name.clone()))
+            .map(|c| (c.id, c.name.clone(), c.input_device_name.clone(), c.noise_suppression_enabled, c.vad_threshold))
             .collect();
 
-        for (id, name) in sources_to_create {
-            // Get target input device for this channel
-            let target_device = self
-                .state
-                .channels
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.input_device_name.clone());
+        for (id, name, target_device, ns_enabled, vad_threshold) in sources_to_create {
+            info!("Restoring input channel: {} ({}) target={:?} ns={}", name, id, target_device, ns_enabled);
 
-            info!("Restoring input channel: {} ({}) target={:?}", name, id, target_device);
-            self.send_pw_command(PwCommand::CreateVirtualSource {
-                channel_id: id,
-                name,
-                target_device,
-            });
+            if ns_enabled {
+                // Create with noise suppression
+                self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
+                    channel_id: id,
+                    name,
+                    target_mic: target_device,
+                    vad_threshold,
+                });
+            } else {
+                // Create plain virtual source
+                self.send_pw_command(PwCommand::CreateVirtualSource {
+                    channel_id: id,
+                    name,
+                    target_device,
+                });
+            }
         }
 
         std::thread::sleep(Duration::from_millis(300));
@@ -1210,6 +1214,7 @@ impl DaemonService {
                     output_device_name: c.output_device_name.clone(),
                     kind: c.kind,
                     input_device_name: c.input_device_name.clone(),
+                    noise_suppression_enabled: c.noise_suppression_enabled,
                     vad_threshold: c.vad_threshold,
                 })
                 .collect(),
