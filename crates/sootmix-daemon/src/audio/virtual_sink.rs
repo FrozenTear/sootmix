@@ -209,34 +209,75 @@ pub fn update_node_description(
 
 /// Destroy a virtual sink by killing its pw-loopback process.
 pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
+    // First try tracked process
     if let Some(ref mut map) = *get_processes() {
         if let Some(mut child) = map.remove(&node_id) {
-            info!("Destroying virtual sink with node ID {}", node_id);
+            info!("Destroying virtual sink with node ID {} (tracked process)", node_id);
             let _ = child.kill();
             let _ = child.wait();
             return Ok(());
         }
     }
 
+    // Process not tracked (e.g., daemon restarted). Look up node name and kill by pattern.
     warn!(
-        "No tracked process for node {}, attempting pw-cli destroy",
+        "No tracked process for node {}, looking up node name to kill pw-loopback",
         node_id
     );
+
+    // Get the node name from PipeWire
+    if let Ok(node_name) = get_node_name(node_id) {
+        info!("Found node name '{}' for node {}, killing matching pw-loopback", node_name, node_id);
+        // Kill pw-loopback processes that have this node name in their arguments
+        // Match both the source name (sootmix.X) and the input name (sootmix.X.input)
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("pw-loopback.*{}", node_name)])
+            .output();
+        // Give process time to die
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Also try pw-cli destroy as final fallback
     match Command::new("pw-cli")
         .args(["destroy", &node_id.to_string()])
         .output()
     {
         Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("pw-cli destroy failed for node {}: {}", node_id, stderr);
+            debug!("pw-cli destroy for node {}: {}", node_id, stderr.trim());
         }
         Err(e) => {
-            warn!("pw-cli destroy failed for node {}: {}", node_id, e);
+            debug!("pw-cli destroy failed for node {}: {}", node_id, e);
         }
         _ => {}
     }
 
     Ok(())
+}
+
+/// Get the node name for a given node ID from PipeWire.
+fn get_node_name(node_id: u32) -> Result<String, VirtualSinkError> {
+    let output = Command::new("pw-cli")
+        .args(["info", &node_id.to_string()])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(VirtualSinkError::NodeNotFound);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse "node.name = \"sootmix.Foo\"" from pw-cli info output
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.starts_with("node.name") {
+            if let Some(value) = line.split('=').nth(1) {
+                let name = value.trim().trim_matches('"').trim_matches('\'');
+                return Ok(name.to_string());
+            }
+        }
+    }
+
+    Err(VirtualSinkError::NodeNotFound)
 }
 
 /// Destroy all virtual sinks (cleanup on exit).

@@ -294,7 +294,7 @@ impl MixerChannel {
             output_device_name: None,
             pw_loopback_output_id: None,
             meter_levels: Some(Arc::new(AtomicMeterLevels::new())),
-            input_device_name: None,
+            input_device_name: Some("system-default".to_string()),
             input_device_id: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,

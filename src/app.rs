@@ -2284,28 +2284,10 @@ impl SootMix {
     fn cmd_delete_channel(&mut self, channel_id: Uuid) {
         info!("Deleting channel: {}, daemon_connected: {}", channel_id, self.daemon_connected);
 
-        // Check if this is an input channel - handle locally since daemon doesn't support input channels yet
         let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
         info!("Channel {} is_input: {}", channel_id, is_input);
 
-        if is_input {
-            // Input channels are managed locally, not by daemon
-            // Destroy virtual source for input channels
-            let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
-            info!("Input channel source_id: {:?}", source_id);
-            if let Some(node_id) = source_id {
-                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-            }
-            let capture_id = self.state.channel(channel_id).and_then(|c| c.pw_loopback_capture_id);
-            info!("Input channel capture_id: {:?}", capture_id);
-            if let Some(node_id) = capture_id {
-                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
-            }
-            info!("Removing input channel {} from state", channel_id);
-            self.state.channels.retain(|c| c.id != channel_id);
-            return;
-        }
-
+        // When connected to daemon, always delegate deletion to daemon (for both input and output channels)
         if self.daemon_connected {
             if let Err(e) = daemon_client::send_daemon_command(
                 daemon_client::DaemonCommand::DeleteChannel(channel_id.to_string())
@@ -2313,8 +2295,26 @@ impl SootMix {
                 error!("Failed to send delete channel command to daemon: {}", e);
             }
         } else {
+            // Standalone mode - handle deletion locally
 
-            // Get channel info before removing
+            // Handle input channels
+            if is_input {
+                let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
+                info!("Input channel source_id: {:?}", source_id);
+                if let Some(node_id) = source_id {
+                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                }
+                let capture_id = self.state.channel(channel_id).and_then(|c| c.pw_loopback_capture_id);
+                info!("Input channel capture_id: {:?}", capture_id);
+                if let Some(node_id) = capture_id {
+                    self.send_pw_command(PwCommand::DestroyVirtualSink { node_id });
+                }
+                info!("Removing input channel {} from state", channel_id);
+                self.state.channels.retain(|c| c.id != channel_id);
+                return;
+            }
+
+            // Get channel info before removing (output channels)
             let channel_info = self.state.channel(channel_id).map(|c| {
                 (c.pw_sink_id, c.assigned_apps.clone(), c.is_managed, c.pw_eq_node_id)
             });

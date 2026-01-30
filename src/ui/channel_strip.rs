@@ -285,26 +285,33 @@ pub fn channel_strip<'a>(
 
     let device_picker: Element<'a, Message> = if is_input {
         // Input channel: show input device picker + sidetone controls
-        let input_options: Vec<String> = std::iter::once("None".to_string())
-            .chain(
-                available_inputs
-                    .iter()
-                    .map(|d| truncate_string(&d.description, max_display_chars)),
-            )
+        // Filter out the synthetic "system-default" entry - we'll add our own "Default" label
+        let hw_inputs: Vec<_> = available_inputs
+            .iter()
+            .filter(|d| d.name != "system-default")
             .collect();
 
+        let input_options: Vec<String> = std::iter::once("Default".to_string())
+            .chain(hw_inputs.iter().map(|d| truncate_string(&d.description, max_display_chars)))
+            .collect();
+
+        // Map stored input_device_name to display label
         let selected_input = channel.input_device_name
             .clone()
             .map(|name| {
-                available_inputs
-                    .iter()
-                    .find(|d| d.description == name || d.name == name)
-                    .map(|d| truncate_string(&d.description, max_display_chars))
-                    .unwrap_or_else(|| truncate_string(&name, max_display_chars))
+                if name == "system-default" {
+                    "Default".to_string()
+                } else {
+                    hw_inputs
+                        .iter()
+                        .find(|d| d.description == name || d.name == name)
+                        .map(|d| truncate_string(&d.description, max_display_chars))
+                        .unwrap_or_else(|| truncate_string(&name, max_display_chars))
+                }
             })
-            .or_else(|| Some("None".to_string()));
+            .unwrap_or_else(|| "Default".to_string());
 
-        let display_to_full: Vec<(String, String)> = available_inputs
+        let display_to_full: Vec<(String, String)> = hw_inputs
             .iter()
             .map(|d| (truncate_string(&d.description, max_display_chars), d.description.clone()))
             .collect();
@@ -315,9 +322,9 @@ pub fn channel_strip<'a>(
 
         let input_picker = column![
             text("Input").size(TEXT_SMALL).color(TEXT_DIM),
-            pick_list(input_options, selected_input, move |selection: String| {
-                let device = if selection == "None" {
-                    None
+            pick_list(input_options, Some(selected_input), move |selection: String| {
+                let device = if selection == "Default" {
+                    Some("system-default".to_string())
                 } else {
                     let full_name = display_to_full
                         .iter()
