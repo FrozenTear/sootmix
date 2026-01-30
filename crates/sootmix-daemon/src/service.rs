@@ -1120,12 +1120,20 @@ impl DaemonService {
                     (None, None)
                 };
 
-                // If we have a target mic and a capture node, create the link
-                if let (Some(mic_name), Some(capture_node_id)) = (target_mic, capture_id) {
-                    self.send_pw_command(PwCommand::LinkInputChannelToMic {
-                        capture_node_id,
-                        target_mic_name: mic_name,
-                    });
+                // Link the capture node to the target mic (or system default)
+                if let Some(capture_node_id) = capture_id {
+                    if let Some(mic_name) = target_mic {
+                        // Specific mic selected
+                        self.send_pw_command(PwCommand::LinkInputChannelToMic {
+                            capture_node_id,
+                            target_mic_name: mic_name,
+                        });
+                    } else {
+                        // No specific mic - link to system default
+                        self.send_pw_command(PwCommand::LinkInputChannelToDefaultMic {
+                            capture_node_id,
+                        });
+                    }
                 }
             }
             PwEvent::RecordingSourceCreated { name, node_id } => {

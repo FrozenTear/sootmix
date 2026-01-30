@@ -604,6 +604,8 @@ async fn listen_to_signals(
         .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
     let mut outputs_changed = client.proxy.receive_outputs_changed().await
         .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
+    let mut inputs_changed = client.proxy.receive_inputs_changed().await
+        .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
 
     loop {
         tokio::select! {
@@ -691,6 +693,9 @@ async fn listen_to_signals(
             }
             Some(_signal) = outputs_changed.next() => {
                 let _ = tx.send(DaemonEvent::OutputsChanged);
+            }
+            Some(_signal) = inputs_changed.next() => {
+                let _ = tx.send(DaemonEvent::InputsChanged);
             }
             else => {
                 // All streams ended, connection lost
@@ -795,6 +800,8 @@ async fn listen_to_signals_arc(
         .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
     let mut outputs_changed = client.proxy.receive_outputs_changed().await
         .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
+    let mut inputs_changed = client.proxy.receive_inputs_changed().await
+        .map_err(|e| DaemonClientError::SignalSubscriptionFailed(e.to_string()))?;
 
     loop {
         tokio::select! {
@@ -882,6 +889,9 @@ async fn listen_to_signals_arc(
             }
             Some(_signal) = outputs_changed.next() => {
                 let _ = tx.send(DaemonEvent::OutputsChanged);
+            }
+            Some(_signal) = inputs_changed.next() => {
+                let _ = tx.send(DaemonEvent::InputsChanged);
             }
             else => {
                 // All streams ended, connection lost

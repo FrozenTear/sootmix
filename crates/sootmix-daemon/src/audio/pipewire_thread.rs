@@ -99,6 +99,11 @@ pub enum PwCommand {
         /// Target mic node name (description or node.name)
         target_mic_name: String,
     },
+    /// Link an input channel's capture stream to the system default microphone.
+    LinkInputChannelToDefaultMic {
+        /// The capture stream node (input side of the loopback)
+        capture_node_id: u32,
+    },
     Shutdown,
 }
 
@@ -1101,6 +1106,61 @@ fn handle_command(
                 }
             } else {
                 warn!("Could not find mic '{}' to link to capture stream", target_mic_name);
+            }
+        }
+
+        PwCommand::LinkInputChannelToDefaultMic { capture_node_id } => {
+            info!("Linking capture stream {} to system default mic", capture_node_id);
+
+            // Find the first hardware audio source (mic) that isn't a sootmix node
+            let default_mic = {
+                let st = state.borrow();
+                st.nodes.values()
+                    .filter(|n| {
+                        n.media_class == MediaClass::AudioSource
+                            && !n.name.starts_with("sootmix.")
+                            && !n.name.contains("loopback")
+                    })
+                    .next()
+                    .map(|n| (n.id, n.name.clone()))
+            };
+
+            if let Some((mic_id, mic_name)) = default_mic {
+                info!("Using default mic: {} (node {})", mic_name, mic_id);
+
+                // Get ports for both nodes
+                let (mic_output_ports, capture_input_ports) = {
+                    let st = state.borrow();
+                    let mic_ports: Vec<_> = st.ports.values()
+                        .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
+                        .cloned()
+                        .collect();
+                    let capture_ports: Vec<_> = st.ports.values()
+                        .filter(|p| p.node_id == capture_node_id && p.direction == PortDirection::Input)
+                        .cloned()
+                        .collect();
+                    (mic_ports, capture_ports)
+                };
+
+                // Create links between matching channels
+                for mic_port in &mic_output_ports {
+                    for capture_port in &capture_input_ports {
+                        let mic_ch = mic_port.name.rsplit('_').next().unwrap_or("");
+                        let cap_ch = capture_port.name.rsplit('_').next().unwrap_or("");
+
+                        if mic_ch == cap_ch || mic_ch == "MONO" {
+                            debug!(
+                                "Creating link: mic port {} ({}) -> capture port {} ({})",
+                                mic_port.id, mic_port.name, capture_port.id, capture_port.name
+                            );
+                            if let Err(e) = crate::audio::routing::create_link(mic_port.id, capture_port.id) {
+                                warn!("Failed to link default mic to capture stream: {}", e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("No default microphone found to link to capture stream");
             }
         }
     }
