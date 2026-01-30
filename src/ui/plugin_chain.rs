@@ -386,20 +386,50 @@ pub fn plugin_browser(
 
     let plugin_list = scrollable(column(plugin_items).spacing(SPACING_XS)).height(Length::Fixed(300.0));
 
-    // Divider
-    let divider = container(Space::new().height(1))
-        .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
-            ..container::Style::default()
-        });
+    // Download plugins button
+    let download_btn = button(
+        row![
+            text("\u{2B07}").size(TEXT_SMALL),
+            Space::new().width(SPACING_XS),
+            text("Download Plugins").size(TEXT_SMALL),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding([SPACING_XS, SPACING_SM])
+    .style(|_theme: &Theme, status| {
+        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if is_hovered {
+                SOOTMIX_DARK.accent_secondary
+            } else {
+                SURFACE_LIGHT
+            })),
+            text_color: if is_hovered { SOOTMIX_DARK.canvas } else { TEXT_DIM },
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(SOOTMIX_DARK.accent_secondary)
+                .width(1.0),
+            ..button::Style::default()
+        }
+    })
+    .on_press(Message::OpenPluginDownloader);
+
+    // Divider style closure
+    let divider_style = |_theme: &Theme| container::Style {
+        background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+        ..container::Style::default()
+    };
 
     let content = column![
         header,
         Space::new().height(SPACING_SM),
-        divider,
+        container(Space::new().height(1)).width(Length::Fill).style(divider_style),
         Space::new().height(SPACING_SM),
         plugin_list,
+        Space::new().height(SPACING_SM),
+        container(Space::new().height(1)).width(Length::Fill).style(divider_style),
+        Space::new().height(SPACING_SM),
+        container(download_btn).center_x(Length::Fill),
     ]
     .padding(PADDING)
     .spacing(SPACING_XS);

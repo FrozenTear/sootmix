@@ -68,14 +68,24 @@ pub enum PluginCategory {
     Eq,
     /// Compressors, limiters, gates, expanders.
     Dynamics,
-    /// Reverb, delay, echo.
+    /// Reverb effects.
     Reverb,
+    /// Delay, echo effects.
+    Delay,
     /// Modulation effects (chorus, flanger, phaser).
     Modulation,
     /// Distortion, saturation, amp simulation.
     Distortion,
-    /// Utility (gain, pan, phase, metering).
+    /// Utility (gain, pan, phase, routing).
     Utility,
+    /// Analyzers, meters, visualization.
+    Analyzer,
+    /// Filters, crossovers.
+    Filter,
+    /// Signal generators, oscillators.
+    Generator,
+    /// Synthesizers, instruments.
+    Synth,
     /// Multi-effects or uncategorized.
     Other,
 }

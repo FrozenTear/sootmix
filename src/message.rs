@@ -172,6 +172,24 @@ pub enum Message {
     /// Plugin sidechain source changed (channel_id, slot_index, source_channel_id or None).
     PluginSidechainSourceChanged(Uuid, usize, Option<Uuid>),
 
+    // ==================== Plugin Downloader ====================
+    /// Open the plugin downloader panel.
+    OpenPluginDownloader,
+    /// Close the plugin downloader panel.
+    ClosePluginDownloader,
+    /// Update downloader search filter.
+    DownloaderSearchChanged(String),
+    /// Start downloading a plugin pack (pack_id).
+    DownloadPack(String),
+    /// Download progress update (pack_id, progress 0.0-1.0).
+    DownloadProgress(String, f32),
+    /// Download completed successfully (pack_id).
+    DownloadComplete(String),
+    /// Download failed (pack_id, error message).
+    DownloadFailed(String, String),
+    /// Refresh the list of installed packs.
+    RefreshInstalledPacks,
+
     // ==================== PipeWire Events (from PW thread) ====================
     /// PipeWire connection established.
     PwConnected,

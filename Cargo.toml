@@ -40,6 +40,7 @@ libspa = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-stream = "0.1"
 futures = { version = "0.3", features = ["std", "async-await"] }
+async-stream = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -49,10 +50,19 @@ toml = "0.8"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 directories = "5"
+dirs = "5"
 regex = "1"
 thiserror = "2"
 tempfile = "3"
 parking_lot = "0.12"
+walkdir = "2"
+
+# HTTP/Download
+reqwest = { version = "0.12", features = ["stream"] }
+flate2 = "1.0"
+tar = "0.4"
+xz2 = "0.1"
+sevenz-rust = "0.6"
 
 # Audio processing
 nnnoiseless = "0.5"

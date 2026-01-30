@@ -658,6 +658,16 @@ pub struct AppState {
     pub bottom_panel_expanded: bool,
     /// Height of the bottom detail panel in pixels.
     pub bottom_panel_height: f32,
+
+    // ==================== Plugin Downloader ====================
+    /// Whether the plugin downloader panel is open.
+    pub downloader_open: bool,
+    /// Current search filter in the downloader.
+    pub downloader_search: String,
+    /// Currently downloading packs (pack_id -> progress 0.0-1.0).
+    pub downloading: std::collections::HashMap<String, f32>,
+    /// Set of installed pack IDs.
+    pub installed_packs: std::collections::HashSet<String>,
 }
 
 impl Default for AppState {
@@ -702,6 +712,10 @@ impl AppState {
             left_sidebar_collapsed: false,
             bottom_panel_expanded: false,
             bottom_panel_height: 200.0,
+            downloader_open: false,
+            downloader_search: String::new(),
+            downloading: std::collections::HashMap::new(),
+            installed_packs: std::collections::HashSet::new(),
         }
     }
 

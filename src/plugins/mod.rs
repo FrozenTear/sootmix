@@ -30,9 +30,11 @@
 //! ```
 
 pub mod builtin;
+pub mod downloader;
 pub mod host;
 pub mod manager;
 pub mod native;
+pub mod registry;
 
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm;

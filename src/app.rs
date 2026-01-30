@@ -63,6 +63,8 @@ pub struct SootMix {
     daemon_connected: bool,
     /// Receiver for single-instance activation requests from new launches.
     activation_rx: Option<mpsc::Receiver<()>>,
+    /// Whether shared plugin instances have been sent to PW thread.
+    shared_instances_sent: bool,
 }
 
 impl SootMix {
@@ -155,6 +157,7 @@ impl SootMix {
             main_window_id: Some(window_id),
             daemon_connected: false,
             activation_rx,
+            shared_instances_sent: false,
         };
 
         (app, open_window.discard())
@@ -227,6 +230,23 @@ impl SootMix {
             .collect();
 
         Some((plugin_name, params))
+    }
+
+    /// Ensure shared plugin instances are sent to PW thread.
+    /// Call this before any plugin filter operations.
+    fn ensure_shared_instances_sent(&mut self) {
+        if self.shared_instances_sent {
+            return;
+        }
+        if let Some(ref pw) = self.pw_thread {
+            let shared_instances = self.plugin_manager.shared_instances();
+            if let Err(e) = pw.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
+                error!("Failed to send shared plugin instances to PW thread: {:?}", e);
+            } else {
+                self.shared_instances_sent = true;
+                info!("Shared plugin instances sent to PW thread");
+            }
+        }
     }
 
     /// Handle messages.
@@ -774,18 +794,38 @@ impl SootMix {
             Message::AddPluginToChannel(channel_id, plugin_id) => {
                 info!("Adding plugin '{}' to channel {}", plugin_id, channel_id);
 
+                // Look up actual plugin type from registry before loading
+                let plugin_type = {
+                    let registry_arc = self.plugin_manager.registry();
+                    let registry = registry_arc.read();
+                    registry
+                        .get(&plugin_id)
+                        .map(|meta| meta.plugin_type)
+                        .unwrap_or(PluginType::Native)
+                };
+
                 // Try to load the plugin via PluginManager
                 match self.plugin_manager.load(&plugin_id) {
                     Ok(instance_id) => {
-                        info!("Loaded plugin instance: {}", instance_id);
+                        info!("Loaded plugin instance: {} (type: {:?})", instance_id, plugin_type);
 
                         // Add to channel state
                         if let Some(channel) = self.state.channel_mut(channel_id) {
-                            // Add config for persistence
-                            let config = PluginSlotConfig::new(
+                            // Add config for persistence with correct type and external_id
+                            #[allow(unused_mut)]
+                            let mut config = PluginSlotConfig::new(
                                 plugin_id.clone(),
-                                PluginType::Native,
+                                plugin_type,
                             );
+                            // For LV2/VST3, store the external_id (URI or class ID)
+                            #[cfg(feature = "lv2-plugins")]
+                            if plugin_type == PluginType::Lv2 {
+                                config.external_id = Some(plugin_id.clone());
+                            }
+                            #[cfg(feature = "vst3-plugins")]
+                            if plugin_type == PluginType::Vst3 {
+                                config.external_id = Some(plugin_id.clone());
+                            }
                             channel.plugin_chain.push(config);
 
                             // Track the runtime instance ID
@@ -805,6 +845,9 @@ impl SootMix {
                                 warn!("Failed to update plugin processor: {}", e);
                             }
 
+                            // Ensure shared plugin instances are available on PW thread
+                            self.ensure_shared_instances_sent();
+
                             // Create or update PipeWire plugin filter
                             if !self.plugin_filter_manager.has_filter(channel_id) {
                                 // First plugin - create the filter
@@ -818,13 +861,15 @@ impl SootMix {
 
                                 // Send command to PipeWire thread
                                 if let Some(ref pw) = self.pw_thread {
-                                    let meter_levels = self.state.channel(channel_id)
-                                        .and_then(|c| c.meter_levels.clone());
+                                    let (meter_levels, loopback_output_node_id) = self.state.channel(channel_id)
+                                        .map(|c| (c.meter_levels.clone(), c.pw_loopback_output_id))
+                                        .unwrap_or((None, None));
                                     let _ = pw.send(PwCommand::CreatePluginFilter {
                                         channel_id,
                                         channel_name,
                                         plugin_chain: instances,
                                         meter_levels,
+                                        loopback_output_node_id,
                                     });
                                 }
                             } else {
@@ -995,6 +1040,77 @@ impl SootMix {
                     }
                 }
                 self.save_config();
+            }
+
+            // ==================== Plugin Downloader ====================
+            Message::OpenPluginDownloader => {
+                info!("Opening plugin downloader");
+                self.state.downloader_open = true;
+                // Refresh installed packs
+                let installed = crate::plugins::downloader::blocking::get_installed_packs();
+                self.state.installed_packs = installed.into_iter().collect();
+            }
+            Message::ClosePluginDownloader => {
+                self.state.downloader_open = false;
+                self.state.downloader_search.clear();
+            }
+            Message::DownloaderSearchChanged(search) => {
+                self.state.downloader_search = search;
+            }
+            Message::DownloadPack(pack_id) => {
+                info!("Starting download of pack: {}", pack_id);
+                // Initialize progress
+                self.state.downloading.insert(pack_id.clone(), 0.0);
+
+                // Start async download task with progress streaming
+                let pack = crate::plugins::registry::get_pack_by_id(&pack_id);
+                if let Some(pack) = pack {
+                    return iced::Task::run(
+                        async_stream::stream! {
+                            let manager = crate::plugins::downloader::DownloadManager::new();
+                            let (tx, mut rx) = tokio::sync::mpsc::channel::<f32>(32);
+                            let pack_id_inner = pack.id.clone();
+                            let pack_id_progress = pack.id.clone();
+
+                            // Spawn the download in a separate task
+                            let download_handle = tokio::spawn(async move {
+                                manager.download_pack(&pack, tx).await
+                            });
+
+                            // Yield progress updates as they arrive
+                            while let Some(progress) = rx.recv().await {
+                                yield Message::DownloadProgress(pack_id_progress.clone(), progress);
+                            }
+
+                            // Wait for download to complete and yield final result
+                            match download_handle.await {
+                                Ok(Ok(())) => yield Message::DownloadComplete(pack_id_inner),
+                                Ok(Err(e)) => yield Message::DownloadFailed(pack_id_inner, e.to_string()),
+                                Err(e) => yield Message::DownloadFailed(pack_id_inner, format!("Task panicked: {}", e)),
+                            }
+                        },
+                        |msg| msg,
+                    );
+                }
+            }
+            Message::DownloadProgress(pack_id, progress) => {
+                self.state.downloading.insert(pack_id, progress);
+            }
+            Message::DownloadComplete(pack_id) => {
+                info!("Download complete: {}", pack_id);
+                self.state.downloading.remove(&pack_id);
+                self.state.installed_packs.insert(pack_id);
+                // Rescan plugins to pick up newly installed ones
+                self.plugin_manager.scan();
+            }
+            Message::DownloadFailed(pack_id, error) => {
+                error!("Download failed for {}: {}", pack_id, error);
+                self.state.downloading.remove(&pack_id);
+                self.state.last_error = Some(format!("Download failed: {}", error));
+            }
+            Message::RefreshInstalledPacks => {
+                let installed = crate::plugins::downloader::blocking::get_installed_packs();
+                self.state.installed_packs = installed.into_iter().collect();
             }
 
             // ==================== PipeWire Events ====================
@@ -1323,14 +1439,48 @@ impl SootMix {
         .padding(PADDING);
 
         // Wrap in main container
-        container(content)
+        let main_container = container(content)
             .width(Fill)
             .height(Fill)
             .style(|_theme| container::Style {
                 background: Some(Background::Color(BACKGROUND)),
                 ..container::Style::default()
-            })
+            });
+
+        // Plugin downloader modal (shown as overlay)
+        if self.state.downloader_open {
+            let downloader = crate::ui::plugin_downloader(
+                &self.state.downloader_search,
+                &self.state.downloading,
+                &self.state.installed_packs,
+            );
+
+            // Modal backdrop
+            let backdrop = button(Space::new().width(Fill).height(Fill))
+                .style(|_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(Color { a: 0.6, ..Color::BLACK })),
+                    ..button::Style::default()
+                })
+                .on_press(Message::ClosePluginDownloader);
+
+            // Stack modal on top with centering
+            iced::widget::stack![
+                main_container,
+                container(
+                    iced::widget::stack![
+                        backdrop,
+                        container(downloader)
+                            .center_x(Fill)
+                            .center_y(Fill),
+                    ]
+                )
+                .width(Fill)
+                .height(Fill),
+            ]
             .into()
+        } else {
+            main_container.into()
+        }
     }
 
     /// View the bottom detail panel (Ableton-style).
@@ -3218,6 +3368,46 @@ impl SootMix {
                         }
                     }
                 }
+
+                // Create plugin filter if channel has restored plugins
+                if let Some(channel) = self.state.channel(channel_id) {
+                    if !channel.plugin_instances.is_empty() {
+                        let channel_name = channel.name.clone();
+                        let plugin_count = channel.plugin_chain.len();
+                        let instances = channel.plugin_instances.clone();
+                        let meter_levels = channel.meter_levels.clone();
+
+                        info!(
+                            "Creating plugin filter for restored channel '{}' with {} plugins",
+                            channel_name, plugin_count
+                        );
+
+                        // Ensure shared instances are sent first
+                        self.ensure_shared_instances_sent();
+
+                        // Create filter in manager
+                        if !self.plugin_filter_manager.has_filter(channel_id) {
+                            if let Err(e) = self.plugin_filter_manager.create_filter(
+                                channel_id,
+                                &channel_name,
+                                plugin_count,
+                            ) {
+                                warn!("Failed to create plugin filter for restored channel: {}", e);
+                            }
+
+                            // Send command to PipeWire thread
+                            if let Some(ref pw) = self.pw_thread {
+                                let _ = pw.send(PwCommand::CreatePluginFilter {
+                                    channel_id,
+                                    channel_name,
+                                    plugin_chain: instances,
+                                    meter_levels,
+                                    loopback_output_node_id,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             PwEvent::VirtualSinkDestroyed { node_id } => {
                 for channel in &mut self.state.channels {
@@ -3760,6 +3950,8 @@ impl SootMix {
                             let shared_instances = self.plugin_manager.shared_instances();
                             if let Err(e) = thread.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
                                 error!("Failed to send shared plugin instances to PW thread: {:?}", e);
+                            } else {
+                                self.shared_instances_sent = true;
                             }
                             self.pw_thread = Some(thread);
                             self.pw_event_rx = Some(event_rx);
