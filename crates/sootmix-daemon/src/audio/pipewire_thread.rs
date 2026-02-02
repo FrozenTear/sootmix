@@ -645,7 +645,7 @@ fn handle_command(
                 let st = state.borrow();
                 st.nodes
                     .values()
-                    .find(|n| n.media_class == MediaClass::AudioSource && n.description == desc)
+                    .find(|n| n.is_audio_input() && n.description == desc)
                     .map(|n| n.name.clone())
                     .unwrap_or_else(|| "@DEFAULT_SOURCE@".to_string())
             } else {
@@ -1182,7 +1182,7 @@ fn handle_command(
                 st.nodes
                     .values()
                     .find(|n| {
-                        n.media_class == MediaClass::AudioSource
+                        n.is_audio_input()
                             && (n.name == target_mic_name || n.description == target_mic_name)
                     })
                     .map(|n| n.id)
@@ -1250,15 +1250,15 @@ fn handle_command(
                     let st = state.borrow();
                     st.nodes
                         .get(&default_id)
-                        .filter(|n| n.media_class == MediaClass::AudioSource)
+                        .filter(|n| n.is_audio_input())
                         .map(|n| (n.id, n.name.clone()))
                 } else {
-                    // Fallback: find the first hardware audio source that isn't a sootmix node
+                    // Fallback: find the first hardware audio input that isn't a sootmix node
                     let st = state.borrow();
                     st.nodes
                         .values()
                         .filter(|n| {
-                            n.media_class == MediaClass::AudioSource
+                            n.is_audio_input()
                                 && !n.name.starts_with("sootmix.")
                                 && !n.name.contains("loopback")
                         })

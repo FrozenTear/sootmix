@@ -263,10 +263,7 @@ impl PwGraphState {
     pub fn input_devices(&self, exclude_names: &[&str]) -> Vec<InputInfo> {
         self.nodes
             .values()
-            .filter(|n| {
-                n.media_class == MediaClass::AudioSource
-                    && !exclude_names.iter().any(|ex| n.name.contains(ex))
-            })
+            .filter(|n| n.is_audio_input() && !exclude_names.iter().any(|ex| n.name.contains(ex)))
             .map(|n| InputInfo {
                 node_id: n.id,
                 name: n.name.clone(),
@@ -538,7 +535,6 @@ pub struct DaemonService {
     signal_tx: Option<tokio_mpsc::UnboundedSender<SignalEvent>>,
 }
 
-
 impl DaemonService {
     pub fn new(
         mixer_config: MixerConfig,
@@ -582,7 +578,10 @@ impl DaemonService {
         // Emit signals for newly discovered apps
         for app in &self.state.apps {
             if !old_app_ids.contains(&app.node_id) {
-                debug!("Emitting AppDiscovered signal for: {} (node {})", app.name, app.node_id);
+                debug!(
+                    "Emitting AppDiscovered signal for: {} (node {})",
+                    app.name, app.node_id
+                );
                 self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
             }
         }
@@ -677,7 +676,10 @@ impl DaemonService {
                 .and_then(|c| c.output_device_name.clone())
                 .or_else(|| self.state.master_output.clone());
 
-            info!("Restoring output channel: {} ({}) target={:?}", name, id, target_device);
+            info!(
+                "Restoring output channel: {} ({}) target={:?}",
+                name, id, target_device
+            );
             self.send_pw_command(PwCommand::CreateVirtualSink {
                 channel_id: id,
                 name,
@@ -691,11 +693,22 @@ impl DaemonService {
             .channels
             .iter()
             .filter(|c| c.is_input() && c.pw_source_id.is_none())
-            .map(|c| (c.id, c.name.clone(), c.input_device_name.clone(), c.noise_suppression_enabled, c.vad_threshold))
+            .map(|c| {
+                (
+                    c.id,
+                    c.name.clone(),
+                    c.input_device_name.clone(),
+                    c.noise_suppression_enabled,
+                    c.vad_threshold,
+                )
+            })
             .collect();
 
         for (id, name, target_device, ns_enabled, vad_threshold) in sources_to_create {
-            info!("Restoring input channel: {} ({}) target={:?} ns={}", name, id, target_device, ns_enabled);
+            info!(
+                "Restoring input channel: {} ({}) target={:?} ns={}",
+                name, id, target_device, ns_enabled
+            );
 
             if ns_enabled {
                 // Create with noise suppression
@@ -752,9 +765,7 @@ impl DaemonService {
     /// Attempt PipeWire reconnection with exponential backoff.
     fn attempt_reconnect_if_needed(&mut self) {
         // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
-        let backoff = Duration::from_secs(
-            (2u64 << self.state.reconnect_failures.min(4)).min(30),
-        );
+        let backoff = Duration::from_secs((2u64 << self.state.reconnect_failures.min(4)).min(30));
 
         let should_attempt = match self.state.last_reconnect_attempt {
             None => true,
@@ -790,9 +801,7 @@ impl DaemonService {
                 warn!(
                     "PipeWire reconnection failed: {} (next attempt in {:?})",
                     e,
-                    Duration::from_secs(
-                        (2u64 << self.state.reconnect_failures.min(4)).min(30)
-                    )
+                    Duration::from_secs((2u64 << self.state.reconnect_failures.min(4)).min(30))
                 );
             }
         }
@@ -824,8 +833,8 @@ impl DaemonService {
                 let node_id = node.id;
                 let node_name = node.name.clone();
                 let node_class = node.media_class.clone();
-                let is_hw_sink = node_class == MediaClass::AudioSink
-                    && !node.name.starts_with("sootmix.");
+                let is_hw_sink =
+                    node_class == MediaClass::AudioSink && !node.name.starts_with("sootmix.");
                 let node_desc = node.description.clone();
 
                 if is_hw_sink {
@@ -874,7 +883,9 @@ impl DaemonService {
                         channel.pw_sink_id = None;
                         channel.pw_loopback_output_id = None;
                         if channel.is_managed {
-                            let target = channel.output_device_name.clone()
+                            let target = channel
+                                .output_device_name
+                                .clone()
                                 .or_else(|| self.state.master_output.clone());
                             channels_to_recreate.push((channel.id, channel.name.clone(), target));
                         }
@@ -889,7 +900,10 @@ impl DaemonService {
 
                 // Auto-recreate managed virtual sinks that were killed externally
                 for (channel_id, name, target_device) in channels_to_recreate {
-                    info!("Recreating virtual sink for channel '{}' after external removal", name);
+                    info!(
+                        "Recreating virtual sink for channel '{}' after external removal",
+                        name
+                    );
                     self.send_pw_command(PwCommand::CreateVirtualSink {
                         channel_id,
                         name,
@@ -995,8 +1009,7 @@ impl DaemonService {
                     .nodes
                     .get(&port_node_id)
                     .map_or(false, |n| {
-                        n.media_class == MediaClass::AudioSink
-                            && !n.name.starts_with("sootmix.")
+                        n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix.")
                     });
 
                 if is_hw_sink {
@@ -1116,11 +1129,8 @@ impl DaemonService {
                 meter_levels,
             } => {
                 // Get channel info and update state
-                let (target_mic, capture_id) = if let Some(channel) = self
-                    .state
-                    .channels
-                    .iter_mut()
-                    .find(|c| c.id == channel_id)
+                let (target_mic, capture_id) = if let Some(channel) =
+                    self.state.channels.iter_mut().find(|c| c.id == channel_id)
                 {
                     channel.pw_source_id = Some(source_node_id);
                     channel.pw_loopback_capture_id = loopback_capture_node_id;
@@ -1160,7 +1170,10 @@ impl DaemonService {
                     self.state.master_recording_enabled = false;
                 }
             }
-            PwEvent::NativeNoiseFilterCreated { channel_id, source_node_id } => {
+            PwEvent::NativeNoiseFilterCreated {
+                channel_id,
+                source_node_id,
+            } => {
                 info!(
                     "Native noise filter created for channel {}: source_node={}",
                     channel_id, source_node_id
@@ -1307,7 +1320,9 @@ impl DaemonService {
                 self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
             }
             if let Some(capture_id) = channel.pw_loopback_capture_id {
-                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: capture_id });
+                self.send_pw_command(PwCommand::DestroyVirtualSink {
+                    node_id: capture_id,
+                });
             }
         } else {
             // Destroy virtual sink for output channels
@@ -1380,10 +1395,7 @@ impl DaemonService {
         };
 
         if let Some(node_id) = node_id {
-            self.send_pw_command(PwCommand::SetVolume {
-                node_id,
-                volume,
-            });
+            self.send_pw_command(PwCommand::SetVolume { node_id, volume });
         }
 
         Ok(())
@@ -1410,10 +1422,7 @@ impl DaemonService {
         };
 
         if let Some(node_id) = node_id {
-            self.send_pw_command(PwCommand::SetMute {
-                node_id,
-                muted,
-            });
+            self.send_pw_command(PwCommand::SetMute { node_id, muted });
         }
 
         self.save_config();
@@ -1468,7 +1477,10 @@ impl DaemonService {
             );
             // First destroy the existing loopback to avoid node name conflicts
             if let Some(source_id) = existing_source_id {
-                info!("Destroying existing loopback source {} before creating noise filter", source_id);
+                info!(
+                    "Destroying existing loopback source {} before creating noise filter",
+                    source_id
+                );
                 self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
             }
             // Then create the noise filter (which creates its own Audio/Source)
@@ -1481,9 +1493,7 @@ impl DaemonService {
         } else {
             info!("Disabling noise suppression for channel '{}'", channel_name);
             // First destroy the noise filter
-            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter {
-                channel_id: id,
-            });
+            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter { channel_id: id });
             // Then recreate the regular loopback
             self.send_pw_command(PwCommand::CreateVirtualSource {
                 channel_id: id,
@@ -1543,9 +1553,7 @@ impl DaemonService {
             );
 
             // Destroy the existing filter
-            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter {
-                channel_id: id,
-            });
+            self.send_pw_command(PwCommand::DestroyNativeNoiseFilter { channel_id: id });
 
             // Create new filter with updated threshold
             self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
@@ -1607,7 +1615,10 @@ impl DaemonService {
                         gain_db, volume_linear, device_name, node_id
                     );
                 } else {
-                    warn!("Could not find PipeWire node for input device '{}'", device_name);
+                    warn!(
+                        "Could not find PipeWire node for input device '{}'",
+                        device_name
+                    );
                 }
             }
         }
@@ -1618,11 +1629,11 @@ impl DaemonService {
 
     /// Resolve an input device name to its PipeWire node ID.
     fn resolve_input_device_to_node_id(&self, device_name: &str) -> Option<u32> {
-        self.state.pw_graph.nodes.values()
-            .find(|n| {
-                n.media_class == MediaClass::AudioSource
-                    && (n.name == device_name || n.description == device_name)
-            })
+        self.state
+            .pw_graph
+            .nodes
+            .values()
+            .find(|n| n.is_audio_input() && (n.name == device_name || n.description == device_name))
             .map(|n| n.id)
     }
 
@@ -1644,10 +1655,7 @@ impl DaemonService {
         self.state.master_muted = muted;
 
         if let Some(node_id) = self.get_master_output_device_id() {
-            self.send_pw_command(PwCommand::SetMute {
-                node_id,
-                muted,
-            });
+            self.send_pw_command(PwCommand::SetMute { node_id, muted });
         }
 
         self.save_config();
@@ -1894,14 +1902,22 @@ impl DaemonService {
             } else {
                 channel.output_device_name = device_name_opt.clone();
             }
-            (channel.kind, channel.name.clone(), channel.pw_sink_id, channel.pw_loopback_output_id)
+            (
+                channel.kind,
+                channel.name.clone(),
+                channel.pw_sink_id,
+                channel.pw_loopback_output_id,
+            )
         };
 
         if channel_kind == ChannelKind::Input {
             // For input channels, we need to recreate the virtual source with the new target
             // Destroy the existing one first
             if let Some(source_id) = sink_id {
-                info!("Recreating input channel '{}' with new mic: {:?}", channel_name, device_name_opt);
+                info!(
+                    "Recreating input channel '{}' with new mic: {:?}",
+                    channel_name, device_name_opt
+                );
                 self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
             }
             // Create new virtual source with the target mic
@@ -2294,10 +2310,7 @@ impl DaemonService {
             let loopback_id = match c.pw_loopback_output_id {
                 Some(id) => id,
                 None => {
-                    debug!(
-                        "Channel '{}': no loopback output ID, skipping",
-                        c.name
-                    );
+                    debug!("Channel '{}': no loopback output ID, skipping", c.name);
                     continue;
                 }
             };
