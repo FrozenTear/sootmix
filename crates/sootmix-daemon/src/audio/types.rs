@@ -46,6 +46,14 @@ impl PwNode {
         matches!(self.media_class, MediaClass::AudioSource)
     }
 
+    /// Check if this node can provide audio input (microphone, line-in, or duplex device).
+    pub fn is_audio_input(&self) -> bool {
+        matches!(
+            self.media_class,
+            MediaClass::AudioSource | MediaClass::AudioDuplex
+        )
+    }
+
     pub fn display_name(&self) -> &str {
         if !self.description.is_empty() {
             &self.description
@@ -64,6 +72,8 @@ impl PwNode {
 pub enum MediaClass {
     AudioSink,
     AudioSource,
+    /// Combined input/output device (e.g., USB headset with mic).
+    AudioDuplex,
     StreamOutputAudio,
     StreamInputAudio,
     VideoSource,
@@ -75,6 +85,7 @@ impl MediaClass {
         match s {
             "Audio/Sink" => Self::AudioSink,
             "Audio/Source" => Self::AudioSource,
+            "Audio/Duplex" => Self::AudioDuplex,
             "Stream/Output/Audio" => Self::StreamOutputAudio,
             "Stream/Input/Audio" => Self::StreamInputAudio,
             "Video/Source" => Self::VideoSource,
@@ -86,6 +97,7 @@ impl MediaClass {
         match self {
             Self::AudioSink => "Audio/Sink",
             Self::AudioSource => "Audio/Source",
+            Self::AudioDuplex => "Audio/Duplex",
             Self::StreamOutputAudio => "Stream/Output/Audio",
             Self::StreamInputAudio => "Stream/Input/Audio",
             Self::VideoSource => "Video/Source",

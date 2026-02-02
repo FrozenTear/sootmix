@@ -4,7 +4,9 @@
 
 //! Application state management.
 
-use crate::audio::types::{AudioChannel, InputDevice, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort};
+use crate::audio::types::{
+    AudioChannel, InputDevice, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort,
+};
 use crate::config::RoutingRulesConfig;
 use crate::plugins::{PluginSlotConfig, PluginType};
 use serde::{Deserialize, Serialize};
@@ -240,7 +242,6 @@ pub struct MixerChannel {
     pub meter_levels: Option<std::sync::Arc<crate::audio::meter_stream::AtomicMeterLevels>>,
 
     // ==================== Input Channel Fields ====================
-
     /// Whether this channel is an output (app routing) or input (mic capture) channel.
     #[serde(default)]
     pub kind: ChannelKind,
@@ -536,7 +537,10 @@ impl PwGraphState {
 
     /// Get ports for a specific node.
     pub fn ports_for_node(&self, node_id: u32) -> Vec<&PwPort> {
-        self.ports.values().filter(|p| p.node_id == node_id).collect()
+        self.ports
+            .values()
+            .filter(|p| p.node_id == node_id)
+            .collect()
     }
 
     /// Find a link between two nodes.
@@ -783,13 +787,17 @@ impl AppState {
     /// Capture current mixer state as a snapshot.
     pub fn capture_snapshot(&self) -> MixerSnapshot {
         MixerSnapshot {
-            channels: self.channels.iter().map(|c| ChannelSnapshot {
-                id: c.id,
-                volume_db: c.volume_db,
-                muted: c.muted,
-                eq_enabled: c.eq_enabled,
-                eq_preset: c.eq_preset.clone(),
-            }).collect(),
+            channels: self
+                .channels
+                .iter()
+                .map(|c| ChannelSnapshot {
+                    id: c.id,
+                    volume_db: c.volume_db,
+                    muted: c.muted,
+                    eq_enabled: c.eq_enabled,
+                    eq_preset: c.eq_preset.clone(),
+                })
+                .collect(),
             master_volume_db: self.master_volume_db,
             master_muted: self.master_muted,
         }
@@ -819,12 +827,16 @@ impl AppState {
 
     /// Find a channel by name.
     pub fn channel_by_name(&self, name: &str) -> Option<&MixerChannel> {
-        self.channels.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.channels
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Find a channel by name (mutable).
     pub fn channel_by_name_mut(&mut self, name: &str) -> Option<&mut MixerChannel> {
-        self.channels.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.channels
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Find a channel by ID.
@@ -861,11 +873,15 @@ impl AppState {
             .map(|node| AppInfo {
                 node_id: node.id,
                 // Use app_name if available, otherwise description, then name
-                name: node.app_name.clone()
-                    .or_else(|| if !node.description.is_empty() {
-                        Some(node.description.clone())
-                    } else {
-                        None
+                name: node
+                    .app_name
+                    .clone()
+                    .or_else(|| {
+                        if !node.description.is_empty() {
+                            Some(node.description.clone())
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or_else(|| node.name.clone()),
                 binary: node.binary_name.clone(),
@@ -878,25 +894,36 @@ impl AppState {
     pub fn update_available_inputs(&mut self) {
         // Debug: log all nodes and their media classes to diagnose discovery issues
         let total_nodes = self.pw_graph.nodes.len();
-        let audio_sources: Vec<_> = self.pw_graph.nodes.values()
-            .filter(|n| n.media_class == MediaClass::AudioSource)
+        let audio_inputs: Vec<_> = self
+            .pw_graph
+            .nodes
+            .values()
+            .filter(|n| n.media_class.is_audio_input())
             .collect();
-        let potential_inputs: Vec<_> = self.pw_graph.nodes.values()
+        let potential_inputs: Vec<_> = self
+            .pw_graph
+            .nodes
+            .values()
             .filter(|n| n.name.contains("alsa_input") || n.name.contains("input"))
             .collect();
 
-        if !potential_inputs.is_empty() || !audio_sources.is_empty() {
+        if !potential_inputs.is_empty() || !audio_inputs.is_empty() {
             debug!(
-                "update_available_inputs: {} total nodes, {} Audio/Source nodes, {} potential inputs",
-                total_nodes, audio_sources.len(), potential_inputs.len()
+                "update_available_inputs: {} total nodes, {} audio input nodes, {} potential inputs",
+                total_nodes, audio_inputs.len(), potential_inputs.len()
             );
-            for n in &audio_sources {
-                debug!("  Audio/Source: id={} name='{}' desc='{}'", n.id, n.name, n.description);
+            for n in &audio_inputs {
+                debug!(
+                    "  Audio input: id={} name='{}' desc='{}' class={:?}",
+                    n.id, n.name, n.description, n.media_class
+                );
             }
             for n in &potential_inputs {
-                if n.media_class != MediaClass::AudioSource {
-                    debug!("  Potential input (wrong class): id={} name='{}' class={:?}",
-                           n.id, n.name, n.media_class);
+                if !n.media_class.is_audio_input() {
+                    debug!(
+                        "  Potential input (wrong class): id={} name='{}' class={:?}",
+                        n.id, n.name, n.media_class
+                    );
                 }
             }
         }
@@ -906,7 +933,7 @@ impl AppState {
             .nodes
             .values()
             .filter(|n| {
-                n.media_class == MediaClass::AudioSource
+                n.media_class.is_audio_input()
                     && !n.name.contains("sootmix.")
                     && !n.name.starts_with("LB-")
                     && !n.name.contains("loopback")
@@ -927,7 +954,10 @@ impl AppState {
         inputs.extend(hw_inputs);
         self.available_inputs = inputs;
 
-        debug!("update_available_inputs: result = {} devices", self.available_inputs.len());
+        debug!(
+            "update_available_inputs: result = {} devices",
+            self.available_inputs.len()
+        );
     }
 
     /// Update available outputs from PipeWire graph.

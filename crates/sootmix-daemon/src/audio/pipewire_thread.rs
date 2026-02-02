@@ -458,7 +458,10 @@ fn spawn_cli_work_for_node<F>(
     {
         let mut set = in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if set.contains(&node_id) {
-            trace!("Node {} already has CLI operation in-flight, skipping", node_id);
+            trace!(
+                "Node {} already has CLI operation in-flight, skipping",
+                node_id
+            );
             return;
         }
         set.insert(node_id);
@@ -563,7 +566,11 @@ fn handle_command(
             }
         }
 
-        PwCommand::CreateVirtualSink { channel_id, name, target_device } => {
+        PwCommand::CreateVirtualSink {
+            channel_id,
+            name,
+            target_device,
+        } => {
             debug!(
                 "Creating virtual sink: '{}' for channel {} (target: {:?})",
                 name, channel_id, target_device
@@ -581,11 +588,8 @@ fn handle_command(
                 .collect();
             let monitor_source_name = format!("sootmix.{}.monitor", safe_name);
 
-            let meter = PulseAudioMeter::new(
-                channel_id,
-                &monitor_source_name,
-                Arc::clone(&meter_levels),
-            );
+            let meter =
+                PulseAudioMeter::new(channel_id, &monitor_source_name, Arc::clone(&meter_levels));
             // Start meter - it will retry connection until the sink appears
             meter.start();
             state.borrow_mut().pulse_meters.insert(channel_id, meter);
@@ -620,7 +624,11 @@ fn handle_command(
             });
         }
 
-        PwCommand::CreateVirtualSource { channel_id, name, target_device } => {
+        PwCommand::CreateVirtualSource {
+            channel_id,
+            name,
+            target_device,
+        } => {
             debug!(
                 "Creating virtual source: '{}' for channel {} (target: {:?})",
                 name, channel_id, target_device
@@ -635,19 +643,17 @@ fn handle_command(
             // The target_device contains the friendly description, but PA needs the actual source name
             let pa_source_name = if let Some(desc) = target_device.as_deref() {
                 let st = state.borrow();
-                st.nodes.values()
-                    .find(|n| n.media_class == MediaClass::AudioSource && n.description == desc)
+                st.nodes
+                    .values()
+                    .find(|n| n.is_audio_input() && n.description == desc)
                     .map(|n| n.name.clone())
                     .unwrap_or_else(|| "@DEFAULT_SOURCE@".to_string())
             } else {
                 "@DEFAULT_SOURCE@".to_string()
             };
 
-            let meter = PulseAudioMeter::new(
-                channel_id,
-                &pa_source_name,
-                Arc::clone(&meter_levels),
-            );
+            let meter =
+                PulseAudioMeter::new(channel_id, &pa_source_name, Arc::clone(&meter_levels));
             meter.start();
             state.borrow_mut().pulse_meters.insert(channel_id, meter);
 
@@ -661,7 +667,10 @@ fn handle_command(
             // Native pw_stream doesn't load the adapter, causing format mismatch.
             let meter_levels_clone = Arc::clone(&meter_levels);
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                match crate::audio::virtual_sink::create_virtual_source(&name, target_device.as_deref()) {
+                match crate::audio::virtual_sink::create_virtual_source(
+                    &name,
+                    target_device.as_deref(),
+                ) {
                     Ok(result) => {
                         let _ = event_tx.send(PwEvent::VirtualSourceCreated {
                             channel_id,
@@ -722,7 +731,10 @@ fn handle_command(
                 }
             } else {
                 // Fallback to CLI destroy for legacy loopbacks
-                warn!("No native loopback found for node {}, trying CLI destroy", node_id);
+                warn!(
+                    "No native loopback found for node {}, trying CLI destroy",
+                    node_id
+                );
                 spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
                     if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
                         warn!("Failed to destroy virtual sink {}: {}", node_id, e);
@@ -730,7 +742,10 @@ fn handle_command(
                 });
             }
 
-            let _ = state.borrow().event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
+            let _ = state
+                .borrow()
+                .event_tx
+                .send(PwEvent::VirtualSinkDestroyed { node_id });
         }
 
         PwCommand::CreateLink {
@@ -755,9 +770,10 @@ fn handle_command(
                 None => {
                     warn!("Output port {} not found, using CLI fallback", output_port);
                     spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
-                            let _ =
-                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port)
+                        {
+                            let _ = event_tx
+                                .send(PwEvent::Error(format!("Failed to create link: {}", e)));
                         }
                     });
                     return;
@@ -769,9 +785,10 @@ fn handle_command(
                 None => {
                     warn!("Input port {} not found, using CLI fallback", input_port);
                     spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
-                            let _ =
-                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e)));
+                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port)
+                        {
+                            let _ = event_tx
+                                .send(PwEvent::Error(format!("Failed to create link: {}", e)));
                         }
                     });
                     return;
@@ -800,9 +817,10 @@ fn handle_command(
                 Err(e) => {
                     warn!("Native link creation failed: {:?}, using CLI fallback", e);
                     spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e2) = crate::audio::routing::create_link(output_port, input_port) {
-                            let _ =
-                                event_tx.send(PwEvent::Error(format!("Failed to create link: {}", e2)));
+                        if let Err(e2) = crate::audio::routing::create_link(output_port, input_port)
+                        {
+                            let _ = event_tx
+                                .send(PwEvent::Error(format!("Failed to create link: {}", e2)));
                         }
                     });
                 }
@@ -815,7 +833,10 @@ fn handle_command(
             // If we destroy async and create sync, WirePlumber can re-route the stream
             // to a different sink during the window between destroy and create.
             if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                let _ = state.borrow().event_tx.send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
+                let _ = state
+                    .borrow()
+                    .event_tx
+                    .send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
             }
         }
 
@@ -841,11 +862,16 @@ fn handle_command(
                 {
                     debug!("Native volume failed ({}), using CLI fallback", e);
                     let in_flight = Arc::clone(&state.borrow().cli_in_flight);
-                    spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
-                        if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
-                            error!("CLI volume control also failed: {}", e2);
-                        }
-                    });
+                    spawn_cli_work_for_node(
+                        &state.borrow().event_tx,
+                        &in_flight,
+                        node_id,
+                        move |_event_tx| {
+                            if let Err(e2) = crate::audio::volume::set_volume(node_id, volume) {
+                                error!("CLI volume control also failed: {}", e2);
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -860,11 +886,16 @@ fn handle_command(
                 {
                     debug!("Native mute failed ({}), using CLI fallback", e);
                     let in_flight = Arc::clone(&state.borrow().cli_in_flight);
-                    spawn_cli_work_for_node(&state.borrow().event_tx, &in_flight, node_id, move |_event_tx| {
-                        if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
-                            error!("CLI mute control also failed: {}", e2);
-                        }
-                    });
+                    spawn_cli_work_for_node(
+                        &state.borrow().event_tx,
+                        &in_flight,
+                        node_id,
+                        move |_event_tx| {
+                            if let Err(e2) = crate::audio::volume::set_mute(node_id, muted) {
+                                error!("CLI mute control also failed: {}", e2);
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -901,8 +932,7 @@ fn handle_command(
                 crate::audio::routing::get_default_sink_id().and_then(|id| {
                     let s = state.borrow();
                     if s.nodes.get(&id).map_or(false, |n| {
-                        n.media_class == MediaClass::AudioSink
-                            && !n.name.starts_with("sootmix.")
+                        n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix.")
                     }) {
                         Some(id)
                     } else {
@@ -931,7 +961,10 @@ fn handle_command(
 
                     match reroute_result {
                         Some(Ok(())) => {
-                            info!("Native loopback {} re-routed to {:?}", ch_id, target_node_id);
+                            info!(
+                                "Native loopback {} re-routed to {:?}",
+                                ch_id, target_node_id
+                            );
                         }
                         Some(Err(e)) => {
                             // Don't try CLI fallback - pw-link would fail due to format mismatch
@@ -963,8 +996,7 @@ fn handle_command(
                     .ports
                     .values()
                     .filter(|p| {
-                        p.node_id == loopback_output_node
-                            && p.direction == PortDirection::Output
+                        p.node_id == loopback_output_node && p.direction == PortDirection::Output
                     })
                     .collect();
                 let mut in_ports: Vec<_> = s
@@ -1083,7 +1115,12 @@ fn handle_command(
             });
         }
 
-        PwCommand::CreateNativeNoiseFilter { channel_id, name, target_mic, vad_threshold } => {
+        PwCommand::CreateNativeNoiseFilter {
+            channel_id,
+            name,
+            target_mic,
+            vad_threshold,
+        } => {
             info!(
                 "Creating noise filter (CLI) for channel {} (name={}, target={:?}, vad={}%)",
                 channel_id, name, target_mic, vad_threshold
@@ -1130,7 +1167,10 @@ fn handle_command(
             });
         }
 
-        PwCommand::LinkInputChannelToMic { capture_node_id, target_mic_name } => {
+        PwCommand::LinkInputChannelToMic {
+            capture_node_id,
+            target_mic_name,
+        } => {
             info!(
                 "Linking capture stream {} to mic '{}'",
                 capture_node_id, target_mic_name
@@ -1139,22 +1179,31 @@ fn handle_command(
             // Find the mic node by name/description
             let mic_node_id = {
                 let st = state.borrow();
-                st.nodes.values().find(|n| {
-                    n.media_class == MediaClass::AudioSource
-                        && (n.name == target_mic_name || n.description == target_mic_name)
-                }).map(|n| n.id)
+                st.nodes
+                    .values()
+                    .find(|n| {
+                        n.is_audio_input()
+                            && (n.name == target_mic_name || n.description == target_mic_name)
+                    })
+                    .map(|n| n.id)
             };
 
             if let Some(mic_id) = mic_node_id {
                 // Get ports for both nodes
                 let (mic_output_ports, capture_input_ports) = {
                     let st = state.borrow();
-                    let mic_ports: Vec<_> = st.ports.values()
+                    let mic_ports: Vec<_> = st
+                        .ports
+                        .values()
                         .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
                         .cloned()
                         .collect();
-                    let capture_ports: Vec<_> = st.ports.values()
-                        .filter(|p| p.node_id == capture_node_id && p.direction == PortDirection::Input)
+                    let capture_ports: Vec<_> = st
+                        .ports
+                        .values()
+                        .filter(|p| {
+                            p.node_id == capture_node_id && p.direction == PortDirection::Input
+                        })
                         .cloned()
                         .collect();
                     (mic_ports, capture_ports)
@@ -1173,32 +1222,49 @@ fn handle_command(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
                             );
-                            if let Err(e) = crate::audio::routing::create_link(mic_port.id, capture_port.id) {
+                            if let Err(e) =
+                                crate::audio::routing::create_link(mic_port.id, capture_port.id)
+                            {
                                 warn!("Failed to link mic to capture stream: {}", e);
                             }
                         }
                     }
                 }
             } else {
-                warn!("Could not find mic '{}' to link to capture stream", target_mic_name);
+                warn!(
+                    "Could not find mic '{}' to link to capture stream",
+                    target_mic_name
+                );
             }
         }
 
         PwCommand::LinkInputChannelToDefaultMic { capture_node_id } => {
-            info!("Linking capture stream {} to system default mic", capture_node_id);
+            info!(
+                "Linking capture stream {} to system default mic",
+                capture_node_id
+            );
 
-            // Find the first hardware audio source (mic) that isn't a sootmix node
-            let default_mic = {
-                let st = state.borrow();
-                st.nodes.values()
-                    .filter(|n| {
-                        n.media_class == MediaClass::AudioSource
-                            && !n.name.starts_with("sootmix.")
-                            && !n.name.contains("loopback")
-                    })
-                    .next()
-                    .map(|n| (n.id, n.name.clone()))
-            };
+            // Get the actual system default source from WirePlumber
+            let default_mic =
+                if let Some(default_id) = crate::audio::routing::get_default_source_id() {
+                    let st = state.borrow();
+                    st.nodes
+                        .get(&default_id)
+                        .filter(|n| n.is_audio_input())
+                        .map(|n| (n.id, n.name.clone()))
+                } else {
+                    // Fallback: find the first hardware audio input that isn't a sootmix node
+                    let st = state.borrow();
+                    st.nodes
+                        .values()
+                        .filter(|n| {
+                            n.is_audio_input()
+                                && !n.name.starts_with("sootmix.")
+                                && !n.name.contains("loopback")
+                        })
+                        .next()
+                        .map(|n| (n.id, n.name.clone()))
+                };
 
             if let Some((mic_id, mic_name)) = default_mic {
                 info!("Using default mic: {} (node {})", mic_name, mic_id);
@@ -1206,12 +1272,18 @@ fn handle_command(
                 // Get ports for both nodes
                 let (mic_output_ports, capture_input_ports) = {
                     let st = state.borrow();
-                    let mic_ports: Vec<_> = st.ports.values()
+                    let mic_ports: Vec<_> = st
+                        .ports
+                        .values()
                         .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
                         .cloned()
                         .collect();
-                    let capture_ports: Vec<_> = st.ports.values()
-                        .filter(|p| p.node_id == capture_node_id && p.direction == PortDirection::Input)
+                    let capture_ports: Vec<_> = st
+                        .ports
+                        .values()
+                        .filter(|p| {
+                            p.node_id == capture_node_id && p.direction == PortDirection::Input
+                        })
                         .cloned()
                         .collect();
                     (mic_ports, capture_ports)
@@ -1228,7 +1300,9 @@ fn handle_command(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
                             );
-                            if let Err(e) = crate::audio::routing::create_link(mic_port.id, capture_port.id) {
+                            if let Err(e) =
+                                crate::audio::routing::create_link(mic_port.id, capture_port.id)
+                            {
                                 warn!("Failed to link default mic to capture stream: {}", e);
                             }
                         }

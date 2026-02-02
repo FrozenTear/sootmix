@@ -208,13 +208,33 @@ pub fn get_default_sink_id() -> Option<u32> {
     // First line looks like: "id 42, type PipeWire:Interface:Node/3"
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first_line = stdout.lines().next()?;
-    let id_str = first_line
-        .strip_prefix("id ")?
-        .split(',')
-        .next()?
-        .trim();
+    let id_str = first_line.strip_prefix("id ")?.split(',').next()?.trim();
     let id = id_str.parse::<u32>().ok()?;
     debug!("WirePlumber default sink: node {}", id);
+    Some(id)
+}
+
+/// Get the system's default audio source (microphone) ID from WirePlumber.
+///
+/// Uses `wpctl inspect @DEFAULT_AUDIO_SOURCE@` to find the system's current
+/// default input device. Returns `None` if the command fails or no default
+/// is set.
+pub fn get_default_source_id() -> Option<u32> {
+    let output = Command::new("wpctl")
+        .args(["inspect", "@DEFAULT_AUDIO_SOURCE@"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // First line looks like: "id 42, type PipeWire:Interface:Node/3"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?;
+    let id_str = first_line.strip_prefix("id ")?.split(',').next()?.trim();
+    let id = id_str.parse::<u32>().ok()?;
+    debug!("WirePlumber default source: node {}", id);
     Some(id)
 }
 
