@@ -14,12 +14,21 @@ mod service;
 
 use dbus::DaemonDbusService;
 use service::SignalEvent;
-use sootmix_ipc::{DBUS_NAME, DBUS_PATH};
+use sootmix_ipc::{MeterData, DBUS_NAME, DBUS_PATH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
 use zbus::connection::Builder;
+
+/// Convert linear amplitude (0.0-1.0) to dB.
+fn linear_to_db(linear: f32) -> f64 {
+    if linear <= 0.0 {
+        -96.0 // Floor at -96 dB
+    } else {
+        (20.0 * linear.log10()).max(-96.0) as f64
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create signal channel for D-Bus signal events
     let (signal_tx, signal_rx) = tokio_mpsc::unbounded_channel::<SignalEvent>();
+    // Clone for meter polling task
+    let meter_signal_tx = signal_tx.clone();
 
     // Create the daemon service
     let mut daemon_service =
@@ -101,6 +112,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn meter polling task (~30fps for smooth VU meters)
+    let service_meters = service.clone();
+    let shutdown_flag_meters = shutdown_flag.clone();
+    let meter_task = tokio::spawn(async move {
+        while !shutdown_flag_meters.load(Ordering::Relaxed) {
+            tokio::time::sleep(tokio::time::Duration::from_millis(33)).await;
+
+            // Read meter levels from all channels
+            let meter_data: Vec<MeterData> = {
+                let Ok(svc) = service_meters.lock() else {
+                    continue;
+                };
+
+                svc.state
+                    .channels
+                    .iter()
+                    .filter_map(|ch| {
+                        // Only emit for channels with real atomic meter levels
+                        ch.atomic_meter_levels.as_ref().map(|levels| {
+                            let (left, right) = levels.load();
+                            let left_db = linear_to_db(left);
+                            let right_db = linear_to_db(right);
+                            // For now, peak = level (could track peak hold separately)
+                            MeterData::new(ch.id, left_db, right_db, left_db, right_db)
+                        })
+                    })
+                    .collect()
+            };
+
+            // Only send if we have any meter data
+            if !meter_data.is_empty() {
+                let _ = meter_signal_tx.send(SignalEvent::MeterUpdate(meter_data));
+            }
+        }
+    });
+
     // Spawn task to emit D-Bus signals from the signal channel
     let shutdown_flag_signals = shutdown_flag.clone();
     let signal_task = tokio::spawn(async move {
@@ -136,6 +183,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("Failed to emit OutputsChanged signal: {}", e);
                             }
                         }
+                        SignalEvent::MeterUpdate(data) => {
+                            // Don't log meter updates - they're too frequent
+                            if let Err(e) = dbus::emit_meter_update(ctx, data).await {
+                                warn!("Failed to emit MeterUpdate signal: {}", e);
+                            }
+                        }
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
@@ -165,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for tasks to finish (with timeout)
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), event_task).await;
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), meter_task).await;
     let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), signal_task).await;
 
     // Cleanup

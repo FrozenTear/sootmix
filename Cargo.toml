@@ -14,7 +14,7 @@ keywords = ["audio", "pipewire", "mixer", "linux"]
 categories = ["multimedia::audio"]
 
 [features]
-default = []
+default = ["lv2-plugins"]
 lv2-plugins = ["lilv"]
 vst3-plugins = ["vst3"]
 all-plugins = ["lv2-plugins", "vst3-plugins"]

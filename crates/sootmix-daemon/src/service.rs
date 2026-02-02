@@ -22,6 +22,7 @@ pub enum SignalEvent {
     AppDiscovered(AppInfo),
     AppRemoved(String),
     OutputsChanged,
+    MeterUpdate(Vec<sootmix_ipc::MeterData>),
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +53,8 @@ pub struct ChannelState {
     pub pw_sink_id: Option<u32>,
     pub pw_loopback_output_id: Option<u32>,
     pub meter_levels: (f32, f32),
+    /// Atomic meter levels from native loopback (for real-time reading).
+    pub atomic_meter_levels: Option<std::sync::Arc<crate::audio::AtomicMeterLevels>>,
     /// Whether this is an output or input channel.
     pub kind: ChannelKind,
     /// Input device name (for input channels).
@@ -64,6 +67,8 @@ pub struct ChannelState {
     pub noise_suppression_enabled: bool,
     /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
     pub vad_threshold: f32,
+    /// Hardware microphone gain in dB (-12.0 to +12.0). Controls the physical input device level.
+    pub input_gain_db: f32,
 }
 
 impl ChannelState {
@@ -82,12 +87,14 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
+            atomic_meter_levels: None,
             kind: ChannelKind::Output,
             input_device_name: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
+            input_gain_db: 0.0,
         }
     }
 
@@ -106,12 +113,14 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
+            atomic_meter_levels: None,
             kind: ChannelKind::Input,
             input_device_name: None,
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
+            input_gain_db: 0.0,
         }
     }
 
@@ -130,12 +139,14 @@ impl ChannelState {
             pw_sink_id: None,
             pw_loopback_output_id: None,
             meter_levels: (0.0, 0.0),
+            atomic_meter_levels: None,
             kind: saved.kind,
             input_device_name: saved.input_device_name.clone(),
             pw_source_id: None,
             pw_loopback_capture_id: None,
             noise_suppression_enabled: saved.noise_suppression_enabled,
             vad_threshold: saved.vad_threshold,
+            input_gain_db: saved.input_gain_db,
         }
     }
 
@@ -157,6 +168,7 @@ impl ChannelState {
             output_device: self.output_device_name.clone().unwrap_or_default(),
             meter_levels: (left_db as f64, right_db as f64),
             kind: self.kind,
+            input_gain_db: self.input_gain_db as f64,
         }
     }
 
@@ -310,8 +322,6 @@ impl PwGraphState {
     }
 
     pub fn find_port_pairs(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
-        use crate::audio::types::AudioChannel;
-
         // Collect and sort ports by channel for consistent ordering
         let mut output_ports: Vec<_> = self
             .ports
@@ -1042,6 +1052,7 @@ impl DaemonService {
                 channel_id,
                 node_id,
                 loopback_output_node_id,
+                meter_levels,
             } => {
                 let channel_update = self
                     .state
@@ -1051,6 +1062,7 @@ impl DaemonService {
                     .map(|channel| {
                         channel.pw_sink_id = Some(node_id);
                         channel.pw_loopback_output_id = loopback_output_node_id;
+                        channel.atomic_meter_levels = meter_levels;
                         info!(
                             "Virtual sink created for channel '{}': sink={}, loopback={:?}",
                             channel.name, node_id, loopback_output_node_id
@@ -1101,6 +1113,7 @@ impl DaemonService {
                 channel_id,
                 source_node_id,
                 loopback_capture_node_id,
+                meter_levels,
             } => {
                 // Get channel info and update state
                 let (target_mic, capture_id) = if let Some(channel) = self
@@ -1111,6 +1124,7 @@ impl DaemonService {
                 {
                     channel.pw_source_id = Some(source_node_id);
                     channel.pw_loopback_capture_id = loopback_capture_node_id;
+                    channel.atomic_meter_levels = meter_levels;
                     info!(
                         "Virtual source created for input channel '{}': source={}, capture={:?}",
                         channel.name, source_node_id, loopback_capture_node_id
@@ -1224,6 +1238,7 @@ impl DaemonService {
                     input_device_name: c.input_device_name.clone(),
                     noise_suppression_enabled: c.noise_suppression_enabled,
                     vad_threshold: c.vad_threshold,
+                    input_gain_db: c.input_gain_db,
                 })
                 .collect(),
         };
@@ -1543,6 +1558,72 @@ impl DaemonService {
 
         self.save_config();
         Ok(())
+    }
+
+    /// Set the hardware microphone gain for an input channel.
+    /// This controls the physical input device level, separate from the channel volume.
+    pub fn set_channel_input_gain(
+        &mut self,
+        channel_id: &str,
+        gain_db: f64,
+    ) -> Result<(), ServiceError> {
+        let id = Uuid::parse_str(channel_id)
+            .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        // Get channel info and validate
+        let (input_device_name, gain_db) = {
+            let channel = self
+                .state
+                .channels
+                .iter_mut()
+                .find(|c| c.id == id)
+                .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+            if !channel.is_input() {
+                return Err(ServiceError::ChannelNotFound(
+                    "Input gain is only available on input channels".to_string(),
+                ));
+            }
+
+            // Clamp to valid range (-12dB to +12dB)
+            let gain_db = (gain_db as f32).clamp(-12.0, 12.0);
+            channel.input_gain_db = gain_db;
+
+            (channel.input_device_name.clone(), gain_db)
+        };
+
+        // Resolve device name to node ID and apply volume
+        if let Some(device_name) = input_device_name {
+            if device_name != "system-default" {
+                if let Some(node_id) = self.resolve_input_device_to_node_id(&device_name) {
+                    // Convert dB to linear for PipeWire (0dB = 1.0)
+                    let volume_linear = db_to_linear(gain_db);
+                    self.send_pw_command(PwCommand::SetVolume {
+                        node_id,
+                        volume: volume_linear,
+                    });
+                    debug!(
+                        "Set input gain to {:.1}dB (linear={:.3}) on device '{}' (node {})",
+                        gain_db, volume_linear, device_name, node_id
+                    );
+                } else {
+                    warn!("Could not find PipeWire node for input device '{}'", device_name);
+                }
+            }
+        }
+
+        self.save_config();
+        Ok(())
+    }
+
+    /// Resolve an input device name to its PipeWire node ID.
+    fn resolve_input_device_to_node_id(&self, device_name: &str) -> Option<u32> {
+        self.state.pw_graph.nodes.values()
+            .find(|n| {
+                n.media_class == MediaClass::AudioSource
+                    && (n.name == device_name || n.description == device_name)
+            })
+            .map(|n| n.id)
     }
 
     pub fn set_master_volume(&mut self, volume_db: f64) -> Result<(), ServiceError> {

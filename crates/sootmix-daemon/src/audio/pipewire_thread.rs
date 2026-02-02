@@ -4,7 +4,8 @@
 
 //! PipeWire thread management and event handling.
 
-use crate::audio::native_loopback::NativeLoopback;
+use crate::audio::native_loopback::{AtomicMeterLevels, NativeLoopback};
+use crate::audio::pulse_meter::PulseAudioMeter;
 use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use pipewire::link::Link;
 use pipewire::node::{Node, NodeListener};
@@ -123,11 +124,15 @@ pub enum PwEvent {
         channel_id: Uuid,
         node_id: u32,
         loopback_output_node_id: Option<u32>,
+        /// Atomic meter levels for real-time level reading.
+        meter_levels: Option<std::sync::Arc<crate::audio::native_loopback::AtomicMeterLevels>>,
     },
     VirtualSourceCreated {
         channel_id: Uuid,
         source_node_id: u32,
         loopback_capture_node_id: Option<u32>,
+        /// Atomic meter levels for real-time level reading.
+        meter_levels: Option<std::sync::Arc<crate::audio::native_loopback::AtomicMeterLevels>>,
     },
     VirtualSinkDestroyed {
         node_id: u32,
@@ -201,6 +206,8 @@ struct PwThreadState {
     cli_in_flight: Arc<Mutex<HashSet<u32>>>,
     /// Native loopback instances (replacing pw-loopback CLI).
     native_loopbacks: HashMap<Uuid, NativeLoopback>,
+    /// PulseAudio-based meters for input channels.
+    pulse_meters: HashMap<Uuid, PulseAudioMeter>,
     /// Pending loopback node discovery: node_name -> (channel_id, is_main_node)
     /// Used to match nodes created by native loopbacks once they appear in registry.
     pending_loopback_nodes: HashMap<String, (Uuid, bool)>,
@@ -223,6 +230,7 @@ impl PwThreadState {
             pending_cli_cmds: HashMap::new(),
             cli_in_flight: Arc::new(Mutex::new(HashSet::new())),
             native_loopbacks: HashMap::new(),
+            pulse_meters: HashMap::new(),
             pending_loopback_nodes: HashMap::new(),
             discovered_loopback_nodes: HashMap::new(),
         }
@@ -555,12 +563,43 @@ fn handle_command(
             }
         }
 
-        PwCommand::CreateVirtualSink { channel_id, name, target_device: _ } => {
+        PwCommand::CreateVirtualSink { channel_id, name, target_device } => {
             debug!(
-                "Creating virtual sink via pw-loopback: '{}' for channel {}",
-                name, channel_id
+                "Creating virtual sink: '{}' for channel {} (target: {:?})",
+                name, channel_id, target_device
             );
-            // Use pw-loopback CLI which properly handles adapter for FL/FR ports
+
+            // Create a PulseAudio-based meter for this output channel.
+            // We monitor the sink's monitor source (sootmix.{name}.monitor) which
+            // captures all audio being played to the virtual sink.
+            let meter_levels = Arc::new(AtomicMeterLevels::new());
+
+            // Compute the monitor source name - must match what create_virtual_sink_full creates
+            let safe_name: String = name
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            let monitor_source_name = format!("sootmix.{}.monitor", safe_name);
+
+            let meter = PulseAudioMeter::new(
+                channel_id,
+                &monitor_source_name,
+                Arc::clone(&meter_levels),
+            );
+            // Start meter - it will retry connection until the sink appears
+            meter.start();
+            state.borrow_mut().pulse_meters.insert(channel_id, meter);
+
+            info!(
+                "PulseAudio meter started for output channel {} targeting '{}'",
+                channel_id, monitor_source_name
+            );
+
+            // Use CLI pw-loopback for virtual sinks.
+            // Native pw_stream creates a single interleaved port instead of separate FL/FR ports,
+            // which causes WirePlumber to fail linking to hardware devices after ~60 seconds.
+            // CLI pw-loopback uses the adapter module for proper stereo port creation.
+            let meter_levels_clone = Arc::clone(&meter_levels);
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                 match crate::audio::virtual_sink::create_virtual_sink_full(&name, &name) {
                     Ok(result) => {
@@ -568,6 +607,7 @@ fn handle_command(
                             channel_id,
                             node_id: result.sink_node_id,
                             loopback_output_node_id: result.loopback_output_node_id,
+                            meter_levels: Some(meter_levels_clone),
                         });
                     }
                     Err(e) => {
@@ -582,10 +622,44 @@ fn handle_command(
 
         PwCommand::CreateVirtualSource { channel_id, name, target_device } => {
             debug!(
-                "Creating virtual source via pw-loopback: '{}' for channel {} (target: {:?})",
+                "Creating virtual source: '{}' for channel {} (target: {:?})",
                 name, channel_id, target_device
             );
-            // Use pw-loopback CLI which properly handles adapter for FL/FR ports
+
+            // Create a PulseAudio-based meter for this input channel.
+            // PulseAudio's PEAK_DETECT handles format conversion and works reliably
+            // with any audio source (mono mics, stereo, etc).
+            let meter_levels = Arc::new(AtomicMeterLevels::new());
+
+            // Resolve device description to PA source name (node.name)
+            // The target_device contains the friendly description, but PA needs the actual source name
+            let pa_source_name = if let Some(desc) = target_device.as_deref() {
+                let st = state.borrow();
+                st.nodes.values()
+                    .find(|n| n.media_class == MediaClass::AudioSource && n.description == desc)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".to_string())
+            } else {
+                "@DEFAULT_SOURCE@".to_string()
+            };
+
+            let meter = PulseAudioMeter::new(
+                channel_id,
+                &pa_source_name,
+                Arc::clone(&meter_levels),
+            );
+            meter.start();
+            state.borrow_mut().pulse_meters.insert(channel_id, meter);
+
+            info!(
+                "PulseAudio meter started for channel {} targeting '{}'",
+                channel_id, pa_source_name
+            );
+
+            // Use CLI pw-loopback for input channels - it properly handles
+            // format conversion (mono mic → stereo) via libspa-audioconvert adapter.
+            // Native pw_stream doesn't load the adapter, causing format mismatch.
+            let meter_levels_clone = Arc::clone(&meter_levels);
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                 match crate::audio::virtual_sink::create_virtual_source(&name, target_device.as_deref()) {
                     Ok(result) => {
@@ -593,6 +667,7 @@ fn handle_command(
                             channel_id,
                             source_node_id: result.source_node_id,
                             loopback_capture_node_id: result.capture_stream_node_id,
+                            meter_levels: Some(meter_levels_clone),
                         });
                     }
                     Err(e) => {
@@ -1286,13 +1361,25 @@ fn setup_registry_listener(
                         // Check if we have both nodes for this channel
                         let discovered = state_add.borrow().discovered_loopback_nodes.get(&channel_id).cloned();
                         if let Some((Some(main_id), Some(secondary_id))) = discovered {
-                            // Determine if this is a sink or source by checking if we have the loopback
-                            let is_source = state_add.borrow().native_loopbacks
-                                .get(&channel_id)
-                                .map(|lb| lb.is_source)
-                                .unwrap_or(false);
+                            // Get loopback info
+                            let is_source = {
+                                let state_ref = state_add.borrow();
+                                state_ref.native_loopbacks
+                                    .get(&channel_id)
+                                    .map(|lb| lb.is_source)
+                                    .unwrap_or(false)
+                            };
 
                             if is_source {
+                                // For input channels, use the PulseAudio meter's levels
+                                // (PulseAudio PEAK_DETECT handles format conversion reliably)
+                                let meter_levels = {
+                                    let state_ref = state_add.borrow();
+                                    state_ref.pulse_meters
+                                        .get(&channel_id)
+                                        .map(|pm| Arc::clone(pm.levels()))
+                                };
+
                                 info!(
                                     "Native virtual source ready: channel={}, source={}, capture={}",
                                     channel_id, main_id, secondary_id
@@ -1301,8 +1388,17 @@ fn setup_registry_listener(
                                     channel_id,
                                     source_node_id: main_id,
                                     loopback_capture_node_id: Some(secondary_id),
+                                    meter_levels,
                                 });
                             } else {
+                                // For output channels, use native loopback's meter levels
+                                let meter_levels = {
+                                    let state_ref = state_add.borrow();
+                                    state_ref.native_loopbacks
+                                        .get(&channel_id)
+                                        .map(|lb| Arc::clone(lb.meter_levels()))
+                                };
+
                                 info!(
                                     "Native virtual sink ready: channel={}, sink={}, output={}",
                                     channel_id, main_id, secondary_id
@@ -1311,6 +1407,7 @@ fn setup_registry_listener(
                                     channel_id,
                                     node_id: main_id,
                                     loopback_output_node_id: Some(secondary_id),
+                                    meter_levels,
                                 });
                             }
 

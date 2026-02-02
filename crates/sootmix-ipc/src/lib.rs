@@ -51,6 +51,8 @@ pub struct ChannelInfo {
     pub meter_levels: (f64, f64),
     /// Channel kind (Output or Input).
     pub kind: ChannelKind,
+    /// Hardware microphone gain in dB (-12.0 to +12.0). Only applies to input channels.
+    pub input_gain_db: f64,
 }
 
 impl ChannelInfo {
@@ -67,6 +69,7 @@ impl ChannelInfo {
             output_device: String::new(),
             meter_levels: (-60.0, -60.0),
             kind: ChannelKind::Output,
+            input_gain_db: 0.0,
         }
     }
 

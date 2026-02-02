@@ -90,21 +90,6 @@ impl AtomicMeterLevels {
 // PEAK CALCULATION
 // ============================================================================
 
-/// Calculate peak level from audio samples.
-///
-/// This is RT-safe - no allocations or blocking.
-#[inline]
-pub fn calculate_peak(samples: &[f32]) -> f32 {
-    let mut peak: f32 = 0.0;
-    for &sample in samples {
-        let abs = sample.abs();
-        if abs > peak {
-            peak = abs;
-        }
-    }
-    peak
-}
-
 /// Calculate stereo peak levels from interleaved samples.
 ///
 /// Assumes stereo interleaved format: [L0, R0, L1, R1, ...]
@@ -135,7 +120,6 @@ pub fn calculate_stereo_peaks(samples: &[f32]) -> (f32, f32) {
 // METER CAPTURE STREAM
 // ============================================================================
 
-const NUM_CHANNELS: usize = 2;
 
 /// User data for meter stream callback.
 struct MeterUserData {
@@ -161,7 +145,9 @@ pub struct MeterCaptureStream {
 }
 
 impl MeterCaptureStream {
-    /// Create a new meter capture stream.
+    /// Create a new meter capture stream for a virtual sink (output channel).
+    ///
+    /// Uses `stream.monitor=true` to capture from the sink's monitor ports.
     ///
     /// # Arguments
     /// * `core` - PipeWire core connection
@@ -179,10 +165,12 @@ impl MeterCaptureStream {
         let stream_name = format!("sootmix.meter.{}", channel_name);
 
         info!(
-            "Creating meter capture stream for channel '{}' ({}) targeting '{}'",
+            "Creating meter capture stream for channel '{}' ({}) targeting sink '{}'",
             channel_name, channel_id, target_node_name
         );
 
+        // Use raw audio capture for true stereo peak detection.
+        // We process the interleaved stereo samples ourselves instead of using resample.peaks.
         let stream = StreamRc::new(
             core.clone(),
             &stream_name,
@@ -194,10 +182,7 @@ impl MeterCaptureStream {
                 "node.name" => stream_name.clone(),
                 "node.description" => format!("SootMix Meter - {}", channel_name),
                 "node.passive" => "true",
-                "node.rate" => "1/30",
-                "node.latency" => "1/30",
                 "stream.monitor" => "true",
-                "resample.peaks" => "true",
                 "target.object" => target_node_name,
                 "audio.channels" => "2",
                 "audio.position" => "FL,FR"
@@ -214,6 +199,74 @@ impl MeterCaptureStream {
             .state_changed(|_stream, user_data, old, new| {
                 debug!(
                     "Meter stream state changed: {:?} -> {:?} (channel {})",
+                    old, new, user_data.channel_id
+                );
+            })
+            .process(meter_process_callback)
+            .register()?;
+
+        Ok(Self {
+            channel_id,
+            stream,
+            _listener: listener,
+            levels,
+        })
+    }
+
+    /// Create a new meter capture stream for a virtual source (input channel).
+    ///
+    /// Unlike sink metering, this does NOT use `stream.monitor` - it connects
+    /// directly to the source's output ports to capture what apps receive.
+    ///
+    /// # Arguments
+    /// * `core` - PipeWire core connection
+    /// * `channel_id` - Channel UUID
+    /// * `channel_name` - Human-readable channel name
+    /// * `target_node_name` - Name of the virtual source to capture from
+    /// * `levels` - Atomic levels to store peaks (shared with UI)
+    pub fn new_for_source(
+        core: &pipewire::core::CoreRc,
+        channel_id: Uuid,
+        channel_name: &str,
+        target_node_name: &str,
+        levels: Arc<AtomicMeterLevels>,
+    ) -> Result<Self, pipewire::Error> {
+        let stream_name = format!("sootmix.meter.{}", channel_name);
+
+        info!(
+            "Creating meter capture stream for input channel '{}' ({}) targeting source '{}'",
+            channel_name, channel_id, target_node_name
+        );
+
+        // For sources, we don't use stream.monitor - we connect directly to output ports.
+        // Use raw audio capture for true stereo peak detection.
+        let stream = StreamRc::new(
+            core.clone(),
+            &stream_name,
+            properties! {
+                "media.type" => "Audio",
+                "media.class" => "Stream/Input/Audio",
+                "media.name" => "Peak detect",
+                "media.role" => "DSP",
+                "node.name" => stream_name.clone(),
+                "node.description" => format!("SootMix Meter - {}", channel_name),
+                "node.passive" => "true",
+                "target.object" => target_node_name,
+                "audio.channels" => "2",
+                "audio.position" => "FL,FR"
+            },
+        )?;
+
+        let user_data = MeterUserData {
+            levels: Arc::clone(&levels),
+            channel_id,
+        };
+
+        let listener = stream
+            .add_local_listener_with_user_data(user_data)
+            .state_changed(|_stream, user_data, old, new| {
+                debug!(
+                    "Input meter stream state changed: {:?} -> {:?} (channel {})",
                     old, new, user_data.channel_id
                 );
             })
@@ -275,8 +328,8 @@ impl MeterCaptureStream {
 
 /// Process callback for meter capture stream.
 ///
-/// With `resample.peaks = true`, PipeWire outputs peak amplitude values directly
-/// (one per channel per update period).
+/// Receives raw interleaved stereo audio samples and calculates separate L/R peaks
+/// for true stereo metering.
 fn meter_process_callback(stream: &Stream, user_data: &mut MeterUserData) {
     // Dequeue the buffer
     let mut buffer = match stream.dequeue_buffer() {
@@ -303,8 +356,6 @@ fn meter_process_callback(stream: &Stream, user_data: &mut MeterUserData) {
         None => return,
     };
 
-    // With resample.peaks=true, we get peak values as f32 samples
-    // The number of samples depends on node.rate and how many channels
     let n_samples = size / std::mem::size_of::<f32>();
 
     if n_samples == 0 {
@@ -315,28 +366,18 @@ fn meter_process_callback(stream: &Stream, user_data: &mut MeterUserData) {
         std::slice::from_raw_parts(raw_data.as_ptr() as *const f32, n_samples)
     };
 
-    // For stereo, take the peak from available samples
-    // With low rates, we might get 1-2 samples per channel
+    // Calculate stereo peaks from interleaved samples
     let (peak_left, peak_right) = if n_samples >= 2 {
-        // Interleaved stereo: [L, R, ...]
-        let mut left_peak: f32 = 0.0;
-        let mut right_peak: f32 = 0.0;
-        for i in (0..n_samples).step_by(2) {
-            left_peak = left_peak.max(samples[i].abs());
-            if i + 1 < n_samples {
-                right_peak = right_peak.max(samples[i + 1].abs());
-            }
-        }
-        (left_peak, right_peak)
+        calculate_stereo_peaks(samples)
     } else {
-        // Mono or single sample - use for both channels
+        // Single sample fallback - use for both channels
         let peak = samples[0].abs();
         (peak, peak)
     };
 
-    // Clamp to valid range
-    let peak_left = peak_left.clamp(0.0, 1.0);
-    let peak_right = peak_right.clamp(0.0, 1.0);
+    // Clamp to valid range (allow slight overshoot for clip detection)
+    let peak_left = peak_left.clamp(0.0, 2.0);
+    let peak_right = peak_right.clamp(0.0, 2.0);
 
     // Store in atomic levels
     user_data.levels.store(peak_left, peak_right);
@@ -368,7 +409,7 @@ impl MeterStreamManager {
         }
     }
 
-    /// Create a meter stream for a channel.
+    /// Create a meter stream for an output channel (virtual sink).
     pub fn create_stream(
         &mut self,
         core: &pipewire::core::CoreRc,
@@ -381,6 +422,27 @@ impl MeterStreamManager {
         self.destroy_stream(channel_id);
 
         let stream = MeterCaptureStream::new(core, channel_id, channel_name, target_node_name, levels)?;
+        self.streams.insert(channel_id, stream);
+
+        Ok(())
+    }
+
+    /// Create a meter stream for an input channel (virtual source).
+    ///
+    /// This creates a meter stream that captures from the source's output ports
+    /// (what apps receive), not monitor ports.
+    pub fn create_source_stream(
+        &mut self,
+        core: &pipewire::core::CoreRc,
+        channel_id: Uuid,
+        channel_name: &str,
+        target_node_name: &str,
+        levels: Arc<AtomicMeterLevels>,
+    ) -> Result<(), pipewire::Error> {
+        // Remove existing stream if any
+        self.destroy_stream(channel_id);
+
+        let stream = MeterCaptureStream::new_for_source(core, channel_id, channel_name, target_node_name, levels)?;
         self.streams.insert(channel_id, stream);
 
         Ok(())
@@ -452,13 +514,6 @@ mod tests {
         // Reset
         levels.reset();
         assert!(!levels.is_active());
-    }
-
-    #[test]
-    fn test_peak_calculation() {
-        let samples = vec![0.1, -0.5, 0.3, -0.2, 0.8, -0.1];
-        let peak = calculate_peak(&samples);
-        assert!((peak - 0.8).abs() < 0.001);
     }
 
     #[test]

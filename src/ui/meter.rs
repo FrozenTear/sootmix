@@ -60,6 +60,9 @@ const PEAK_INDICATOR_COLOR: Color = Color::from_rgb(1.0, 1.0, 1.0);
 // VU METER STATE
 // ============================================================================
 
+/// Height of the clip indicator at the top of the meter.
+const CLIP_INDICATOR_HEIGHT: f32 = 4.0;
+
 /// VU meter state for canvas rendering.
 #[derive(Debug, Clone)]
 pub struct VuMeter {
@@ -71,6 +74,10 @@ pub struct VuMeter {
     pub peak_left: f32,
     /// Right channel peak hold (0.0 to 1.0+).
     pub peak_right: f32,
+    /// Left channel has clipped.
+    pub clipped_left: bool,
+    /// Right channel has clipped.
+    pub clipped_right: bool,
 }
 
 impl VuMeter {
@@ -81,6 +88,8 @@ impl VuMeter {
             level_right: state.level_right,
             peak_left: state.peak_hold_left,
             peak_right: state.peak_hold_right,
+            clipped_left: state.clipped_left,
+            clipped_right: state.clipped_right,
         }
     }
 
@@ -91,6 +100,8 @@ impl VuMeter {
             level_right: 0.0,
             peak_left: 0.0,
             peak_right: 0.0,
+            clipped_left: false,
+            clipped_right: false,
         }
     }
 }
@@ -123,14 +134,29 @@ impl<Message> canvas::Program<Message> for VuMeter {
         let bg_path = Path::rectangle(Point::ORIGIN, Size::new(METER_WIDTH, height));
         frame.fill(&bg_path, METER_BACKGROUND);
 
-        // Draw left bar
-        self.draw_bar(&mut frame, 0.0, height, self.level_left, self.peak_left);
+        // Reserve space for clip indicator at top
+        let meter_height = height - CLIP_INDICATOR_HEIGHT - 2.0; // 2px gap
+
+        // Draw clip indicators at top
+        self.draw_clip_indicator(&mut frame, 0.0, self.clipped_left);
+        self.draw_clip_indicator(&mut frame, BAR_WIDTH + BAR_GAP, self.clipped_right);
+
+        // Draw left bar (offset by clip indicator height)
+        self.draw_bar(
+            &mut frame,
+            0.0,
+            CLIP_INDICATOR_HEIGHT + 2.0, // Start Y
+            meter_height,
+            self.level_left,
+            self.peak_left,
+        );
 
         // Draw right bar
         self.draw_bar(
             &mut frame,
             BAR_WIDTH + BAR_GAP,
-            height,
+            CLIP_INDICATOR_HEIGHT + 2.0, // Start Y
+            meter_height,
             self.level_right,
             self.peak_right,
         );
@@ -140,8 +166,23 @@ impl<Message> canvas::Program<Message> for VuMeter {
 }
 
 impl VuMeter {
+    /// Draw the clip indicator at the top of the meter.
+    fn draw_clip_indicator(&self, frame: &mut Frame, x: f32, clipped: bool) {
+        let color = if clipped {
+            METER_RED
+        } else {
+            Color::from_rgba(0.2, 0.2, 0.2, 0.5) // Dim when not clipping
+        };
+
+        let path = Path::rectangle(
+            Point::new(x, 0.0),
+            Size::new(BAR_WIDTH, CLIP_INDICATOR_HEIGHT),
+        );
+        frame.fill(&path, color);
+    }
+
     /// Draw a single meter bar with gradient coloring and peak hold.
-    fn draw_bar(&self, frame: &mut Frame, x: f32, height: f32, level: f32, peak: f32) {
+    fn draw_bar(&self, frame: &mut Frame, x: f32, start_y: f32, height: f32, level: f32, peak: f32) {
         // Clamp level to reasonable range
         let level = level.clamp(0.0, 1.5);
         let peak = peak.clamp(0.0, 1.5);
@@ -154,13 +195,13 @@ impl VuMeter {
         if fill_height > 0.0 {
             // Draw the meter bar with gradient sections
             // We draw from bottom up with different colors for each zone
-            self.draw_segmented_bar(frame, x, height, fill_height);
+            self.draw_segmented_bar(frame, x, start_y, height, fill_height);
         }
 
         // Draw peak hold indicator
         if peak > 0.01 {
             let peak_ratio = (peak / 1.2).min(1.0);
-            let peak_y = height * (1.0 - peak_ratio);
+            let peak_y = start_y + height * (1.0 - peak_ratio);
 
             // Choose peak indicator color based on level
             let peak_color = if peak >= RED_THRESHOLD {
@@ -182,8 +223,8 @@ impl VuMeter {
     }
 
     /// Draw the segmented/gradient meter bar.
-    fn draw_segmented_bar(&self, frame: &mut Frame, x: f32, height: f32, fill_height: f32) {
-        let mut current_y = height;
+    fn draw_segmented_bar(&self, frame: &mut Frame, x: f32, start_y: f32, height: f32, fill_height: f32) {
+        let mut current_y = start_y + height; // Bottom of meter
         let mut remaining_fill = fill_height;
 
         // Green zone (0 to -12dB, which is 0.0 to 0.25 linear)

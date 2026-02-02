@@ -460,6 +460,21 @@ impl SootMix {
                 self.cmd_set_channel_vad_threshold(channel_id, threshold);
             }
 
+            Message::ChannelInputGainChanged(channel_id, gain_db) => {
+                // Update local state only (don't send to daemon until released)
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.input_gain_db = gain_db;
+                }
+            }
+
+            Message::ChannelInputGainReleased(channel_id) => {
+                // Get the current gain and send to daemon
+                if let Some(channel) = self.state.channel(channel_id) {
+                    let gain_db = channel.input_gain_db;
+                    self.cmd_set_channel_input_gain(channel_id, gain_db);
+                }
+            }
+
             // ==================== App Drag & Drop ====================
             Message::StartDraggingApp(node_id, app_id) => {
                 info!("Started dragging app: {} (node {})", app_id, node_id);
@@ -2449,6 +2464,9 @@ impl SootMix {
 
             // Handle input channels
             if is_input {
+                // Destroy meter stream first
+                self.send_pw_command(PwCommand::DestroyMeterStream { channel_id });
+
                 let source_id = self.state.channel(channel_id).and_then(|c| c.pw_source_id);
                 info!("Input channel source_id: {:?}", source_id);
                 if let Some(node_id) = source_id {
@@ -2707,6 +2725,29 @@ impl SootMix {
                 }
             ) {
                 error!("Failed to send set VAD threshold command to daemon: {}", e);
+            }
+        }
+        // Note: local state is already updated in the message handler
+        self.save_config();
+    }
+
+    /// Set the hardware microphone gain for an input channel.
+    fn cmd_set_channel_input_gain(&mut self, channel_id: Uuid, gain_db: f32) {
+        // Only input channels support input gain
+        let is_input = self.state.channel(channel_id).map(|c| c.is_input()).unwrap_or(false);
+        if !is_input {
+            warn!("Input gain is only available on input channels");
+            return;
+        }
+
+        if self.daemon_connected {
+            if let Err(e) = daemon_client::send_daemon_command(
+                daemon_client::DaemonCommand::SetChannelInputGain {
+                    channel_id: channel_id.to_string(),
+                    gain_db: gain_db as f64,
+                }
+            ) {
+                error!("Failed to send set input gain command to daemon: {}", e);
             }
         }
         // Note: local state is already updated in the message handler
@@ -3449,6 +3490,11 @@ impl SootMix {
                 info!("PwEvent: VirtualSourceCreated channel={} source={} loopback_capture={:?}",
                     channel_id, source_node_id, loopback_capture_node_id);
 
+                // Get channel info before mutating
+                let (channel_name, meter_levels) = self.state.channel(channel_id)
+                    .map(|c| (c.name.clone(), c.meter_levels.clone()))
+                    .unwrap_or_default();
+
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.pw_source_id = Some(source_node_id);
                     channel.pw_loopback_capture_id = loopback_capture_node_id;
@@ -3461,6 +3507,19 @@ impl SootMix {
                     .and_then(|c| c.input_device_name.clone());
                 if let Some(ref device_name) = input_device_name {
                     self.route_input_device_to_channel(channel_id, device_name);
+                }
+
+                // Create meter stream for input channel to show real audio levels
+                if let Some(meter_levels) = meter_levels {
+                    if let Some(ref pw) = self.pw_thread {
+                        info!("Creating input meter stream for channel '{}' (source={})", channel_name, source_node_id);
+                        let _ = pw.send(PwCommand::CreateInputMeterStream {
+                            channel_id,
+                            channel_name,
+                            source_node_id,
+                            meter_levels,
+                        });
+                    }
                 }
             }
             PwEvent::Error(err) => {
@@ -4032,6 +4091,7 @@ impl SootMix {
                             sidetone_volume_db: -20.0,
                             noise_suppression_enabled: false,
                             vad_threshold: 95.0,
+                            input_gain_db: ch_info.input_gain_db as f32,
                         };
                         self.state.channels.push(channel);
                     }
@@ -4123,6 +4183,7 @@ impl SootMix {
                             sidetone_volume_db: -20.0,
                             noise_suppression_enabled: false,
                             vad_threshold: 95.0,
+                            input_gain_db: ch_info.input_gain_db as f32,
                         };
                         self.state.channels.push(channel);
                     }
@@ -4207,11 +4268,24 @@ impl SootMix {
                 // Update channel meter levels from daemon
                 for meter in data {
                     let id = meter.channel_id();
-                    if let Some(channel) = self.state.channel(id) {
-                        // Meter data is already in dB from daemon
-                        if let Some(ref meter_levels) = channel.meter_levels {
-                            meter_levels.store(meter.level_left_db as f32, meter.level_right_db as f32);
+                    let left_db = meter.level_left_db;
+                    let right_db = meter.level_right_db;
+                    if let Some(channel) = self.state.channel_mut(id) {
+                        // Meter data comes in dB from daemon, convert to linear for AtomicMeterLevels
+                        // AtomicMeterLevels expects linear values (0.0 to 1.0+)
+                        let left_linear = crate::state::db_to_linear(left_db as f32);
+                        let right_linear = crate::state::db_to_linear(right_db as f32);
+                        if left_linear > 0.01 || right_linear > 0.01 {
+                            debug!(
+                                "MeterUpdate: ch={} dB=({:.1},{:.1}) linear=({:.4},{:.4})",
+                                channel.name, left_db, right_db, left_linear, right_linear
+                            );
                         }
+                        if let Some(ref meter_levels) = channel.meter_levels {
+                            meter_levels.store(left_linear, right_linear);
+                        }
+                    } else {
+                        debug!("MeterUpdate: channel {} not found in GUI state", id);
                     }
                 }
             }

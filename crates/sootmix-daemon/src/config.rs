@@ -69,6 +69,9 @@ pub struct SavedChannel {
     /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
+    /// Hardware microphone gain in dB (-12.0 to +12.0). Controls the physical input device level.
+    #[serde(default)]
+    pub input_gain_db: f32,
 }
 
 fn default_vad_threshold() -> f32 {

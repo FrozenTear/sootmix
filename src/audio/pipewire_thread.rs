@@ -83,6 +83,8 @@ pub enum PwCommand {
         plugin_chain: Vec<Uuid>,
         /// Atomic meter levels for real-time metering.
         meter_levels: Option<std::sync::Arc<crate::audio::meter_stream::AtomicMeterLevels>>,
+        /// Optional loopback output node ID for direct routing (bypasses name search).
+        loopback_output_node_id: Option<u32>,
     },
     /// Destroy a plugin filter stream.
     DestroyPluginFilter { channel_id: Uuid },
@@ -127,7 +129,7 @@ pub enum PwCommand {
         /// Node ID of the Audio/Source to destroy.
         node_id: u32,
     },
-    /// Create a meter capture stream for a channel's virtual sink.
+    /// Create a meter capture stream for a channel's virtual sink (output channel).
     ///
     /// This creates a lightweight PipeWire stream that connects to the
     /// virtual sink's monitor ports to capture audio levels in real-time.
@@ -136,6 +138,18 @@ pub enum PwCommand {
         channel_name: String,
         /// The virtual sink node ID to meter.
         sink_node_id: u32,
+        /// Atomic levels to store peaks (shared with UI).
+        meter_levels: Arc<AtomicMeterLevels>,
+    },
+    /// Create a meter capture stream for a channel's virtual source (input channel).
+    ///
+    /// This creates a lightweight PipeWire stream that connects to the
+    /// virtual source's output ports to capture audio levels in real-time.
+    CreateInputMeterStream {
+        channel_id: Uuid,
+        channel_name: String,
+        /// The virtual source node ID to meter.
+        source_node_id: u32,
         /// Atomic levels to store peaks (shared with UI).
         meter_levels: Arc<AtomicMeterLevels>,
     },
@@ -942,6 +956,7 @@ fn handle_command(
             channel_name,
             plugin_chain,
             meter_levels,
+            loopback_output_node_id,
         } => {
             info!(
                 "Creating plugin filter for channel '{}' with {} plugins",
@@ -984,22 +999,25 @@ fn handle_command(
                     let capture_node_id = streams.capture_node_id();
                     let playback_node_id = streams.playback_node_id();
 
-                    // Sanitize channel name to match virtual sink naming
-                    let safe_name: String = channel_name
-                        .chars()
-                        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                        .collect();
+                    // Use provided loopback output node ID if available, otherwise search by name
+                    let loopback_output_id = loopback_output_node_id.or_else(|| {
+                        // Sanitize channel name to match virtual sink naming
+                        let safe_name: String = channel_name
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                            .collect();
 
-                    // Find the loopback output node to capture from
-                    // The virtual sink creates: sootmix.{name} (sink) + sootmix.{name}.output (output)
-                    let loopback_output_id = state.borrow().get_loopback_output_node(&safe_name);
-
-                    if loopback_output_id.is_none() {
-                        debug!(
-                            "Loopback output node 'output.sootmix.{}.output' not found yet, will auto-connect",
-                            safe_name
-                        );
-                    }
+                        // Find the loopback output node to capture from
+                        // The virtual sink creates: sootmix.{name} (sink) + sootmix.{name}.output (output)
+                        let output_id = state.borrow().get_loopback_output_node(&safe_name);
+                        if output_id.is_none() {
+                            debug!(
+                                "Loopback output node 'output.sootmix.{}.output' not found yet, will auto-connect",
+                                safe_name
+                            );
+                        }
+                        output_id
+                    });
 
                     // Connect the streams
                     // - Capture from loopback output (or auto-connect if not found)
@@ -1295,6 +1313,53 @@ fn handle_command(
                 }
                 Err(e) => {
                     warn!("Failed to create meter stream for channel '{}': {:?}", channel_name, e);
+                }
+            }
+        }
+
+        PwCommand::CreateInputMeterStream {
+            channel_id,
+            channel_name,
+            source_node_id,
+            meter_levels,
+        } => {
+            // Skip if meter stream already exists for this channel
+            if state.borrow().meter_streams.has_stream(channel_id) {
+                debug!("Meter stream already exists for input channel '{}', skipping", channel_name);
+                return;
+            }
+
+            // Get the target node name from state
+            let target_node_name = state.borrow().nodes.get(&source_node_id)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| format!("node_{}", source_node_id));
+
+            info!(
+                "Creating input meter stream for channel '{}' (target source {} = '{}')",
+                channel_name, source_node_id, target_node_name
+            );
+
+            // Create the meter stream for source (without stream.monitor)
+            let result = state.borrow_mut().meter_streams.create_source_stream(
+                core,
+                channel_id,
+                &channel_name,
+                &target_node_name,
+                meter_levels,
+            );
+
+            match result {
+                Ok(()) => {
+                    // Connect the meter stream to the source
+                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id, source_node_id);
+                    if let Err(e) = connect_result {
+                        warn!("Failed to connect input meter stream for channel '{}': {:?}", channel_name, e);
+                    } else {
+                        info!("Input meter stream created and connected for channel '{}'", channel_name);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create input meter stream for channel '{}': {:?}", channel_name, e);
                 }
             }
         }

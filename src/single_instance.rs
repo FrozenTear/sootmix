@@ -22,6 +22,9 @@ const UI_DBUS_PATH: &str = "/com/sootmix/UI";
 /// Returns `true` if an existing instance was found and activated
 /// (the caller should exit). Returns `false` if no existing instance
 /// was found (the caller should proceed with startup).
+///
+/// This uses D-Bus name ownership as a lock - we try to acquire the name
+/// with DO_NOT_QUEUE, and if it fails, another instance has it.
 pub fn try_activate_existing() -> bool {
     let conn = match blocking::Connection::session() {
         Ok(c) => c,
@@ -31,21 +34,65 @@ pub fn try_activate_existing() -> bool {
         }
     };
 
-    // Try to call Activate on an existing instance
-    match conn.call_method(
-        Some(UI_DBUS_NAME),
-        UI_DBUS_PATH,
-        Some("com.sootmix.UI"),
-        "Activate",
-        &(),
-    ) {
-        Ok(_) => {
-            info!("Activated existing SootMix instance");
-            true
+    // Try to request the D-Bus name with DO_NOT_QUEUE flag.
+    // If another instance has it, this will fail immediately.
+    // We use the blocking API to check ownership.
+    let reply = conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "RequestName",
+        &(UI_DBUS_NAME, 4u32), // 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE
+    );
+
+    match reply {
+        Ok(msg) => {
+            // RequestName returns: 1=PRIMARY_OWNER, 2=IN_QUEUE, 3=EXISTS, 4=ALREADY_OWNER
+            let result: u32 = msg.body().deserialize().unwrap_or(0);
+            if result == 1 || result == 4 {
+                // We got the name - no other instance running
+                // Release it so start_activation_listener can properly acquire it
+                let _ = conn.call_method(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    Some("org.freedesktop.DBus"),
+                    "ReleaseName",
+                    &(UI_DBUS_NAME,),
+                );
+                debug!("No existing instance found, proceeding with startup");
+                false
+            } else {
+                // Another instance owns the name - try to activate it
+                info!("Another instance owns D-Bus name, attempting activation");
+                let _ = conn.call_method(
+                    Some(UI_DBUS_NAME),
+                    UI_DBUS_PATH,
+                    Some("com.sootmix.UI"),
+                    "Activate",
+                    &(),
+                );
+                true
+            }
         }
         Err(e) => {
-            debug!("No existing instance found ({}), proceeding with startup", e);
-            false
+            // D-Bus error - try the old method as fallback
+            debug!("RequestName failed ({}), trying direct activation", e);
+            match conn.call_method(
+                Some(UI_DBUS_NAME),
+                UI_DBUS_PATH,
+                Some("com.sootmix.UI"),
+                "Activate",
+                &(),
+            ) {
+                Ok(_) => {
+                    info!("Activated existing SootMix instance");
+                    true
+                }
+                Err(_) => {
+                    debug!("No existing instance found, proceeding with startup");
+                    false
+                }
+            }
         }
     }
 }

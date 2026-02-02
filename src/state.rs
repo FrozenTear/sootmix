@@ -60,15 +60,44 @@ pub struct MeterDisplayState {
     pub peak_hold_time_left: f32,
     /// Time since peak hold was set for right channel (seconds).
     pub peak_hold_time_right: f32,
+    /// Left channel has clipped (reached 0dBFS).
+    pub clipped_left: bool,
+    /// Right channel has clipped (reached 0dBFS).
+    pub clipped_right: bool,
+    /// Time since left channel last clipped (seconds). Used for auto-reset.
+    pub clip_time_left: f32,
+    /// Time since right channel last clipped (seconds). Used for auto-reset.
+    pub clip_time_right: f32,
 }
 
 impl MeterDisplayState {
+    /// Clip threshold (0dBFS in linear scale).
+    const CLIP_THRESHOLD: f32 = 1.0;
+    /// Peak hold time in seconds (industry standard: 2-3 seconds).
+    const PEAK_HOLD_TIME: f32 = 2.5;
+    /// Peak decay rate in linear units per second (IEC 60268-18 standard: ~20dB/s).
+    const PEAK_DECAY_RATE: f32 = 0.8;
+    /// Clip indicator auto-reset time in seconds.
+    const CLIP_RESET_TIME: f32 = 3.0;
+
+    /// Attack time constant in seconds (fast attack to catch transients).
+    const ATTACK_TIME: f32 = 0.015;
+    /// Decay time constant in seconds (slower decay for smooth falloff).
+    const DECAY_TIME: f32 = 0.25;
+
+    /// Calculate time-based exponential smoothing coefficient.
+    /// Returns alpha for: new_value = old_value + alpha * (target - old_value)
+    #[inline]
+    fn smooth_coeff(dt: f32, time_constant: f32) -> f32 {
+        1.0 - (-dt / time_constant).exp()
+    }
+
     /// Update meter with new levels. Applies smoothing and peak hold logic.
     /// `dt` is the delta time since last update in seconds.
     pub fn update(&mut self, new_left: f32, new_right: f32, dt: f32) {
-        // Smoothing factor for attack/decay
-        let attack_coeff = 0.3; // Fast attack
-        let decay_coeff = 0.15; // Slower decay
+        // Time-based exponential smoothing for frame-rate independent behavior
+        let attack_coeff = Self::smooth_coeff(dt, Self::ATTACK_TIME);
+        let decay_coeff = Self::smooth_coeff(dt, Self::DECAY_TIME);
 
         // Apply attack/decay smoothing to levels
         if new_left > self.level_left {
@@ -83,32 +112,48 @@ impl MeterDisplayState {
             self.level_right += decay_coeff * (new_right - self.level_right);
         }
 
-        // Peak hold logic - hold for 1 second, then decay
-        const PEAK_HOLD_TIME: f32 = 1.0;
-        const PEAK_DECAY_RATE: f32 = 0.5; // Decay rate per second after hold
+        // Clip detection with auto-reset after CLIP_RESET_TIME seconds
+        if new_left >= Self::CLIP_THRESHOLD {
+            self.clipped_left = true;
+            self.clip_time_left = 0.0;
+        } else if self.clipped_left {
+            self.clip_time_left += dt;
+            if self.clip_time_left >= Self::CLIP_RESET_TIME {
+                self.clipped_left = false;
+            }
+        }
+        if new_right >= Self::CLIP_THRESHOLD {
+            self.clipped_right = true;
+            self.clip_time_right = 0.0;
+        } else if self.clipped_right {
+            self.clip_time_right += dt;
+            if self.clip_time_right >= Self::CLIP_RESET_TIME {
+                self.clipped_right = false;
+            }
+        }
 
-        // Left channel peak
+        // Left channel peak hold
         if new_left >= self.peak_hold_left {
             self.peak_hold_left = new_left;
             self.peak_hold_time_left = 0.0;
         } else {
             self.peak_hold_time_left += dt;
-            if self.peak_hold_time_left > PEAK_HOLD_TIME {
-                self.peak_hold_left -= PEAK_DECAY_RATE * dt;
+            if self.peak_hold_time_left > Self::PEAK_HOLD_TIME {
+                self.peak_hold_left -= Self::PEAK_DECAY_RATE * dt;
                 if self.peak_hold_left < self.level_left {
                     self.peak_hold_left = self.level_left;
                 }
             }
         }
 
-        // Right channel peak
+        // Right channel peak hold
         if new_right >= self.peak_hold_right {
             self.peak_hold_right = new_right;
             self.peak_hold_time_right = 0.0;
         } else {
             self.peak_hold_time_right += dt;
-            if self.peak_hold_time_right > PEAK_HOLD_TIME {
-                self.peak_hold_right -= PEAK_DECAY_RATE * dt;
+            if self.peak_hold_time_right > Self::PEAK_HOLD_TIME {
+                self.peak_hold_right -= Self::PEAK_DECAY_RATE * dt;
                 if self.peak_hold_right < self.level_right {
                     self.peak_hold_right = self.level_right;
                 }
@@ -119,6 +164,17 @@ impl MeterDisplayState {
     /// Reset meter to zero.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Reset clip indicators only (called when user clicks on clip indicator).
+    pub fn reset_clip(&mut self) {
+        self.clipped_left = false;
+        self.clipped_right = false;
+    }
+
+    /// Check if either channel has clipped.
+    pub fn has_clipped(&self) -> bool {
+        self.clipped_left || self.clipped_right
     }
 }
 
@@ -216,6 +272,9 @@ pub struct MixerChannel {
     /// VAD threshold for noise suppression (0-100%). Higher = more aggressive noise gating.
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f32,
+    /// Hardware microphone gain in dB (-12.0 to +12.0). Controls the physical input device level.
+    #[serde(default)]
+    pub input_gain_db: f32,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -265,6 +324,7 @@ impl MixerChannel {
             sidetone_volume_db: -20.0,
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
+            input_gain_db: 0.0,
         }
     }
 
@@ -302,6 +362,7 @@ impl MixerChannel {
             sidetone_volume_db: -20.0,
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
+            input_gain_db: 0.0,
         }
     }
 

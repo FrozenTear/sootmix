@@ -8,7 +8,8 @@
 //! while still being accessible for quick actions.
 
 use ksni::{menu::StandardItem, Handle, MenuItem, Tray, TrayMethods};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use tracing::{debug, error, info};
 
 /// Messages sent from the tray to the main application.
@@ -99,6 +100,8 @@ impl Tray for SootMixTray {
 pub struct TrayHandle {
     /// Handle to update the tray state.
     handle: Handle<SootMixTray>,
+    /// Shutdown signal to stop the background thread.
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl TrayHandle {
@@ -115,6 +118,7 @@ impl TrayHandle {
     /// Shut down the tray icon, removing it from the system tray.
     pub fn shutdown(&self) {
         info!("Shutting down system tray");
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         self.handle.shutdown();
     }
 }
@@ -122,6 +126,7 @@ impl TrayHandle {
 impl Drop for TrayHandle {
     fn drop(&mut self) {
         info!("TrayHandle dropped — shutting down tray icon");
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         self.handle.shutdown();
     }
 }
@@ -134,6 +139,10 @@ pub fn start_tray() -> Option<(mpsc::Receiver<TrayMessage>, TrayHandle)> {
     let (tx, rx) = mpsc::channel();
 
     let tray = SootMixTray { tx, muted: false };
+
+    // Shutdown flag shared between the handle and the background thread
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_thread = Arc::clone(&shutdown_flag);
 
     // Spawn the tray in a background task
     // We use a oneshot channel to get the handle back
@@ -150,8 +159,11 @@ pub fn start_tray() -> Option<(mpsc::Receiver<TrayMessage>, TrayHandle)> {
                 Ok(handle) => {
                     info!("System tray started");
                     let _ = handle_tx.send(Some(handle));
-                    // Keep the runtime alive
-                    std::future::pending::<()>().await;
+                    // Poll shutdown flag instead of pending forever
+                    while !shutdown_flag_thread.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    info!("Tray thread received shutdown signal, exiting");
                 }
                 Err(e) => {
                     error!("Failed to start system tray: {}", e);
@@ -163,7 +175,7 @@ pub fn start_tray() -> Option<(mpsc::Receiver<TrayMessage>, TrayHandle)> {
 
     // Wait for the handle (with timeout)
     match handle_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Some(handle)) => Some((rx, TrayHandle { handle })),
+        Ok(Some(handle)) => Some((rx, TrayHandle { handle, shutdown_flag })),
         Ok(None) => None,
         Err(_) => {
             error!("Timeout waiting for tray to start");

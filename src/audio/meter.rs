@@ -105,15 +105,33 @@ impl MeterManager {
                 if real_levels.is_active() {
                     // Use real audio levels from the plugin processing chain
                     let (raw_left, raw_right) = real_levels.load();
+                    if raw_left > 0.01 || raw_right > 0.01 {
+                        tracing::trace!(
+                            "Meter read: ch={} raw=({:.4},{:.4}) is_input={}",
+                            channel.name, raw_left, raw_right, channel.is_input()
+                        );
+                    }
 
-                    // Apply channel volume scaling for display
-                    let volume_scale = if channel.muted {
-                        0.0
+                    // For INPUT channels: show PRE-FADER levels (raw input, not affected by volume)
+                    // This is industry standard - input meters show what's coming in, not what's going out.
+                    // For OUTPUT channels: show POST-FADER levels (affected by volume/mute)
+                    if channel.is_input() {
+                        // Pre-fader metering for inputs - show raw input level
+                        // Only apply mute (user still wants to see "muted" state visually)
+                        if channel.muted {
+                            (0.0, 0.0)
+                        } else {
+                            (raw_left, raw_right)
+                        }
                     } else {
-                        db_to_linear(channel.volume_db)
-                    };
-
-                    (raw_left * volume_scale, raw_right * volume_scale)
+                        // Post-fader metering for outputs - apply channel volume
+                        let volume_scale = if channel.muted {
+                            0.0
+                        } else {
+                            db_to_linear(channel.volume_db)
+                        };
+                        (raw_left * volume_scale, raw_right * volume_scale)
+                    }
                 } else {
                     // Real metering available but no audio data yet - use simulated
                     calculate_simulated_level(phase, channel, state)
@@ -126,8 +144,9 @@ impl MeterManager {
             // Update channel meter display
             channel.meter_display.update(level_left, level_right, dt);
 
-            // Accumulate for master meter (use pre-volume levels for accurate summing)
-            if level_left > 0.0 || level_right > 0.0 {
+            // Accumulate for master meter (only output channels contribute)
+            // Input channels don't route to master output directly
+            if !channel.is_input() && (level_left > 0.0 || level_right > 0.0) {
                 total_left = total_left.max(level_left);
                 total_right = total_right.max(level_right);
             }
@@ -159,20 +178,36 @@ fn calculate_simulated_level(
     channel: &MixerChannel,
     state: &mut ChannelMeterState,
 ) -> (f32, f32) {
-    let has_activity = !channel.assigned_apps.is_empty() && !channel.muted;
+    // For input channels, activity is based on having an input device selected
+    // For output channels, activity is based on having apps assigned
+    let has_activity = if channel.is_input() {
+        channel.input_device_name.is_some() && !channel.muted
+    } else {
+        !channel.assigned_apps.is_empty() && !channel.muted
+    };
     let target_activity = if has_activity { 0.7 } else { 0.0 };
     state.simulated_activity += 0.1 * (target_activity - state.simulated_activity);
 
     if state.simulated_activity > 0.01 {
         let base_level = state.simulated_activity;
-        let volume_scale = db_to_linear(channel.volume_db);
         let phase_offset = state.variation_phase;
         let variation_l = 0.15 * (phase + phase_offset).sin();
         let variation_r = 0.15 * (phase * 1.1 + phase_offset + 0.5).sin();
 
-        let left = (base_level + variation_l).clamp(0.0, 1.0) * volume_scale;
-        let right = (base_level + variation_r).clamp(0.0, 1.0) * volume_scale;
-        (left, right)
+        // For INPUT channels: show PRE-FADER levels (not affected by channel volume)
+        // For OUTPUT channels: show POST-FADER levels (affected by volume)
+        if channel.is_input() {
+            // Pre-fader simulated metering for inputs
+            let left = (base_level + variation_l).clamp(0.0, 1.0);
+            let right = (base_level + variation_r).clamp(0.0, 1.0);
+            (left, right)
+        } else {
+            // Post-fader simulated metering for outputs
+            let volume_scale = db_to_linear(channel.volume_db);
+            let left = (base_level + variation_l).clamp(0.0, 1.0) * volume_scale;
+            let right = (base_level + variation_r).clamp(0.0, 1.0) * volume_scale;
+            (left, right)
+        }
     } else {
         (0.0, 0.0)
     }

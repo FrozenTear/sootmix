@@ -319,6 +319,7 @@ pub fn channel_strip<'a>(
         let sidetone_enabled = channel.sidetone_enabled;
         let sidetone_vol = channel.sidetone_volume_db;
         let noise_suppression_enabled = channel.noise_suppression_enabled;
+        let input_gain = channel.input_gain_db;
 
         let input_picker = column![
             text("Input").size(TEXT_SMALL).color(TEXT_DIM),
@@ -350,6 +351,43 @@ pub fn channel_strip<'a>(
                             .width(1.0),
                     }
                 }),
+        ]
+        .spacing(SPACING_XS);
+
+        // Mic Gain slider (hardware input level)
+        let gain_label = format!("{:+.1}dB", input_gain);
+        let mic_gain_section = column![
+            text("Mic Gain").size(TEXT_SMALL).color(TEXT_DIM),
+            row![
+                slider(-12.0..=12.0, input_gain, move |v| {
+                    Message::ChannelInputGainChanged(id, v)
+                })
+                .step(0.5)
+                .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0 - 50.0))
+                .on_release(Message::ChannelInputGainReleased(id))
+                .style(|_theme: &Theme, _status| slider::Style {
+                    rail: slider::Rail {
+                        backgrounds: (
+                            Background::Color(SOOTMIX_DARK.accent_primary),
+                            Background::Color(SLIDER_TRACK),
+                        ),
+                        width: 4.0,
+                        border: Border::default().rounded(2.0),
+                    },
+                    handle: slider::Handle {
+                        shape: slider::HandleShape::Rectangle {
+                            width: 12,
+                            border_radius: RADIUS_SM.into(),
+                        },
+                        background: Background::Color(TEXT),
+                        border_width: 0.0,
+                        border_color: Color::TRANSPARENT,
+                    },
+                }),
+                Space::new().width(SPACING_XS),
+                text(gain_label).size(TEXT_CAPTION).color(TEXT_DIM),
+            ]
+            .align_y(Alignment::Center),
         ]
         .spacing(SPACING_XS);
 
@@ -435,7 +473,13 @@ pub fn channel_strip<'a>(
                 .into()
         };
 
-        column![input_picker, Space::new().height(SPACING_XS), sidetone_row]
+        column![
+            input_picker,
+            Space::new().height(SPACING_XS),
+            mic_gain_section,
+            Space::new().height(SPACING_XS),
+            sidetone_row
+        ]
             .into()
     } else {
         // Output channel: show output device picker

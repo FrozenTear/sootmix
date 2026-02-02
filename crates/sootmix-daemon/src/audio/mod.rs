@@ -7,9 +7,10 @@
 pub mod native_loopback;
 pub mod noise_filter;
 pub mod pipewire_thread;
+pub mod pulse_meter;
 pub mod routing;
 pub mod types;
 pub mod virtual_sink;
 pub mod volume;
 
-pub use pipewire_thread::{PwCommand, PwEvent, PwThread};
+pub use native_loopback::AtomicMeterLevels;

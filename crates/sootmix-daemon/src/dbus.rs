@@ -296,6 +296,36 @@ impl DaemonDbusService {
         Ok(())
     }
 
+    /// Set the hardware microphone gain for an input channel.
+    /// This controls the physical input device level, separate from the channel volume.
+    async fn set_channel_input_gain(
+        &self,
+        channel_id: &str,
+        gain_db: f64,
+    ) -> zbus::fdo::Result<()> {
+        // Validate gain is within reasonable bounds (-12dB to +12dB)
+        if gain_db.is_nan() || gain_db.is_infinite() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Gain must be a finite number".into(),
+            ));
+        }
+        let gain_db = gain_db.clamp(-12.0, 12.0);
+
+        debug!(
+            "D-Bus: set_channel_input_gain({}, {})",
+            channel_id, gain_db
+        );
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        service.process_pw_events();
+        service
+            .set_channel_input_gain(channel_id, gain_db)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Set master volume in dB.
     async fn set_master_volume(
         &self,
@@ -785,6 +815,22 @@ pub async fn emit_inputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<
             INTERFACE_NAME,
             "InputsChanged",
             &(),
+        )
+        .await
+}
+
+/// Emit MeterUpdate signal with meter data for all channels.
+pub async fn emit_meter_update(
+    ctx: &zbus::SignalContext<'_>,
+    data: Vec<MeterData>,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "MeterUpdate",
+            &(data,),
         )
         .await
 }
