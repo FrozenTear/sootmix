@@ -480,11 +480,11 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
     // linking the capture stream to all available sources. We'll manage links ourselves.
     let capture_props = if let Some(device) = target_device {
         format!(
-            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[FL FR] target.object=\"{}\"",
+            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[MONO] target.object=\"{}\"",
             device
         )
     } else {
-        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[FL FR]".to_string()
+        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[MONO]".to_string()
     };
 
     // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
@@ -493,7 +493,7 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
     let playback_props = format!(
         "media.class=Audio/Source node.name={} node.description=\"{}\" \
          node.virtual=false device.class=audio-input \
-         audio.position=[FL FR] priority.session=2000",
+         audio.position=[MONO] priority.session=2000",
         source_name, name
     );
 

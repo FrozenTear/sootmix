@@ -192,7 +192,7 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
     let playback_props = format!(
         "media.class=Audio/Source node.name={} node.description=\"{}\" \
          node.virtual=false device.class=audio-input \
-         audio.position=[FL FR] priority.session=2000",
+         audio.position=[MONO] priority.session=2000",
         source_node_name, description
     );
 
@@ -201,7 +201,7 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
     // IMPORTANT: We use node.autoconnect=false so we can explicitly link to
     // the user's selected input device rather than the system default.
     let capture_props = format!(
-        "media.class=Stream/Input/Audio node.autoconnect=false audio.position=[FL FR] \
+        "media.class=Stream/Input/Audio node.autoconnect=false audio.position=[MONO] \
          object.linger=true session.suspend-timeout-enabled=false"
     );
 
