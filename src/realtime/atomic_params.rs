@@ -473,8 +473,8 @@ mod tests {
         let mut param = SmoothedParam::new(0.0, 10.0, 48000.0);
         param.set_target(1.0);
 
-        // Process some samples
-        for _ in 0..1000 {
+        // Process enough samples to converge (10ms smoothing @ 48kHz = 480 sample time constant)
+        for _ in 0..2000 {
             param.process();
         }
 

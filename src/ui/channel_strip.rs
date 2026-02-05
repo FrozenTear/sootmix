@@ -50,7 +50,6 @@ pub fn channel_strip<'a>(
     let id = channel.id;
     let volume_db = channel.volume_db;
     let muted = channel.muted;
-    let eq_enabled = channel.eq_enabled;
     let name = channel.name.clone();
     let is_drop_target = dragging.is_some();
     let output_device_name = channel.output_device_name.clone();
@@ -121,38 +120,6 @@ pub fn channel_strip<'a>(
     } else {
         Space::new().width(0).height(0).into()
     };
-
-    // === EQ BUTTON ===
-    let eq_button = button(text("EQ").size(TEXT_SMALL))
-        .padding([SPACING_XS, SPACING_SM])
-        .style(move |_theme: &Theme, status| {
-            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            let bg_color = if eq_enabled {
-                if is_hovered {
-                    lighten(PRIMARY, 0.15)
-                } else {
-                    PRIMARY
-                }
-            } else if is_hovered {
-                SURFACE_LIGHT
-            } else {
-                SURFACE
-            };
-            button::Style {
-                background: Some(Background::Color(bg_color)),
-                text_color: if eq_enabled {
-                    SOOTMIX_DARK.canvas
-                } else {
-                    TEXT
-                },
-                border: Border::default()
-                    .rounded(RADIUS_SM)
-                    .color(if eq_enabled { PRIMARY } else { SURFACE_LIGHT })
-                    .width(1.0),
-                ..button::Style::default()
-            }
-        })
-        .on_press(Message::ChannelEqToggled(id));
 
     // === VOLUME SLIDER ===
     let volume_slider = vertical_slider(-60.0..=12.0, volume_db, move |v| {
@@ -559,7 +526,7 @@ pub fn channel_strip<'a>(
         row![type_badge, name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
         Space::new().height(SPACING_SM),
         // Controls: EQ + FX
-        row![eq_button, Space::new().width(SPACING_SM), fx_btn,].align_y(Alignment::Center),
+        fx_btn,
         Space::new().height(SPACING),
         // Fader section
         container(slider_meter_row).center_x(Fill),

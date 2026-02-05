@@ -46,9 +46,6 @@ pub fn focus_panel<'a>(
     // === INPUT SOURCES ===
     let inputs = input_sources_section(channel);
 
-    // === EQ SECTION ===
-    let eq_section = eq_section(channel);
-
     // === NOISE SUPPRESSION SECTION (input channels only) ===
     let noise_section: Element<Message> = if channel.kind == ChannelKind::Input {
         noise_suppression_section(channel)
@@ -82,8 +79,6 @@ pub fn focus_panel<'a>(
         signal_flow,
         Space::new().height(SPACING),
         inputs,
-        Space::new().height(SPACING),
-        eq_section,
         Space::new().height(SPACING),
         noise_section,
         Space::new().height(SPACING),

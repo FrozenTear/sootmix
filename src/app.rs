@@ -2060,19 +2060,6 @@ impl SootMix {
         let snapshot_b_button = self.snapshot_button(SnapshotSlot::B);
         let snapshot_save_button = self.snapshot_save_button();
 
-        let rules_count = self.state.routing_rules.rules.len();
-        let rules_button = button(
-            text(format!("Rules ({})", rules_count)).size(12)
-        )
-            .padding([6, 12])
-            .style(|_theme: &Theme, _status| button::Style {
-                background: Some(Background::Color(SURFACE_LIGHT)),
-                text_color: TEXT,
-                border: standard_border(),
-                ..button::Style::default()
-            })
-            .on_press(Message::OpenRoutingRulesPanel);
-
         let settings_button = button(text("Settings").size(12))
             .padding([6, 12])
             .style(|_theme: &Theme, _status| button::Style {
@@ -2096,8 +2083,6 @@ impl SootMix {
             Space::new().width(SPACING_SMALL),
             snapshot_save_button,
             Space::new().width(SPACING),
-            rules_button,
-            Space::new().width(SPACING_SMALL),
             settings_button,
         ]
         .align_y(Alignment::Center)
