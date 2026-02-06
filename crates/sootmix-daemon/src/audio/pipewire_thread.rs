@@ -1209,15 +1209,17 @@ fn handle_command(
                     (mic_ports, capture_ports)
                 };
 
-                // Create links between matching channels (FL->FL, FR->FR, or MONO->FL/FR)
+                // Create links between matching channels (FL->FL, FR->FR, MONO->FL, FL->MONO)
+                // Uses AudioChannel::is_compatible() which handles stereo↔mono mapping
+                // (e.g. stereo mic FL/FR → mono capture gets FL→MONO link)
+                let mut linked_capture_ports: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
                 for mic_port in &mic_output_ports {
                     for capture_port in &capture_input_ports {
-                        // Match by channel name suffix (FL, FR, MONO)
-                        let mic_ch = mic_port.name.rsplit('_').next().unwrap_or("");
-                        let cap_ch = capture_port.name.rsplit('_').next().unwrap_or("");
-
-                        // Link if channels match, or if mic is mono (link to both)
-                        if mic_ch == cap_ch || mic_ch == "MONO" {
+                        if linked_capture_ports.contains(&capture_port.id) {
+                            continue;
+                        }
+                        if mic_port.channel.is_compatible(&capture_port.channel) {
                             debug!(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
@@ -1227,6 +1229,7 @@ fn handle_command(
                             {
                                 warn!("Failed to link mic to capture stream: {}", e);
                             }
+                            linked_capture_ports.insert(capture_port.id);
                         }
                     }
                 }
@@ -1290,12 +1293,15 @@ fn handle_command(
                 };
 
                 // Create links between matching channels
+                // Uses AudioChannel::is_compatible() for proper stereo↔mono handling
+                let mut linked_capture_ports: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
                 for mic_port in &mic_output_ports {
                     for capture_port in &capture_input_ports {
-                        let mic_ch = mic_port.name.rsplit('_').next().unwrap_or("");
-                        let cap_ch = capture_port.name.rsplit('_').next().unwrap_or("");
-
-                        if mic_ch == cap_ch || mic_ch == "MONO" {
+                        if linked_capture_ports.contains(&capture_port.id) {
+                            continue;
+                        }
+                        if mic_port.channel.is_compatible(&capture_port.channel) {
                             debug!(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
@@ -1305,6 +1311,7 @@ fn handle_command(
                             {
                                 warn!("Failed to link default mic to capture stream: {}", e);
                             }
+                            linked_capture_ports.insert(capture_port.id);
                         }
                     }
                 }
