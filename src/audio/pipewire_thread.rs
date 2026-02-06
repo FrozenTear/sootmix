@@ -247,14 +247,17 @@ struct PluginFilterInfo {
 /// Stored when a meter stream is created, and links are created when ports are discovered.
 #[derive(Clone)]
 struct PendingMeterLink {
-    /// The sink node ID to capture from (for monitor ports).
+    /// The target node ID to capture from (sink for output channels, source for input channels).
     sink_node_id: u32,
-    /// The sink node name.
+    /// The target node name.
     sink_name: String,
     /// The meter stream node ID.
     meter_node_id: u32,
     /// The meter stream node name.
     meter_name: String,
+    /// Whether this is a source meter (input channel).
+    /// Source meters connect to regular output ports instead of monitor ports.
+    is_source: bool,
 }
 
 /// Default sample rate when PipeWire settings unavailable.
@@ -1307,6 +1310,7 @@ fn handle_command(
                             sink_name: target_node_name.clone(),
                             meter_node_id: 0, // Will be filled when node is discovered
                             meter_name,
+                            is_source: false,
                         });
                         debug!("Queued pending meter link for discovery: sink {} -> meter 'sootmix.meter.{}'", sink_node_id, channel_name);
                     }
@@ -1350,12 +1354,24 @@ fn handle_command(
 
             match result {
                 Ok(()) => {
-                    // Connect the meter stream to the source
+                    // Connect the meter stream (without AUTOCONNECT - links created manually)
                     let connect_result = state.borrow().meter_streams.connect_stream(channel_id, source_node_id);
                     if let Err(e) = connect_result {
                         warn!("Failed to connect input meter stream for channel '{}': {:?}", channel_name, e);
                     } else {
                         info!("Input meter stream created and connected for channel '{}'", channel_name);
+
+                        // Queue pending meter link for manual link creation when ports are discovered.
+                        // Input meters connect to source output ports (not monitor ports).
+                        let meter_name = format!("sootmix.meter.{}", channel_name);
+                        state.borrow_mut().pending_meter_links.push(PendingMeterLink {
+                            sink_node_id: source_node_id,
+                            sink_name: target_node_name.clone(),
+                            meter_node_id: 0, // Will be filled when node is discovered
+                            meter_name,
+                            is_source: true,
+                        });
+                        debug!("Queued pending input meter link for discovery: source {} -> meter 'sootmix.meter.{}'", source_node_id, channel_name);
                     }
                 }
                 Err(e) => {
@@ -1621,18 +1637,22 @@ fn process_pending_meter_links(state: &Rc<RefCell<PwThreadState>>, added_port: &
             continue;
         }
 
-        // Find sink monitor ports (FL and FR) for stereo metering.
-        // PipeWire allows multiple output ports linked to one input port — it
-        // sums them, but with resample.peaks=true we get per-update peak values.
-        // Linking both channels lets each peak through independently when the
-        // stream negotiates stereo (2-channel interleaved) format.
+        // Find the target node's output ports for metering.
+        // For output channels (sinks): use monitor_FL/FR ports
+        // For input channels (sources): use regular output ports (FL/FR)
         let sink_monitor_ports = {
             let state_ref = state.borrow();
             let mut ports: Vec<(u32, String)> = state_ref.ports.values()
                 .filter(|p| {
                     p.node_id == pending.sink_node_id
                         && p.direction == PortDirection::Output
-                        && p.name.starts_with("monitor_")
+                        && if pending.is_source {
+                            // Source meters: use regular output ports
+                            !p.name.starts_with("monitor_")
+                        } else {
+                            // Sink meters: use monitor ports only
+                            p.name.starts_with("monitor_")
+                        }
                 })
                 .map(|p| (p.id, p.name.clone()))
                 .collect();
