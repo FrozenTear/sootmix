@@ -1059,7 +1059,11 @@ impl DaemonService {
                 self.check_and_fix_rogue_link(&link);
             }
             PwEvent::LinkRemoved(id) => {
-                self.state.pw_graph.links.remove(&id);
+                // Save link info before removing, so we can check if it was managed
+                let removed_link = self.state.pw_graph.links.remove(&id);
+                if let Some(link) = removed_link {
+                    self.check_and_restore_managed_link(&link);
+                }
             }
             PwEvent::VirtualSinkCreated {
                 channel_id,
@@ -1741,6 +1745,103 @@ impl DaemonService {
 
         self.save_config();
         Ok(())
+    }
+
+    /// Check if a removed link was one we manage (app→virtual_sink or
+    /// loopback_output→hardware_device). If so, re-create it.
+    /// This handles external tools (e.g. KDE audio control) or WirePlumber
+    /// re-routing streams and destroying our links.
+    fn check_and_restore_managed_link(&mut self, link: &PwLink) {
+        let our_sinks: Vec<u32> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| c.pw_sink_id)
+            .collect();
+
+        // Case 1: Link was from an assigned app to one of our virtual sinks
+        if our_sinks.contains(&link.input_node) {
+            let app_node_id = link.output_node;
+            let is_assigned_app = self.state.apps.iter().any(|a| {
+                if a.node_id != app_node_id {
+                    return false;
+                }
+                let id = a.identifier().to_string();
+                self.state
+                    .channels
+                    .iter()
+                    .any(|c| c.pw_sink_id == Some(link.input_node) && c.assigned_apps.contains(&id))
+            });
+
+            if is_assigned_app {
+                warn!(
+                    "Managed link removed: app node {} -> sink node {}. Restoring.",
+                    link.output_node, link.input_node
+                );
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port: link.output_port,
+                    input_port: link.input_port,
+                });
+                return;
+            }
+        }
+
+        // Case 2: Link was from a channel's loopback output to a hardware device
+        let is_loopback_output = self
+            .state
+            .channels
+            .iter()
+            .any(|c| c.pw_loopback_output_id == Some(link.output_node));
+
+        if is_loopback_output {
+            let target_is_hw_sink = self
+                .state
+                .pw_graph
+                .nodes
+                .get(&link.input_node)
+                .map(|n| n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix."))
+                .unwrap_or(false);
+
+            if target_is_hw_sink {
+                warn!(
+                    "Managed link removed: loopback output {} -> hw sink {}. Restoring.",
+                    link.output_node, link.input_node
+                );
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port: link.output_port,
+                    input_port: link.input_port,
+                });
+                return;
+            }
+        }
+
+        // Case 3: Link was from a mic to an input channel's capture stream
+        let is_capture_stream = self
+            .state
+            .channels
+            .iter()
+            .any(|c| c.pw_loopback_capture_id == Some(link.input_node));
+
+        if is_capture_stream {
+            let source_is_mic = self
+                .state
+                .pw_graph
+                .nodes
+                .get(&link.output_node)
+                .map(|n| n.is_audio_input() && !n.name.starts_with("sootmix."))
+                .unwrap_or(false);
+
+            if source_is_mic {
+                warn!(
+                    "Managed link removed: mic {} -> capture stream {}. Restoring.",
+                    link.output_node, link.input_node
+                );
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port: link.output_port,
+                    input_port: link.input_port,
+                });
+            }
+        }
     }
 
     /// Check if a newly-created link goes from an assigned app to the wrong sink.
