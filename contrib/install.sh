@@ -306,6 +306,21 @@ download() {
     fi
 }
 
+# Reload systemd and restart daemon if it was running
+restart_daemon_if_running() {
+    if ! check_command systemctl; then
+        return
+    fi
+
+    systemctl --user daemon-reload 2>/dev/null || true
+
+    if systemctl --user is-active sootmix-daemon.service >/dev/null 2>&1; then
+        info "Restarting sootmix-daemon..."
+        systemctl --user restart sootmix-daemon.service
+        success "sootmix-daemon restarted with new version."
+    fi
+}
+
 # Install from pre-built binary
 install_binary() {
     info "Installing from pre-built binary..."
@@ -384,6 +399,9 @@ install_binary() {
         install -Dm644 sootmix-daemon.service "$systemd_user_dir/sootmix-daemon.service"
     fi
 
+    # Reload and restart daemon if running
+    restart_daemon_if_running
+
     success "Binary installation complete!"
 }
 
@@ -435,10 +453,8 @@ install_source() {
         $use_sudo gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
     fi
 
-    # Reload systemd user daemon
-    if check_command systemctl; then
-        systemctl --user daemon-reload 2>/dev/null || true
-    fi
+    # Reload and restart daemon if running
+    restart_daemon_if_running
 
     success "Source installation complete!"
 }
