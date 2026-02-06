@@ -292,8 +292,10 @@ impl MeterCaptureStream {
         );
 
         // Connect as input (capturing audio from sink's monitor ports)
-        // AUTOCONNECT lets PipeWire/WirePlumber handle the actual connection
-        let flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS | StreamFlags::AUTOCONNECT;
+        // Do NOT use AUTOCONNECT - WirePlumber would route meters to hardware
+        // devices instead of virtual channels. Links are created manually via
+        // process_pending_meter_links() in pipewire_thread.rs.
+        let flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
 
         self.stream.connect(
             libspa::utils::Direction::Input,
