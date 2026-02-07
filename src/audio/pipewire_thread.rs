@@ -1294,7 +1294,7 @@ fn handle_command(
             match result {
                 Ok(()) => {
                     // Connect the meter stream
-                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id, sink_node_id);
+                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id);
                     if let Err(e) = connect_result {
                         warn!("Failed to connect meter stream for channel '{}': {:?}", channel_name, e);
                     } else {
@@ -1355,7 +1355,7 @@ fn handle_command(
             match result {
                 Ok(()) => {
                     // Connect the meter stream (without AUTOCONNECT - links created manually)
-                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id, source_node_id);
+                    let connect_result = state.borrow().meter_streams.connect_stream(channel_id);
                     if let Err(e) = connect_result {
                         warn!("Failed to connect input meter stream for channel '{}': {:?}", channel_name, e);
                     } else {

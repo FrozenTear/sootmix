@@ -182,8 +182,7 @@ impl MeterCaptureStream {
                 "node.name" => stream_name.clone(),
                 "node.description" => format!("SootMix Meter - {}", channel_name),
                 "node.passive" => "true",
-                "stream.monitor" => "true",
-                "target.object" => target_node_name,
+                "node.autoconnect" => "false",
                 "audio.channels" => "2",
                 "audio.position" => "FL,FR"
             },
@@ -251,7 +250,7 @@ impl MeterCaptureStream {
                 "node.name" => stream_name.clone(),
                 "node.description" => format!("SootMix Meter - {}", channel_name),
                 "node.passive" => "true",
-                "target.object" => target_node_name,
+                "node.autoconnect" => "false",
                 "audio.channels" => "2",
                 "audio.position" => "FL,FR"
             },
@@ -281,25 +280,23 @@ impl MeterCaptureStream {
         })
     }
 
-    /// Connect the stream to a target node (the virtual sink).
+    /// Connect the stream without a target - links are created manually.
     ///
-    /// # Arguments
-    /// * `target_node_id` - The virtual sink node ID to capture from
-    pub fn connect(&self, target_node_id: u32) -> Result<(), pipewire::Error> {
+    /// Does NOT pass a target node ID or use AUTOCONNECT, so WirePlumber
+    /// has no routing hints at all. Actual links from virtual sink monitor
+    /// ports to this meter's input ports are created by
+    /// process_pending_meter_links() in pipewire_thread.rs.
+    pub fn connect(&self) -> Result<(), pipewire::Error> {
         info!(
-            "Connecting meter stream for channel {} to sink {}",
-            self.channel_id, target_node_id
+            "Connecting meter stream for channel {} (no target - manual linking)",
+            self.channel_id
         );
 
-        // Connect as input (capturing audio from sink's monitor ports)
-        // Do NOT use AUTOCONNECT - WirePlumber would route meters to hardware
-        // devices instead of virtual channels. Links are created manually via
-        // process_pending_meter_links() in pipewire_thread.rs.
         let flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
 
         self.stream.connect(
             libspa::utils::Direction::Input,
-            Some(target_node_id),
+            None,
             flags,
             &mut [],
         )?;
@@ -450,14 +447,13 @@ impl MeterStreamManager {
         Ok(())
     }
 
-    /// Connect a meter stream to a sink node.
+    /// Connect a meter stream (no target - links are created manually).
     pub fn connect_stream(
         &self,
         channel_id: Uuid,
-        sink_node_id: u32,
     ) -> Result<(), pipewire::Error> {
         if let Some(stream) = self.streams.get(&channel_id) {
-            stream.connect(sink_node_id)?;
+            stream.connect()?;
         } else {
             warn!(
                 "Cannot connect meter stream: channel {} not found",
