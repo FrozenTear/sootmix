@@ -110,6 +110,7 @@ impl MixerConfig {
         toml::from_str(s)
     }
 
+    #[allow(dead_code)]
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
@@ -193,16 +194,19 @@ impl RoutingRulesConfig {
         toml::to_string_pretty(self)
     }
 
+    #[allow(dead_code)]
     pub fn get_rule(&self, id: Uuid) -> Option<&RoutingRule> {
         self.rules.iter().find(|r| r.id == id)
     }
 
+    #[allow(dead_code)]
     pub fn toggle_rule(&mut self, id: Uuid) {
         if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
             rule.enabled = !rule.enabled;
         }
     }
 
+    #[allow(dead_code)]
     pub fn remove_rule(&mut self, id: Uuid) {
         self.rules.retain(|r| r.id != id);
     }
@@ -270,6 +274,7 @@ impl ConfigManager {
     }
 
     /// Save routing rules.
+    #[allow(dead_code)]
     pub fn save_routing_rules(&self, config: &RoutingRulesConfig) -> Result<(), ConfigError> {
         let path = self.config_path("routing_rules.toml");
         let content = config.to_toml()?;

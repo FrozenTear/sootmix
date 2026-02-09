@@ -7,6 +7,8 @@
 //! Downloads tarballs from GitHub releases, extracts them, and installs
 //! LV2 bundles to ~/.lv2/ for automatic discovery.
 
+#![allow(dead_code, unused_imports)]
+
 use crate::plugins::registry::PluginPack;
 use std::path::PathBuf;
 use thiserror::Error;

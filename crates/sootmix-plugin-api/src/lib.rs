@@ -42,6 +42,7 @@
 //! ```
 
 #![warn(missing_docs)]
+#![allow(non_local_definitions)]
 
 use abi_stable::{
     sabi_trait,
@@ -287,7 +288,12 @@ pub enum PluginError {
     /// Invalid parameter index.
     InvalidParameter(u32),
     /// Invalid parameter value.
-    InvalidValue { param: u32, value: f32 },
+    InvalidValue {
+        /// Parameter index.
+        param: u32,
+        /// The invalid value.
+        value: f32,
+    },
     /// Failed to load state.
     StateLoadFailed(RString),
     /// Failed to save state.

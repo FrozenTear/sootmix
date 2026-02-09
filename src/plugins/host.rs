@@ -10,6 +10,8 @@
 //! - Sample rate queries
 //! - (Future) File access, preset management, etc.
 
+#![allow(dead_code, unused_imports)]
+
 use sootmix_plugin_api::PluginInfo;
 use std::sync::Arc;
 use tracing::{debug, info, warn};

@@ -46,6 +46,7 @@ pub enum PwCommand {
     /// Bind to an existing node for control (used for adopted sinks).
     BindNode { node_id: u32 },
     /// Unbind from a node (release proxy).
+    #[allow(dead_code)]
     UnbindNode { node_id: u32 },
     /// Create a link between two ports.
     CreateLink { output_port: u32, input_port: u32 },
@@ -56,12 +57,14 @@ pub enum PwCommand {
     /// Set mute state on a node.
     SetMute { node_id: u32, muted: bool },
     /// Set both volume and mute atomically.
+    #[allow(dead_code)]
     SetVolumeMute {
         node_id: u32,
         volume: f32,
         muted: bool,
     },
     /// Set EQ parameters on a filter-chain node.
+    #[allow(dead_code)]
     SetEqParams {
         node_id: u32,
         band: String,
@@ -133,6 +136,7 @@ pub enum PwCommand {
     ///
     /// This creates a lightweight PipeWire stream that connects to the
     /// virtual sink's monitor ports to capture audio levels in real-time.
+    #[allow(dead_code)]
     CreateMeterStream {
         channel_id: Uuid,
         channel_name: String,
@@ -171,6 +175,7 @@ pub enum PwEvent {
     /// Node removed from the graph.
     NodeRemoved(u32),
     /// Node properties changed.
+    #[allow(dead_code)]
     NodeChanged(PwNode),
     /// Port added.
     PortAdded(PwPort),
@@ -199,6 +204,7 @@ pub enum PwEvent {
     /// Plugin filter destroyed.
     PluginFilterDestroyed { channel_id: Uuid },
     /// Control parameter changed (volume, mute, etc).
+    #[allow(dead_code)]
     ParamChanged {
         node_id: u32,
         volume: Option<f32>,
@@ -229,6 +235,7 @@ struct BoundNode {
 /// A created link proxy that we own.
 struct CreatedLink {
     /// The link proxy.
+    #[allow(dead_code)]
     proxy: Link,
 }
 
@@ -1066,7 +1073,7 @@ fn handle_command(
             let event_tx = state.borrow().event_tx.clone();
 
             // Remove and destroy the filter
-            if let Some(mut filter_info) = state.borrow_mut().plugin_filters.remove(&channel_id) {
+            if let Some(filter_info) = state.borrow_mut().plugin_filters.remove(&channel_id) {
                 // Disconnect the streams
                 if let Err(e) = filter_info.streams.disconnect() {
                     warn!("Error disconnecting plugin filter streams: {:?}", e);

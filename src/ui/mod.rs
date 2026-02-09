@@ -14,8 +14,4 @@ pub mod plugin_downloader;
 pub mod routing_rules_panel;
 pub mod theme;
 
-pub use focus_panel::{focus_panel, focus_panel_empty, FocusPluginInfo, FOCUS_PANEL_WIDTH};
-pub use meter::{vu_meter, METER_WIDTH};
-pub use plugin_chain::{fx_button, plugin_browser, plugin_chain_panel, plugin_editor, PluginEditorParam};
 pub use plugin_downloader::plugin_downloader;
-pub use theme::THEME_PALETTE;

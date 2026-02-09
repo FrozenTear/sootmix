@@ -4,6 +4,8 @@
 
 //! Application configuration (window settings, behavior).
 
+#![allow(dead_code, unused_imports)]
+
 use crate::plugins::PluginSlotConfig;
 use crate::state::ChannelKind;
 use serde::{Deserialize, Serialize};

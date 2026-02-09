@@ -4,6 +4,8 @@
 
 //! Global preset definitions (entire mixer state).
 
+#![allow(dead_code, unused_imports)]
+
 use serde::{Deserialize, Serialize};
 
 /// Master channel settings in a preset.

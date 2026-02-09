@@ -29,6 +29,8 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
+#![allow(dead_code)]
+
 pub mod builtin;
 pub mod downloader;
 pub mod host;
@@ -36,6 +38,7 @@ pub mod manager;
 pub mod native;
 pub mod registry;
 
+#[allow(unexpected_cfgs)]
 #[cfg(feature = "wasm-plugins")]
 pub mod wasm;
 
@@ -45,14 +48,7 @@ pub mod lv2;
 #[cfg(feature = "vst3-plugins")]
 pub mod vst3;
 
-pub use host::PluginHost;
-pub use manager::{PluginInstance, PluginManager, PluginRegistry, SharedPluginInstances};
-
-#[cfg(feature = "lv2-plugins")]
-pub use lv2::{Lv2PluginLoader, Lv2PluginMeta};
-
-#[cfg(feature = "vst3-plugins")]
-pub use vst3::{Vst3PluginLoader, Vst3PluginMeta};
+pub use manager::{PluginManager, SharedPluginInstances};
 
 use serde::{Deserialize, Serialize};
 use sootmix_plugin_api::{PluginCategory, PluginInfo};

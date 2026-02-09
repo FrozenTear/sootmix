@@ -4,6 +4,8 @@
 
 //! LV2 plugin scanning and metadata extraction.
 
+#![allow(dead_code)]
+
 use super::Lv2World;
 use sootmix_plugin_api::PluginCategory;
 use std::sync::Arc;

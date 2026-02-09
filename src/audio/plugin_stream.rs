@@ -22,6 +22,8 @@
 //! - Plugin instances are accessed via try_lock() for RT safety
 //! - Parameter updates flow via lock-free ring buffer
 
+#![allow(dead_code, unused_imports)]
+
 use crate::audio::meter_stream::{calculate_stereo_peaks, AtomicMeterLevels};
 use crate::audio::plugin_filter::PluginProcessingContext;
 use crate::plugins::SharedPluginInstances;

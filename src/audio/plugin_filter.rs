@@ -25,6 +25,8 @@
 //! - Lock-free ring buffer for parameter updates (UI → RT)
 //! - try_lock() on plugin instances to avoid blocking RT thread
 
+#![allow(dead_code, unused_imports)]
+
 use crate::plugins::SharedPluginInstances;
 use crate::realtime::{PluginParamUpdate, RingBuffer, RingBufferReader, RingBufferWriter};
 use std::collections::HashMap;

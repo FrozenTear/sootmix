@@ -8,6 +8,8 @@
 //! It supports both real audio levels (from PipeWire streams) and simulated
 //! levels (as fallback when real metering isn't available).
 
+#![allow(dead_code)]
+
 use crate::audio::meter_stream::AtomicMeterLevels;
 use crate::state::{db_to_linear, MeterDisplayState, MixerChannel};
 use std::collections::HashMap;

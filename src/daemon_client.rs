@@ -4,6 +4,8 @@
 
 //! D-Bus client for communicating with the SootMix daemon.
 
+#![allow(dead_code, unused_imports)]
+
 use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, MeterData, OutputInfo, RoutingRuleInfo};
 use std::sync::Arc;
 use tokio::sync::Mutex;

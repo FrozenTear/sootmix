@@ -8,6 +8,8 @@
 //! must outlive all plugin instances. We use a global singleton pattern with
 //! reference counting to ensure proper lifetime management.
 
+#![allow(dead_code)]
+
 use crate::plugins::PluginLoadError;
 use lilv::World;
 use std::sync::{Arc, OnceLock};

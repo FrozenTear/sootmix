@@ -4,6 +4,8 @@
 
 //! Configuration persistence (save/load).
 
+#![allow(dead_code, unused_imports)]
+
 use crate::config::{AppConfig, EqPreset, GlobalPreset, MixerConfig, RoutingRulesConfig};
 use directories::ProjectDirs;
 use std::fs;

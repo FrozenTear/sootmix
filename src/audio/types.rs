@@ -4,6 +4,8 @@
 
 //! PipeWire type definitions for nodes, ports, and links.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

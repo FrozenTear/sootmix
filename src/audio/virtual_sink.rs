@@ -4,6 +4,8 @@
 
 //! Virtual sink creation and management using pw-loopback.
 
+#![allow(dead_code, unused_imports)]
+
 use std::collections::HashMap;
 use std::process::{Child, Command};
 use parking_lot::Mutex;

@@ -4,6 +4,8 @@
 
 //! Auto-routing rules for automatic app-to-channel assignment.
 
+#![allow(dead_code)]
+
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;

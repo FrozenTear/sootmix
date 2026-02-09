@@ -44,9 +44,11 @@ pub enum PwCommand {
         node_id: u32,
         description: String,
     },
+    #[allow(dead_code)]
     BindNode {
         node_id: u32,
     },
+    #[allow(dead_code)]
     UnbindNode {
         node_id: u32,
     },
@@ -115,6 +117,7 @@ pub enum PwEvent {
     Disconnected,
     NodeAdded(PwNode),
     NodeRemoved(u32),
+    #[allow(dead_code)]
     NodeChanged(PwNode),
     PortAdded(PwPort),
     PortRemoved(u32),

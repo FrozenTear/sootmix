@@ -21,6 +21,8 @@
 //!                  [UI reads for display]
 //! ```
 
+#![allow(dead_code)]
+
 use pipewire::properties::properties;
 use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc};
 use std::collections::HashMap;

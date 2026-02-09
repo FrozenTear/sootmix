@@ -7,6 +7,8 @@
 //! This module provides utilities for setting node parameters (volume, mute, EQ)
 //! using the native PipeWire API instead of CLI tools.
 
+#![allow(dead_code, unused_imports)]
+
 use libspa::pod::serialize::PodSerializer;
 use libspa::pod::{Object, Property, Value, ValueArray};
 use libspa::utils::Id;

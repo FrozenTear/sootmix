@@ -24,6 +24,8 @@
 //!         capture_stream                            playback_stream
 //! ```
 
+#![allow(dead_code)]
+
 use pipewire::properties::properties;
 use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc};
 use std::cell::RefCell;

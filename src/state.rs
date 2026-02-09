@@ -4,11 +4,13 @@
 
 //! Application state management.
 
+#![allow(dead_code)]
+
 use crate::audio::types::{
     AudioChannel, InputDevice, MediaClass, OutputDevice, PortDirection, PwLink, PwNode, PwPort,
 };
 use crate::config::RoutingRulesConfig;
-use crate::plugins::{PluginSlotConfig, PluginType};
+use crate::plugins::PluginSlotConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;

@@ -14,6 +14,8 @@
 //! - `Lv2PluginAdapter` - Wraps LV2 instance to implement AudioEffect trait
 //! - `Lv2PluginLoader` - Handles scanning and loading LV2 plugins
 
+#![allow(dead_code)]
+
 mod adapter;
 mod scanner;
 mod world;
@@ -27,7 +29,7 @@ use sootmix_plugin_api::PluginBox;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Standard LV2 search paths on Linux.
 pub const LV2_SEARCH_PATHS: &[&str] = &[

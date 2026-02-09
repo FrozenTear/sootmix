@@ -10,6 +10,8 @@
 //! - Peak hold indicators with color-coded warnings
 //! - Smooth visual transitions
 
+#![allow(dead_code)]
+
 use crate::message::Message;
 use crate::state::MeterDisplayState;
 use crate::ui::theme::{METER_BACKGROUND, METER_GREEN, METER_ORANGE, METER_RED, METER_YELLOW};

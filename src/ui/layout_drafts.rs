@@ -24,6 +24,8 @@
 //! - PatternFly Drawer: https://www.patternfly.org/components/drawer/design-guidelines/
 //! - Adobe Slide-out Panels: https://developer.adobe.com/commerce/admin-developer/pattern-library/containers/slideouts-modals-overlays/
 
+#![allow(dead_code, unused_imports)]
+
 use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::state::{AppState, MixerChannel};

@@ -7,6 +7,8 @@
 //! Unlike external plugins (Native, LV2, VST3), builtin plugins are part of the
 //! SootMix binary. They are created directly rather than loaded from external files.
 
+#![allow(dead_code, unused_imports)]
+
 use sootmix_plugin_api::{PluginBox, PluginInfo};
 
 /// Registry of available built-in plugins.

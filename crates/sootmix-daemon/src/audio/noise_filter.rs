@@ -35,6 +35,7 @@ struct NoiseFilterInstance {
     child: Child,
     #[allow(dead_code)]
     config_file: NamedTempFile,
+    #[allow(dead_code)]
     source_node_id: Option<u32>,
 }
 
@@ -281,6 +282,7 @@ fn get_builtin_rnnoise_path() -> Option<String> {
 }
 
 /// Check if the RNNoise LADSPA plugin is available.
+#[allow(dead_code)]
 pub fn is_rnnoise_available() -> bool {
     // First check our built-in plugin
     if get_builtin_rnnoise_path().is_some() {
@@ -435,6 +437,7 @@ pub fn destroy_noise_filter(channel_id: Uuid) -> Result<(), NoiseFilterError> {
 }
 
 /// Destroy all noise filters (cleanup on exit).
+#[allow(dead_code)]
 pub fn destroy_all_noise_filters() {
     if let Some(ref mut map) = *get_processes() {
         for (channel_id, mut instance) in map.drain() {
@@ -446,6 +449,7 @@ pub fn destroy_all_noise_filters() {
 }
 
 /// Get the source node ID for a channel's noise filter, if it exists.
+#[allow(dead_code)]
 pub fn get_noise_filter_node_id(channel_id: Uuid) -> Option<u32> {
     if let Some(ref map) = *get_processes() {
         if let Some(instance) = map.get(&channel_id) {
@@ -456,6 +460,7 @@ pub fn get_noise_filter_node_id(channel_id: Uuid) -> Option<u32> {
 }
 
 /// Check if a channel has an active noise filter.
+#[allow(dead_code)]
 pub fn has_noise_filter(channel_id: Uuid) -> bool {
     if let Some(ref map) = *get_processes() {
         return map.contains_key(&channel_id);

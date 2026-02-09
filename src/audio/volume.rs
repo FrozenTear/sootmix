@@ -4,6 +4,8 @@
 
 //! Volume and mute control using wpctl.
 
+#![allow(dead_code, unused_imports)]
+
 use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, error, info};

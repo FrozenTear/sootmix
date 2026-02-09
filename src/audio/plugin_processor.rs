@@ -39,6 +39,8 @@
 //! - Parameter updates flow via lock-free ring buffer
 //! - If lock is contended, RT thread does passthrough (no audio glitches)
 
+#![allow(dead_code, unused_imports)]
+
 use crate::plugins::SharedPluginInstances;
 use std::collections::HashMap;
 use thiserror::Error;

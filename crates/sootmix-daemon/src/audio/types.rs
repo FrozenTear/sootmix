@@ -16,6 +16,7 @@ pub struct PwNode {
     pub media_class: MediaClass,
     pub app_name: Option<String>,
     pub binary_name: Option<String>,
+    #[allow(dead_code)]
     pub ports: Vec<PwPort>,
     pub properties: HashMap<String, String>,
 }
@@ -38,10 +39,12 @@ impl PwNode {
         matches!(self.media_class, MediaClass::StreamOutputAudio)
     }
 
+    #[allow(dead_code)]
     pub fn is_sink(&self) -> bool {
         matches!(self.media_class, MediaClass::AudioSink)
     }
 
+    #[allow(dead_code)]
     pub fn is_source(&self) -> bool {
         matches!(self.media_class, MediaClass::AudioSource)
     }
@@ -54,6 +57,7 @@ impl PwNode {
         )
     }
 
+    #[allow(dead_code)]
     pub fn display_name(&self) -> &str {
         if !self.description.is_empty() {
             &self.description
@@ -93,6 +97,7 @@ impl MediaClass {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {
             Self::AudioSink => "Audio/Sink",
@@ -215,6 +220,7 @@ pub struct PwLink {
     pub output_port: u32,
     pub input_node: u32,
     pub input_port: u32,
+    #[allow(dead_code)]
     pub active: bool,
 }
 
@@ -233,6 +239,7 @@ impl PwLink {
 
 /// Information about an output device.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OutputDevice {
     pub node_id: u32,
     pub name: String,
@@ -240,6 +247,8 @@ pub struct OutputDevice {
 }
 
 impl OutputDevice {
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn display_name(&self) -> &str {
         if !self.description.is_empty() {
             &self.description

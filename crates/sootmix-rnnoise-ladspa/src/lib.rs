@@ -284,6 +284,7 @@ static DESCRIPTOR: LadspaDescriptor = LadspaDescriptor {
 
 /// LADSPA entry point - returns descriptor for the given index
 #[no_mangle]
+#[allow(private_interfaces)]
 pub extern "C" fn ladspa_descriptor(index: c_ulong) -> *const LadspaDescriptor {
     match index {
         0 => &DESCRIPTOR,

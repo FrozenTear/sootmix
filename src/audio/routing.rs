@@ -4,6 +4,8 @@
 
 //! Audio routing - creating and managing links between nodes.
 
+#![allow(dead_code, unused_imports)]
+
 use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, info, warn};

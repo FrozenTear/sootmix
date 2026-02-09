@@ -807,6 +807,7 @@ pub async fn emit_outputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result
 }
 
 /// Emit InputsChanged signal.
+#[allow(dead_code)]
 pub async fn emit_inputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()> {
     ctx.connection()
         .emit_signal(

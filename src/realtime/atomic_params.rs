@@ -21,6 +21,8 @@
 //! let v = volume.get();
 //! ```
 
+#![allow(dead_code, unused_imports)]
+
 use std::sync::atomic::{AtomicU32 as StdAtomicU32, AtomicI32 as StdAtomicI32, Ordering};
 
 /// Atomic f32 for lock-free parameter updates.

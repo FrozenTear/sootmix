@@ -164,6 +164,7 @@ impl SootMix {
     }
 
     /// Application title.
+    #[allow(dead_code)]
     pub fn title(&self) -> String {
         "SootMix".to_string()
     }
@@ -349,7 +350,7 @@ impl SootMix {
                 }
             }
             Message::ChannelNameEditChanged(new_value) => {
-                if let Some((id, ref mut value)) = self.state.editing_channel {
+                if let Some((_id, ref mut value)) = self.state.editing_channel {
                     *value = new_value;
                 }
             }
@@ -1379,7 +1380,7 @@ impl SootMix {
     /// - Channel strips (full width, horizontally scrollable)
     /// - Apps panel (compact, below strips)
     /// - Collapsible bottom panel for selected channel detail
-    pub fn view(&self, _window: iced::window::Id) -> Element<Message> {
+    pub fn view(&self, _window: iced::window::Id) -> Element<'_, Message> {
         // Header bar
         let header = self.view_header();
 
@@ -1499,7 +1500,7 @@ impl SootMix {
     }
 
     /// View the bottom detail panel (Ableton-style).
-    fn view_bottom_panel(&self) -> Element<Message> {
+    fn view_bottom_panel(&self) -> Element<'_, Message> {
         if self.state.bottom_panel_expanded {
             // Expanded state: show drag handle + content
             let drag_handle = container(
@@ -1853,7 +1854,7 @@ impl SootMix {
     }
 
     /// Empty state for bottom panel.
-    fn view_bottom_panel_empty(&self) -> Element<Message> {
+    fn view_bottom_panel_empty(&self) -> Element<'_, Message> {
         container(
             text("Select a channel to view details").size(TEXT_BODY).color(TEXT_DIM),
         )
@@ -1865,7 +1866,8 @@ impl SootMix {
     }
 
     /// View the left sidebar (apps panel + routing rules).
-    fn view_left_sidebar(&self) -> Element<Message> {
+    #[allow(dead_code)]
+    fn view_left_sidebar(&self) -> Element<'_, Message> {
         use crate::ui::focus_panel::FOCUS_PANEL_WIDTH;
 
         // Sidebar width (same as focus panel for symmetry)
@@ -1969,7 +1971,8 @@ impl SootMix {
     }
 
     /// View the center panel (channel strips + footer).
-    fn view_center_panel(&self) -> Element<Message> {
+    #[allow(dead_code)]
+    fn view_center_panel(&self) -> Element<'_, Message> {
         let channel_strips = self.view_channel_strips();
         let footer = self.view_footer();
 
@@ -1984,7 +1987,8 @@ impl SootMix {
     }
 
     /// View the right panel (focus panel, plugin browser, or plugin editor).
-    fn view_right_panel(&self) -> Element<Message> {
+    #[allow(dead_code)]
+    fn view_right_panel(&self) -> Element<'_, Message> {
         use crate::ui::focus_panel::{focus_panel, focus_panel_empty, FocusPluginInfo};
 
         // Priority: Plugin editor > Plugin browser > Focus panel
@@ -2040,7 +2044,7 @@ impl SootMix {
     }
 
     /// View the header bar.
-    fn view_header(&self) -> Element<Message> {
+    fn view_header(&self) -> Element<'_, Message> {
         let title = text("SootMix")
             .size(20)
             .color(TEXT);
@@ -2094,7 +2098,7 @@ impl SootMix {
     /// - Empty slot: click to capture current state
     /// - Filled slot (not active): click to recall
     /// - Filled slot (active): no action (use Save button to update)
-    fn snapshot_button(&self, slot: SnapshotSlot) -> Element<Message> {
+    fn snapshot_button(&self, slot: SnapshotSlot) -> Element<'_, Message> {
         let label = match slot {
             SnapshotSlot::A => "A",
             SnapshotSlot::B => "B",
@@ -2146,7 +2150,7 @@ impl SootMix {
     }
 
     /// Create the "Save All" button for saving entire mixer state to active snapshot.
-    fn snapshot_save_button(&self) -> Element<Message> {
+    fn snapshot_save_button(&self) -> Element<'_, Message> {
         let has_active = self.state.active_snapshot.is_some();
 
         let btn = button(text("Save").size(11))
@@ -2189,7 +2193,7 @@ impl SootMix {
     /// View the channel strips area.
     ///
     // TODO: Master position should be configurable (left/right) in the future.
-    fn view_channel_strips(&self) -> Element<Message> {
+    fn view_channel_strips(&self) -> Element<'_, Message> {
         let dragging = self.state.dragging_app.as_ref();
         let editing = self.state.editing_channel.as_ref();
         let has_active_snapshot = self.state.active_snapshot.is_some();
@@ -2252,7 +2256,7 @@ impl SootMix {
     }
 
     /// View the footer with add channel buttons.
-    fn view_footer(&self) -> Element<Message> {
+    fn view_footer(&self) -> Element<'_, Message> {
         let add_button = button(text("+ New Channel").size(14))
             .padding([10, 20])
             .style(|_theme: &Theme, _status| button::Style {
@@ -2296,6 +2300,7 @@ impl SootMix {
     }
 
     /// Get the application theme.
+    #[allow(dead_code)]
     pub fn theme(&self) -> Theme {
         theme::sootmix_theme()
     }
@@ -3556,7 +3561,7 @@ impl SootMix {
             .find(|c| c.assigned_apps.contains(&app_id) && c.pw_sink_id.is_some())
             .map(|c| (c.id, c.pw_sink_id.unwrap()));
 
-        if let Some((channel_id, sink_id)) = assigned_channel {
+        if let Some((_channel_id, sink_id)) = assigned_channel {
             // This app is assigned to our channel but WirePlumber linked it elsewhere.
             // Destroy the rogue link and re-route.
             info!(

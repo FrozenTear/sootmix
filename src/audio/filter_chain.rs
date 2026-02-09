@@ -4,6 +4,8 @@
 
 //! EQ filter chain creation and management using pw-filter-chain.
 
+#![allow(dead_code, unused_imports)]
+
 use crate::config::eq_preset::EqPreset;
 use std::collections::HashMap;
 use std::io::Write;

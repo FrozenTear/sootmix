@@ -12,6 +12,8 @@
 //! (nirify integration). All colors flow from a semantic palette that can
 //! be swapped for different visual identities while maintaining consistency.
 
+#![allow(dead_code)]
+
 use iced::theme::Palette;
 use iced::{Border, Color, Theme};
 

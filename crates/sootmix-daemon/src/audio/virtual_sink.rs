@@ -24,6 +24,7 @@ pub enum VirtualSinkError {
 
 /// Check availability of PipeWire CLI tools at startup.
 /// Logs warnings for any missing tools with guidance.
+#[allow(dead_code)]
 pub fn check_pipewire_tools() {
     let tools = [
         ("pw-loopback", "Required for creating virtual sinks"),

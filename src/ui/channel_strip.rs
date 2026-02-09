@@ -890,7 +890,7 @@ const APP_TILE_SIZE: f32 = 32.0;
 const APP_ICONS_PER_ROW: usize = 3;
 
 
-pub fn app_card(channel: &MixerChannel) -> Element<Message> {
+pub fn app_card(channel: &MixerChannel) -> Element<'_, Message> {
     let id = channel.id;
     let assigned_apps = &channel.assigned_apps;
 
@@ -998,7 +998,7 @@ fn input_channel_card(channel: &MixerChannel) -> Element<'static, Message> {
 }
 
 /// A single app icon tile: colored square with 2-char initials.
-fn app_icon_tile(channel_id: Uuid, app_id: &str) -> Element<Message> {
+fn app_icon_tile(channel_id: Uuid, app_id: &str) -> Element<'_, Message> {
     let initials = app_initials(app_id);
     let color = app_color(app_id);
     let app_id_owned = app_id.to_string();

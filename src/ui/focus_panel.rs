@@ -8,6 +8,8 @@
 //! the Harrison Mixbus "Focus Channel" pattern. Shows signal flow,
 //! EQ, plugins, and routing in an expanded horizontal layout.
 
+#![allow(dead_code)]
+
 use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::state::MixerChannel;
