@@ -21,6 +21,7 @@ use uuid::Uuid;
 pub enum SignalEvent {
     AppDiscovered(AppInfo),
     AppRemoved(String),
+    #[allow(dead_code)]
     OutputsChanged,
     MeterUpdate(Vec<sootmix_ipc::MeterData>),
 }
@@ -407,6 +408,10 @@ pub struct DaemonState {
     pub auto_routed_apps: HashSet<u32>,
     /// Channels waiting for their sink ports to be ready for auto-routing
     pub pending_auto_route_channels: HashSet<Uuid>,
+    /// Loopback output node IDs that have a RouteChannelToDevice in flight.
+    /// Prevents duplicate routing when multiple hardware sinks appear rapidly
+    /// (e.g. after sleep/wake).
+    pub pending_route_loopbacks: HashSet<u32>,
     /// Counter for periodic app refresh
     pub refresh_counter: u32,
     /// Time of last PipeWire reconnection attempt (for backoff)
@@ -436,6 +441,7 @@ impl DaemonState {
             routing_rules,
             auto_routed_apps: HashSet::new(),
             pending_auto_route_channels: HashSet::new(),
+            pending_route_loopbacks: HashSet::new(),
             refresh_counter: 0,
             last_reconnect_attempt: None,
             reconnect_failures: 0,
@@ -827,6 +833,7 @@ impl DaemonService {
                 }
                 self.state.auto_routed_apps.clear();
                 self.state.pending_auto_route_channels.clear();
+                self.state.pending_route_loopbacks.clear();
                 self.state.master_recording_source_id = None;
             }
             PwEvent::NodeAdded(node) => {
@@ -977,20 +984,22 @@ impl DaemonService {
                     .map(|c| (c.id, c.pw_loopback_output_id));
 
                 if let Some((channel_id, Some(loopback_id))) = loopback_route {
-                    // Check if this loopback output already has links to a hardware sink
+                    // Check if this loopback output already has links or a pending route
                     let has_links = self
                         .state
                         .pw_graph
                         .links
                         .values()
                         .any(|l| l.output_node == loopback_id);
+                    let is_pending = self.state.pending_route_loopbacks.contains(&loopback_id);
 
-                    if !has_links {
+                    if !has_links && !is_pending {
                         debug!(
                             "Loopback output node {} has new ports but no links, retrying route to hardware",
                             loopback_id
                         );
                         let target_device_id = self.get_master_output_device_id();
+                        self.state.pending_route_loopbacks.insert(loopback_id);
                         self.send_pw_command(PwCommand::RouteChannelToDevice {
                             loopback_output_node: loopback_id,
                             target_device_id,
@@ -1021,6 +1030,9 @@ impl DaemonService {
                         .iter()
                         .filter_map(|c| {
                             let loopback_id = c.pw_loopback_output_id?;
+                            if self.state.pending_route_loopbacks.contains(&loopback_id) {
+                                return None;
+                            }
                             let has_links = self
                                 .state
                                 .pw_graph
@@ -1040,6 +1052,7 @@ impl DaemonService {
                             "Hardware sink {} got new port, retrying route for orphaned loopback {}",
                             port_node_id, loopback_id
                         );
+                        self.state.pending_route_loopbacks.insert(loopback_id);
                         self.send_pw_command(PwCommand::RouteChannelToDevice {
                             loopback_output_node: loopback_id,
                             target_device_id: Some(port_node_id),
@@ -1053,6 +1066,9 @@ impl DaemonService {
             }
             PwEvent::LinkAdded(link) => {
                 self.state.pw_graph.links.insert(link.id, link.clone());
+
+                // Clear pending route flag now that a link from this loopback exists
+                self.state.pending_route_loopbacks.remove(&link.output_node);
 
                 // Check if this is a link from an assigned app to the wrong sink.
                 // WirePlumber may create these links competing with our routing.
@@ -1105,6 +1121,7 @@ impl DaemonService {
                     // Route loopback output to master output device
                     // Look up the master output device ID by name
                     let target_device_id = self.get_master_output_device_id();
+                    self.state.pending_route_loopbacks.insert(loopback_id);
                     self.send_pw_command(PwCommand::RouteChannelToDevice {
                         loopback_output_node: loopback_id,
                         target_device_id,
@@ -2038,6 +2055,7 @@ impl DaemonService {
             });
 
             if let Some(loopback_id) = loopback_id {
+                self.state.pending_route_loopbacks.insert(loopback_id);
                 self.send_pw_command(PwCommand::RouteChannelToDevice {
                     loopback_output_node: loopback_id,
                     target_device_id,
@@ -2077,6 +2095,7 @@ impl DaemonService {
             .collect();
 
         for (channel_id, loopback_id) in loopback_info {
+            self.state.pending_route_loopbacks.insert(loopback_id);
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id,
@@ -2334,6 +2353,9 @@ impl DaemonService {
             .iter()
             .filter_map(|c| {
                 let loopback_id = c.pw_loopback_output_id?;
+                if self.state.pending_route_loopbacks.contains(&loopback_id) {
+                    return None;
+                }
                 let has_links = self
                     .state
                     .pw_graph
@@ -2357,6 +2379,7 @@ impl DaemonService {
                 "Fallback: re-routing orphaned channel '{}' (loopback {}) to device {:?}",
                 channel_name, loopback_id, target_device_id
             );
+            self.state.pending_route_loopbacks.insert(loopback_id);
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id,
@@ -2416,6 +2439,18 @@ impl DaemonService {
                 }
             };
 
+            // Skip if a route command is already in flight for this loopback.
+            // This prevents duplicate routing when multiple hardware sinks appear
+            // rapidly (e.g. after sleep/wake) and the first route's links haven't
+            // been confirmed via LinkAdded yet.
+            if self.state.pending_route_loopbacks.contains(&loopback_id) {
+                debug!(
+                    "Channel '{}': loopback {} has pending route, skipping",
+                    c.name, loopback_id
+                );
+                continue;
+            }
+
             // Per-channel output takes priority
             if let Some(ref dev_name) = c.output_device_name {
                 if matches_device(dev_name) {
@@ -2429,22 +2464,20 @@ impl DaemonService {
                 }
             }
 
-            // Master output matches this device (or master is "system-default")
-            if master_matches && c.output_device_name.is_none() {
-                // When master is "system-default", route to whatever the
-                // current system default is, not necessarily this new device
-                let target = if master_is_system_default {
-                    None // resolved later via get_master_output_device_id()
-                } else {
-                    Some(device_node_id)
-                };
-                loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), target));
+            // Master output matches a specific (non-system-default) device
+            if master_matches && !master_is_system_default && c.output_device_name.is_none() {
+                loopbacks_to_route.push((
+                    c.id,
+                    loopback_id,
+                    c.name.clone(),
+                    Some(device_node_id),
+                ));
                 continue;
             }
 
-            // Check if this channel's loopback output has no links (orphaned).
-            // This catches the case where no master output is configured, or
-            // the device was disconnected and links were destroyed.
+            // For channels without a per-channel output (including system-default
+            // master): only re-route if the loopback output is orphaned (no links).
+            // This prevents dual-output when multiple devices appear after sleep/wake.
             if c.output_device_name.is_none() {
                 let has_links = self
                     .state
@@ -2474,6 +2507,7 @@ impl DaemonService {
                 "Re-routing channel '{}' loopback output to device node {:?} (trigger: '{}' node {})",
                 channel_name, target_id, device_desc, device_node_id
             );
+            self.state.pending_route_loopbacks.insert(loopback_id);
             self.send_pw_command(PwCommand::RouteChannelToDevice {
                 loopback_output_node: loopback_id,
                 target_device_id: target_id,
