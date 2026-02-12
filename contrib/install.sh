@@ -8,7 +8,7 @@
 #
 # Options (via environment variables):
 #   SOOTMIX_PREFIX=/usr/local    Install prefix (default: /usr/local)
-#   SOOTMIX_METHOD=source        Installation method: binary or source (default: source)
+#   SOOTMIX_METHOD=binary        Installation method: binary or source (default: binary)
 #   SOOTMIX_VERSION=latest       Version to install (default: latest)
 #
 
@@ -36,7 +36,7 @@ fi
 REPO_URL="https://github.com/FrozenTear/sootmix"
 REPO_NAME="sootmix"
 PREFIX="${SOOTMIX_PREFIX:-/usr/local}"
-METHOD="${SOOTMIX_METHOD:-source}"
+METHOD="${SOOTMIX_METHOD:-binary}"
 VERSION="${SOOTMIX_VERSION:-latest}"
 TEMP_DIR=""
 
@@ -532,7 +532,7 @@ parse_args() {
                 echo ""
                 echo "Options:"
                 echo "  --prefix=PATH    Installation prefix (default: /usr/local)"
-                echo "  --method=METHOD  Installation method: binary or source (default: source)"
+                echo "  --method=METHOD  Installation method: binary or source (default: binary)"
                 echo "  --version=VER    Version to install (default: latest)"
                 echo "  --binary         Shorthand for --method=binary"
                 echo "  --source         Shorthand for --method=source"
@@ -544,11 +544,11 @@ parse_args() {
                 echo "  SOOTMIX_VERSION   Same as --version"
                 echo ""
                 echo "Examples:"
-                echo "  # Install from source (default)"
+                echo "  # Install pre-built binary (default)"
                 echo "  curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh"
                 echo ""
-                echo "  # Install pre-built binary"
-                echo "  curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh -s -- --binary"
+                echo "  # Install from source"
+                echo "  curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh -s -- --source"
                 echo ""
                 echo "  # Install specific version to custom prefix"
                 echo "  curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh -s -- --prefix=/usr --version=0.1.0"
