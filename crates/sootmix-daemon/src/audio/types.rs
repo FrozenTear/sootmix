@@ -201,9 +201,11 @@ impl AudioChannel {
         }
         matches!(
             (self, other),
-            // Mono can connect to left channel
+            // Mono can connect to either stereo channel (for stereo↔mono downmix/upmix)
             (Self::Mono, Self::FrontLeft)
                 | (Self::FrontLeft, Self::Mono)
+                | (Self::Mono, Self::FrontRight)
+                | (Self::FrontRight, Self::Mono)
                 // Unknown channels (e.g. Bluetooth numeric ports like capture_0)
                 // are compatible with any named channel — positional pairing handles order
                 | (Self::Unknown, _)

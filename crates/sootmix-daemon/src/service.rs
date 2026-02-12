@@ -340,9 +340,12 @@ impl PwGraphState {
         let mut used_inputs: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         // First pass: match by compatible channels
+        // When there are more outputs than inputs (e.g. stereo→mono), allow
+        // multiple outputs to link to the same input for downmixing.
+        let allow_reuse = output_ports.len() > input_ports.len();
         for out_port in &output_ports {
             for in_port in &input_ports {
-                if used_inputs.contains(&in_port.id) {
+                if !allow_reuse && used_inputs.contains(&in_port.id) {
                     continue;
                 }
                 if out_port.channel.is_compatible(&in_port.channel) {
