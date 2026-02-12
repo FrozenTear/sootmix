@@ -19,11 +19,11 @@ Audio routing and mixing application for Linux using PipeWire.
 ### Quick Install (Debian/Ubuntu/Fedora/Arch)
 
 ```bash
-# Install from source
+# Install pre-built binary (default)
 curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh
 
-# Install pre-built binary
-curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh -s -- --binary
+# Install from source
+curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh -s -- --source
 ```
 
 ### Arch Linux (AUR)
