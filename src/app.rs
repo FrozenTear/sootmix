@@ -3532,6 +3532,26 @@ impl SootMix {
         let output_node = link.output_node;
         let input_node = link.input_node;
 
+        // Destroy rogue meter links: WirePlumber may connect meter streams to
+        // hardware devices despite node.autoconnect=false. Meters should only
+        // receive audio from their virtual sink's monitor ports.
+        let input_is_meter = self.state.pw_graph.nodes.get(&input_node)
+            .map(|n| n.name.starts_with("sootmix.meter."))
+            .unwrap_or(false);
+        if input_is_meter {
+            let output_is_our_sink = self.state.pw_graph.nodes.get(&output_node)
+                .map(|n| n.name.starts_with("sootmix."))
+                .unwrap_or(false);
+            if !output_is_our_sink {
+                warn!(
+                    "Destroying rogue meter link: hardware node {} -> meter node {}",
+                    output_node, input_node
+                );
+                self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+            }
+            return;
+        }
+
         // Only care about links TO non-sootmix sinks
         let is_our_sink = self.state.channels.iter()
             .any(|c| c.pw_sink_id == Some(input_node));

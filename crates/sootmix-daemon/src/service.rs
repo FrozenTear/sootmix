@@ -2478,9 +2478,11 @@ impl DaemonService {
                 continue;
             }
 
-            // For channels without a per-channel output (including system-default
-            // master): only re-route if the loopback output is orphaned (no links).
-            // This prevents dual-output when multiple devices appear after sleep/wake.
+            // For channels without a per-channel output:
+            // - Always re-route if orphaned (no links)
+            // - For system-default master: also re-route if current links go to a
+            //   device that is no longer the system default (e.g. user connected a
+            //   bluetooth headset and it became the new default)
             if c.output_device_name.is_none() {
                 let has_links = self
                     .state
@@ -2496,6 +2498,26 @@ impl DaemonService {
 
                 if !has_links {
                     loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), None));
+                } else if master_is_system_default {
+                    // Check if existing links still point to the current system default.
+                    // If the default changed (e.g. bluetooth connected), re-route.
+                    let current_default = crate::audio::routing::get_default_sink_id();
+                    if let Some(default_id) = current_default {
+                        let linked_to_default = self
+                            .state
+                            .pw_graph
+                            .links
+                            .values()
+                            .any(|l| l.output_node == loopback_id && l.input_node == default_id);
+                        if !linked_to_default {
+                            debug!(
+                                "Channel '{}': linked to non-default device, re-routing to default {}",
+                                c.name, default_id
+                            );
+                            loopbacks_to_route
+                                .push((c.id, loopback_id, c.name.clone(), None));
+                        }
+                    }
                 }
             }
         }
