@@ -4454,7 +4454,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "abi_stable",
  "async-stream",
@@ -4494,7 +4494,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-daemon"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "abi_stable",
  "bytemuck",
@@ -4523,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-ipc"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -4533,7 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-plugin-api"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "abi_stable",
  "serde",
@@ -4541,7 +4541,7 @@ dependencies = [
 
 [[package]]
 name = "sootmix-rnnoise-ladspa"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "nnnoiseless",
 ]
