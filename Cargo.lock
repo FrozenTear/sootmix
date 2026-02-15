@@ -2028,6 +2028,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced_drop"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d381771f7123ba5d809485f446235d32b498c6850dde6ba9dd8cceb353e5fda8"
+dependencies = [
+ "iced",
+ "iced_core",
+ "iced_runtime",
+ "iced_widget",
+]
+
+[[package]]
 name = "iced_futures"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4463,6 +4475,7 @@ dependencies = [
  "flate2",
  "futures",
  "iced",
+ "iced_drop",
  "ksni",
  "libloading 0.8.9",
  "libspa",

@@ -202,6 +202,26 @@ impl DaemonDbusService {
         Ok(())
     }
 
+    /// Move a channel left or right within its kind group.
+    async fn move_channel(
+        &self,
+        channel_id: &str,
+        direction: i32,
+    ) -> zbus::fdo::Result<()> {
+        debug!("D-Bus: move_channel({}, {})", channel_id, direction);
+        {
+            let mut service = self
+                .service
+                .lock()
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            service.process_pw_events();
+            service
+                .move_channel(channel_id, direction)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     // ==================== Volume/Mute ====================
 
     /// Set channel volume in dB.

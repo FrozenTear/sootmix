@@ -24,6 +24,7 @@ trait Daemon {
     fn create_input_channel(&self, name: &str) -> ZbusResult<String>;
     fn delete_channel(&self, channel_id: &str) -> ZbusResult<()>;
     fn rename_channel(&self, channel_id: &str, name: &str) -> ZbusResult<()>;
+    fn move_channel(&self, channel_id: &str, direction: i32) -> ZbusResult<()>;
     fn set_channel_volume(&self, channel_id: &str, volume_db: f64) -> ZbusResult<()>;
     fn set_channel_mute(&self, channel_id: &str, muted: bool) -> ZbusResult<()>;
     fn set_channel_noise_suppression(&self, channel_id: &str, enabled: bool) -> ZbusResult<()>;
@@ -211,6 +212,13 @@ impl DaemonClient {
     pub async fn rename_channel(&self, channel_id: &str, name: &str) -> Result<(), DaemonClientError> {
         debug!("Renaming channel {} to {}", channel_id, name);
         self.proxy.rename_channel(channel_id, name).await
+            .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
+    }
+
+    /// Move a channel left or right within its kind group.
+    pub async fn move_channel(&self, channel_id: &str, direction: i32) -> Result<(), DaemonClientError> {
+        debug!("Moving channel {} by {}", channel_id, direction);
+        self.proxy.move_channel(channel_id, direction).await
             .map_err(|e| DaemonClientError::MethodCallFailed(e.to_string()))
     }
 
@@ -402,6 +410,7 @@ pub enum DaemonCommand {
     SetChannelNoiseSuppression { channel_id: String, enabled: bool },
     SetChannelVadThreshold { channel_id: String, threshold: f64 },
     SetChannelInputGain { channel_id: String, gain_db: f64 },
+    MoveChannel { channel_id: String, direction: i32 },
 }
 
 /// Global command sender for the daemon subscription.
@@ -771,6 +780,9 @@ async fn handle_daemon_command(
         }
         DaemonCommand::SetChannelInputGain { channel_id, gain_db } => {
             client.set_channel_input_gain(&channel_id, gain_db).await?;
+        }
+        DaemonCommand::MoveChannel { channel_id, direction } => {
+            client.move_channel(&channel_id, direction).await?;
         }
     }
     Ok(())

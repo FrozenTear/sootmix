@@ -7,7 +7,8 @@
 use crate::audio::types::{PwLink, PwNode, PwPort};
 use crate::config::eq_preset::EqPreset;
 use crate::daemon_client::DaemonEvent;
-use crate::state::SnapshotSlot;
+use crate::state::{ChannelFilter, SnapshotSlot};
+use iced::advanced::widget::Id as WidgetId;
 use uuid::Uuid;
 
 /// All messages in the application.
@@ -46,6 +47,22 @@ pub enum Message {
     CancelDrag,
     /// Drop the dragged app onto a channel.
     DropAppOnChannel(Uuid),
+
+    /// Move a channel left within its kind group.
+    MoveChannelLeft(Uuid),
+    /// Move a channel right within its kind group.
+    MoveChannelRight(Uuid),
+    /// Set the channel filter (All, Outputs, Inputs).
+    SetChannelFilter(ChannelFilter),
+
+    /// Channel dropped at a point (source_channel_id, cursor_point, drag_bounds).
+    DropChannel(Uuid, iced::Point, iced::Rectangle),
+    /// Zone resolution result for channel drop (source_channel_id, zones).
+    HandleChannelDrop(Uuid, Vec<(WidgetId, iced::Rectangle)>),
+    /// App dropped at a point (node_id, app_identifier, cursor_point, drag_bounds).
+    DropApp(u32, String, iced::Point, iced::Rectangle),
+    /// Zone resolution result for app drop (node_id, app_identifier, zones).
+    HandleAppDrop(u32, String, Vec<(WidgetId, iced::Rectangle)>),
 
     /// Master volume changed.
     MasterVolumeChanged(f32),

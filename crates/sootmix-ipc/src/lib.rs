@@ -90,19 +90,60 @@ pub struct AppInfo {
     pub binary: String,
     /// Icon name hint (if available).
     pub icon: String,
+    /// Media name from PipeWire (e.g., page title for Chromium PWAs).
+    pub media_name: String,
     /// PipeWire node ID.
     pub node_id: u32,
 }
 
 impl AppInfo {
     /// Get identifier used for matching and assignment.
+    /// Only prefers media_name for generic Chromium/Electron apps where the app name
+    /// is unhelpful. For distinctive apps (Firefox, Zen, etc.), uses app name/binary.
     pub fn identifier(&self) -> &str {
+        if is_generic_app_identity(&self.name, &self.binary) {
+            if !self.media_name.is_empty() && !is_generic_media_name(&self.media_name) {
+                return &self.media_name;
+            }
+        }
         if !self.binary.is_empty() {
             &self.binary
         } else {
             &self.name
         }
     }
+}
+
+/// Check if a media name is generic/unhelpful for identification.
+fn is_generic_media_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"
+    )
+}
+
+/// Check if an app's name/binary is generic (Chromium/Electron), meaning we
+/// should prefer media_name or PID-resolved name for identification.
+/// For apps with distinctive names (Firefox, Zen, Discord native), the app name is better.
+fn is_generic_app_identity(name: &str, binary: &str) -> bool {
+    let generic_names = [
+        "Chromium",
+        "Chrome",
+        "Google Chrome",
+        "Microsoft Edge",
+        "Brave Browser",
+    ];
+    let generic_binaries = [
+        "electron",
+        "chromium",
+        "chrome",
+        "google-chrome",
+        "msedge",
+        "brave",
+    ];
+
+    generic_names.iter().any(|g| name == *g)
+        || generic_binaries.iter().any(|g| binary == *g)
 }
 
 /// Information about an audio output device.

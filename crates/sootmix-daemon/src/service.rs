@@ -206,17 +206,234 @@ fn db_to_linear(db: f32) -> f32 {
     }
 }
 
+/// Check if a media name is generic/unhelpful for identification.
+fn is_generic_media_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"
+    )
+}
+
+/// Check if an app's name/binary is generic (Chromium/Electron), meaning we
+/// should prefer media_name or PID-resolved name for identification.
+fn is_generic_app_identity(name: &str, binary: &str) -> bool {
+    let generic_names = [
+        "Chromium",
+        "Chrome",
+        "Google Chrome",
+        "Microsoft Edge",
+        "Brave Browser",
+    ];
+    let generic_binaries = [
+        "electron",
+        "chromium",
+        "chrome",
+        "google-chrome",
+        "msedge",
+        "brave",
+    ];
+
+    generic_names.iter().any(|g| name == *g)
+        || generic_binaries.iter().any(|g| binary == *g)
+}
+
+/// Well-known domain-to-friendly-name mapping for Chromium PWAs.
+fn friendly_name_from_url(url: &str) -> Option<String> {
+    // Extract the domain from the URL
+    let domain = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()?;
+
+    // Well-known domains
+    let name = match domain {
+        "music.youtube.com" => "YouTube Music",
+        "youtube.com" | "www.youtube.com" => "YouTube",
+        "discord.com" | "www.discord.com" => "Discord",
+        "open.spotify.com" => "Spotify Web",
+        "web.whatsapp.com" => "WhatsApp",
+        "web.telegram.org" => "Telegram",
+        "meet.google.com" => "Google Meet",
+        "teams.microsoft.com" => "Teams",
+        "netflix.com" | "www.netflix.com" => "Netflix",
+        "twitch.tv" | "www.twitch.tv" => "Twitch",
+        "soundcloud.com" | "www.soundcloud.com" => "SoundCloud",
+        "tidal.com" | "listen.tidal.com" => "Tidal",
+        _ => {
+            // Generic fallback: extract main domain part and titlecase it
+            // e.g., "app.example.com" → "Example"
+            let parts: Vec<&str> = domain.split('.').collect();
+            let main = if parts.len() >= 2 {
+                parts[parts.len() - 2]
+            } else {
+                parts[0]
+            };
+            return Some(prettify_package_name(main));
+        }
+    };
+    Some(name.to_string())
+}
+
+/// Extract app name from an Electron .asar path or binary path.
+fn app_name_from_path(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    if path.contains("app.asar") {
+        // e.g., "/usr/lib/youtube-music/app.asar" → parent dir name "youtube-music"
+        let parent = p.parent()?;
+        let dir_name = parent.file_name()?.to_str()?;
+        Some(prettify_package_name(dir_name))
+    } else {
+        // e.g., "/opt/discord/Discord" → file stem "Discord"
+        let stem = p.file_stem()?.to_str()?;
+        // Skip generic binary names
+        if matches!(stem, "electron" | "chromium" | "chrome" | "google-chrome") {
+            None
+        } else {
+            Some(prettify_package_name(stem))
+        }
+    }
+}
+
+/// Convert a package-style name to a friendly display name.
+/// e.g., "youtube-music-desktop" → "Youtube Music Desktop"
+fn prettify_package_name(name: &str) -> String {
+    name.split(|c: char| c == '-' || c == '_')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    format!("{}{}", upper, chars.as_str())
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Check cmdline args for Chromium PWA, Electron, or user-data-dir identifiers.
+fn identify_from_cmdline_args(args: &[String]) -> Option<String> {
+    // Check for --app=<URL> (Chromium PWA)
+    for arg in args {
+        if let Some(url) = arg.strip_prefix("--app=") {
+            if let Some(name) = friendly_name_from_url(url) {
+                return Some(name);
+            }
+        }
+    }
+    // Check for Electron app (.asar in args)
+    for arg in args {
+        if arg.contains(".asar") {
+            if let Some(name) = app_name_from_path(arg) {
+                return Some(name);
+            }
+        }
+    }
+    // Check --user-data-dir (Electron/Chromium audio subprocesses)
+    // e.g., --user-data-dir=/home/soot/.config/YouTube Music → "YouTube Music"
+    for arg in args {
+        if let Some(dir) = arg.strip_prefix("--user-data-dir=") {
+            if let Some(name) = std::path::Path::new(dir).file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() && !matches!(name, "chromium" | "chrome" | "google-chrome" | "BraveSoftware" | "microsoft-edge") {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a friendly app name by reading /proc/<pid>/cmdline.
+/// Returns None if PID is unavailable or cmdline doesn't reveal anything useful.
+fn resolve_app_name_from_pid(pid_str: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid_str)).ok()?;
+    let args: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+
+    if args.is_empty() {
+        return None;
+    }
+
+    if let Some(name) = identify_from_cmdline_args(&args) {
+        return Some(name);
+    }
+
+    // Walk up the process tree to find identifying info
+    if let Some(name) = resolve_name_from_parent_pid(pid_str) {
+        return Some(name);
+    }
+
+    // Check binary path for distinctive name
+    app_name_from_path(&args[0])
+}
+
+fn resolve_name_from_parent_pid(pid_str: &str) -> Option<String> {
+    let mut current_pid = pid_str.to_string();
+    for _ in 0..10 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", current_pid)).ok()?;
+        let ppid = status
+            .lines()
+            .find(|l| l.starts_with("PPid:"))?
+            .split_whitespace()
+            .nth(1)?
+            .to_string();
+
+        if ppid == "0" || ppid == "1" {
+            return None;
+        }
+
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", &ppid)).ok()?;
+        let args: Vec<String> = cmdline
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+
+        if let Some(name) = identify_from_cmdline_args(&args) {
+            return Some(name);
+        }
+        if let Some(first) = args.first() {
+            if let Some(name) = app_name_from_path(first) {
+                return Some(name);
+            }
+        }
+
+        current_pid = ppid;
+    }
+    None
+}
+
 /// Internal app info.
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub node_id: u32,
     pub name: String,
     pub binary: Option<String>,
+    pub media_name: Option<String>,
 }
 
 impl AppState {
     pub fn identifier(&self) -> &str {
-        self.binary.as_deref().unwrap_or(&self.name)
+        let binary = self.binary.as_deref().unwrap_or("");
+        if is_generic_app_identity(&self.name, binary) {
+            if let Some(ref media) = self.media_name {
+                if !media.is_empty() && !is_generic_media_name(media) {
+                    return media;
+                }
+            }
+        }
+        if !binary.is_empty() {
+            binary
+        } else {
+            &self.name
+        }
     }
 
     pub fn to_app_info(&self) -> AppInfo {
@@ -225,6 +442,7 @@ impl AppState {
             name: self.name.clone(),
             binary: self.binary.clone().unwrap_or_default(),
             icon: String::new(),
+            media_name: self.media_name.clone().unwrap_or_default(),
             node_id: self.node_id,
         }
     }
@@ -494,20 +712,42 @@ impl DaemonState {
                     && !name.contains("loopback")
                     && !name.starts_with("filter-chain")
             })
-            .map(|node| AppState {
-                node_id: node.id,
-                name: node
-                    .app_name
-                    .clone()
-                    .or_else(|| {
-                        if !node.description.is_empty() {
-                            Some(node.description.clone())
-                        } else {
-                            None
+            .map(|node| {
+                let mut media_name = node.media_name.clone();
+
+                // If media_name is missing/generic, or the app itself is generic
+                // (Chromium/Electron), try PID-based resolution
+                let media_is_generic = media_name
+                    .as_deref()
+                    .map_or(true, |m| m.is_empty() || is_generic_media_name(m));
+                let app_is_generic = is_generic_app_identity(
+                    node.app_name.as_deref().unwrap_or(""),
+                    node.binary_name.as_deref().unwrap_or(""),
+                );
+                if media_is_generic || app_is_generic {
+                    if let Some(pid) = node.properties.get("application.process.id") {
+                        if let Some(resolved) = resolve_app_name_from_pid(pid) {
+                            media_name = Some(resolved);
                         }
-                    })
-                    .unwrap_or_else(|| node.name.clone()),
-                binary: node.binary_name.clone(),
+                    }
+                }
+
+                AppState {
+                    node_id: node.id,
+                    name: node
+                        .app_name
+                        .clone()
+                        .or_else(|| {
+                            if !node.description.is_empty() {
+                                Some(node.description.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| node.name.clone()),
+                    binary: node.binary_name.clone(),
+                    media_name,
+                }
             })
             .collect();
     }
@@ -575,8 +815,14 @@ impl DaemonService {
 
     /// Update available apps and emit D-Bus signals for changes.
     fn update_apps_and_emit_signals(&mut self) {
-        // Capture old app node IDs
+        // Capture old app state: node_id -> identifier (for detecting identity changes)
         let old_app_ids: HashSet<u32> = self.state.apps.iter().map(|a| a.node_id).collect();
+        let old_identifiers: HashMap<u32, String> = self
+            .state
+            .apps
+            .iter()
+            .map(|a| (a.node_id, a.identifier().to_string()))
+            .collect();
 
         // Update the app list
         self.state.update_available_apps();
@@ -584,14 +830,25 @@ impl DaemonService {
         // Find new and removed apps
         let new_app_ids: HashSet<u32> = self.state.apps.iter().map(|a| a.node_id).collect();
 
-        // Emit signals for newly discovered apps
+        // Emit signals for newly discovered apps or apps whose identity changed
         for app in &self.state.apps {
             if !old_app_ids.contains(&app.node_id) {
                 debug!(
                     "Emitting AppDiscovered signal for: {} (node {})",
-                    app.name, app.node_id
+                    app.identifier(), app.node_id
                 );
                 self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
+            } else if let Some(old_id) = old_identifiers.get(&app.node_id) {
+                if old_id != app.identifier() {
+                    // Identity changed (e.g., PID resolution resolved "Chromium" → "equibop")
+                    // Re-emit as remove + discover so the GUI updates
+                    debug!(
+                        "App identity changed: {} -> {} (node {})",
+                        old_id, app.identifier(), app.node_id
+                    );
+                    self.emit_signal(SignalEvent::AppRemoved(app.node_id.to_string()));
+                    self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
+                }
             }
         }
 
@@ -1387,6 +1644,42 @@ impl DaemonService {
             });
         }
 
+        self.save_config();
+        Ok(())
+    }
+
+    /// Move a channel left (-1) or right (+1) within its kind group.
+    pub fn move_channel(&mut self, channel_id: &str, direction: i32) -> Result<(), ServiceError> {
+        let id = Uuid::parse_str(channel_id)
+            .map_err(|_| ServiceError::ChannelNotFound(channel_id.to_string()))?;
+
+        let Some(idx) = self.state.channels.iter().position(|c| c.id == id) else {
+            return Err(ServiceError::ChannelNotFound(channel_id.to_string()));
+        };
+        let kind = self.state.channels[idx].kind;
+
+        // Collect indices of channels with the same kind
+        let group_indices: Vec<usize> = self.state.channels.iter()
+            .enumerate()
+            .filter(|(_, c)| c.kind == kind)
+            .map(|(i, _)| i)
+            .collect();
+
+        let Some(pos_in_group) = group_indices.iter().position(|&i| i == idx) else {
+            return Ok(());
+        };
+
+        let target_pos = if direction < 0 {
+            if pos_in_group == 0 { return Ok(()); }
+            pos_in_group - 1
+        } else {
+            if pos_in_group >= group_indices.len() - 1 { return Ok(()); }
+            pos_in_group + 1
+        };
+
+        let target_idx = group_indices[target_pos];
+        debug!("Moving channel {} from index {} to {}", channel_id, idx, target_idx);
+        self.state.channels.swap(idx, target_idx);
         self.save_config();
         Ok(())
     }

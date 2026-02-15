@@ -40,18 +40,18 @@ use uuid::Uuid;
 /// * `is_selected` - Whether this channel is currently selected for the focus panel
 pub fn channel_strip<'a>(
     channel: &'a MixerChannel,
-    dragging: Option<&'a (u32, String)>,
     editing: Option<&'a (Uuid, String)>,
     has_active_snapshot: bool,
     available_outputs: &'a [OutputDevice],
     available_inputs: &'a [InputDevice],
     is_selected: bool,
+    is_first_in_group: bool,
+    is_last_in_group: bool,
 ) -> Element<'a, Message> {
     let id = channel.id;
     let volume_db = channel.volume_db;
     let muted = channel.muted;
     let name = channel.name.clone();
-    let is_drop_target = dragging.is_some();
     let output_device_name = channel.output_device_name.clone();
     let is_input = channel.kind == ChannelKind::Input;
 
@@ -212,6 +212,41 @@ pub fn channel_strip<'a>(
                 }
             })
             .on_press(Message::SaveChannelToSnapshot(id))
+            .into()
+    } else {
+        Space::new().width(0).height(0).into()
+    };
+
+    // === MOVE ARROW BUTTONS ===
+    let arrow_style = |_theme: &Theme, status: button::Status| {
+        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if is_hovered {
+                SURFACE_LIGHT
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: if is_hovered { TEXT } else { TEXT_DIM },
+            border: Border::default().rounded(RADIUS_SM),
+            ..button::Style::default()
+        }
+    };
+
+    let left_btn: Element<Message> = if !is_first_in_group {
+        button(text("\u{25C0}").size(TEXT_SMALL).color(TEXT_DIM))
+            .padding([SPACING_XS, SPACING_XS])
+            .style(arrow_style)
+            .on_press(Message::MoveChannelLeft(id))
+            .into()
+    } else {
+        Space::new().width(0).height(0).into()
+    };
+
+    let right_btn: Element<Message> = if !is_last_in_group {
+        button(text("\u{25B6}").size(TEXT_SMALL).color(TEXT_DIM))
+            .padding([SPACING_XS, SPACING_XS])
+            .style(arrow_style)
+            .on_press(Message::MoveChannelRight(id))
             .into()
     } else {
         Space::new().width(0).height(0).into()
@@ -522,8 +557,8 @@ pub fn channel_strip<'a>(
 
     // === ASSEMBLE CHANNEL STRIP ===
     let content = column![
-        // Header: type badge (if input) + name + delete
-        row![type_badge, name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
+        // Header: type badge (if input) + name + arrows + delete
+        row![type_badge, name_element, Space::new().width(Fill), left_btn, right_btn, delete_button,].align_y(Alignment::Center),
         Space::new().height(SPACING_SM),
         // Controls: EQ + FX
         fx_btn,
@@ -545,15 +580,12 @@ pub fn channel_strip<'a>(
     .spacing(SPACING_XS);
 
     // === CONTAINER STYLING ===
-    // Border color based on selection and drop target state
-    let border_color = if is_drop_target {
-        SOOTMIX_DARK.accent_warm
-    } else if is_selected {
+    let border_color = if is_selected {
         PRIMARY
     } else {
         SOOTMIX_DARK.border_subtle
     };
-    let border_width = if is_drop_target || is_selected { 2.0 } else { 1.0 };
+    let border_width = if is_selected { 2.0 } else { 1.0 };
 
     let strip_container = container(content)
         .width(CHANNEL_STRIP_WIDTH)
@@ -572,66 +604,7 @@ pub fn channel_strip<'a>(
             ..container::Style::default()
         });
 
-    // === DROP TARGET OR SELECTABLE WRAPPER ===
-    if is_drop_target {
-        // Drop target mode: click to assign app
-        button(strip_container)
-            .padding(0)
-            .style(|_theme: &Theme, status| {
-                let is_hovered =
-                    matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: Some(Background::Color(Color::TRANSPARENT)),
-                    border: Border::default()
-                        .rounded(RADIUS)
-                        .color(if is_hovered {
-                            SOOTMIX_DARK.accent_warm
-                        } else {
-                            PRIMARY
-                        })
-                        .width(if is_hovered { 3.0 } else { 2.0 }),
-                    shadow: if is_hovered {
-                        iced::Shadow {
-                            color: Color {
-                                a: 0.4,
-                                ..SOOTMIX_DARK.accent_warm
-                            },
-                            offset: iced::Vector::new(0.0, 0.0),
-                            blur_radius: 12.0,
-                        }
-                    } else {
-                        iced::Shadow::default()
-                    },
-                    ..button::Style::default()
-                }
-            })
-            .on_press(Message::DropAppOnChannel(id))
-            .into()
-    } else {
-        // Normal mode: click to select channel for focus panel
-        button(strip_container)
-            .padding(0)
-            .style(move |_theme: &Theme, status| {
-                let is_hovered =
-                    matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: Some(Background::Color(Color::TRANSPARENT)),
-                    border: Border::default()
-                        .rounded(RADIUS)
-                        .color(if is_selected {
-                            PRIMARY
-                        } else if is_hovered {
-                            SOOTMIX_DARK.border_emphasis
-                        } else {
-                            Color::TRANSPARENT
-                        })
-                        .width(if is_selected { 2.0 } else if is_hovered { 1.0 } else { 0.0 }),
-                    ..button::Style::default()
-                }
-            })
-            .on_press(Message::SelectChannel(Some(id)))
-            .into()
-    }
+    strip_container.into()
 }
 
 // ============================================================================

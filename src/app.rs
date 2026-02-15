@@ -511,6 +511,117 @@ impl SootMix {
                     }
                 }
             }
+            // ==================== Channel Reorder ====================
+            Message::MoveChannelLeft(channel_id) => {
+                if self.daemon_connected {
+                    if let Err(e) = daemon_client::send_daemon_command(
+                        daemon_client::DaemonCommand::MoveChannel {
+                            channel_id: channel_id.to_string(),
+                            direction: -1,
+                        }
+                    ) {
+                        error!("Failed to send move channel command to daemon: {}", e);
+                    }
+                }
+                self.move_channel(channel_id, -1);
+                self.save_config();
+            }
+            Message::MoveChannelRight(channel_id) => {
+                if self.daemon_connected {
+                    if let Err(e) = daemon_client::send_daemon_command(
+                        daemon_client::DaemonCommand::MoveChannel {
+                            channel_id: channel_id.to_string(),
+                            direction: 1,
+                        }
+                    ) {
+                        error!("Failed to send move channel command to daemon: {}", e);
+                    }
+                }
+                self.move_channel(channel_id, 1);
+                self.save_config();
+            }
+
+            // ==================== Channel Drag & Drop ====================
+            Message::DropChannel(source_id, point, _rect) => {
+                return iced_drop::zones_on_point(
+                    move |zones| Message::HandleChannelDrop(source_id, zones),
+                    point,
+                    None,
+                    None,
+                );
+            }
+            Message::HandleChannelDrop(source_id, zones) => {
+                use iced::advanced::widget::Id as WidgetId;
+
+                // Find which channel zone was dropped on
+                if let Some(target_id) = zones.iter().find_map(|(zone_id, _)| {
+                    self.state.channels.iter().find(|c| {
+                        *zone_id == WidgetId::from(format!("channel-zone-{}", c.id))
+                    }).map(|c| c.id)
+                }) {
+                    if target_id != source_id {
+                        // Only allow reordering within the same kind group
+                        let source_kind = self.state.channel(source_id).map(|c| c.kind);
+                        let target_kind = self.state.channel(target_id).map(|c| c.kind);
+                        if source_kind == target_kind {
+                            if let (Some(src_idx), Some(tgt_idx)) = (
+                                self.state.channels.iter().position(|c| c.id == source_id),
+                                self.state.channels.iter().position(|c| c.id == target_id),
+                            ) {
+                                debug!("DnD: moving channel from index {} to {}", src_idx, tgt_idx);
+                                // Move element from src_idx to tgt_idx
+                                let channel = self.state.channels.remove(src_idx);
+                                let insert_idx = if src_idx < tgt_idx { tgt_idx } else { tgt_idx };
+                                self.state.channels.insert(insert_idx, channel);
+                                self.save_config();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ==================== App Drag & Drop (real DnD) ====================
+            Message::DropApp(node_id, app_id, point, _rect) => {
+                return iced_drop::zones_on_point(
+                    move |zones| Message::HandleAppDrop(node_id, app_id.clone(), zones),
+                    point,
+                    None,
+                    None,
+                );
+            }
+            Message::HandleAppDrop(app_node_id, app_id, zones) => {
+                use iced::advanced::widget::Id as WidgetId;
+
+                // Find which channel zone was dropped on
+                if let Some(channel_id) = zones.iter().find_map(|(zone_id, _)| {
+                    self.state.channels.iter().find(|c| {
+                        c.kind == crate::state::ChannelKind::Output
+                            && *zone_id == WidgetId::from(format!("channel-zone-{}", c.id))
+                    }).map(|c| c.id)
+                }) {
+                    info!("DnD: assigning app {} to channel {}", app_id, channel_id);
+                    if self.daemon_connected {
+                        if !self.cmd_assign_app(app_node_id, channel_id) {
+                            self.state.last_error = Some("Failed to assign app".to_string());
+                        }
+                    } else {
+                        let has_sink = self.state.channel(channel_id).and_then(|c| c.pw_sink_id).is_some();
+                        if has_sink {
+                            if !self.cmd_assign_app(app_node_id, channel_id) {
+                                self.state.last_error = Some("No matching ports found".to_string());
+                            }
+                        } else {
+                            self.state.last_error = Some("Channel has no sink - try again".to_string());
+                        }
+                    }
+                }
+            }
+
+            // ==================== Channel Filter ====================
+            Message::SetChannelFilter(filter) => {
+                self.state.channel_filter = filter;
+            }
+
             Message::AppAssigned(channel_id, app_id) => {
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     if !channel.assigned_apps.contains(&app_id) {
@@ -2190,31 +2301,119 @@ impl SootMix {
         }
     }
 
+    /// Build a channel column element (strip + app card) for the mixer view.
+    /// Each column is a droppable zone for channel reordering and app assignment.
+    fn build_channel_col<'a>(
+        &'a self,
+        c: &'a MixerChannel,
+        output_ids: &[Uuid],
+        input_ids: &[Uuid],
+    ) -> Element<'a, Message> {
+        use crate::state::ChannelKind;
+        use iced::advanced::widget::Id as WidgetId;
+
+        let channel_id = c.id;
+        let editing = self.state.editing_channel.as_ref();
+        let has_active_snapshot = self.state.active_snapshot.is_some();
+        let is_selected = self.state.selected_channel == Some(c.id);
+        let group = if c.kind == ChannelKind::Output { output_ids } else { input_ids };
+        let is_first = group.first() == Some(&c.id);
+        let is_last = group.last() == Some(&c.id);
+        let strip = channel_strip(
+            c, editing, has_active_snapshot,
+            &self.state.available_outputs, &self.state.available_inputs,
+            is_selected, is_first, is_last,
+        );
+        let card = app_card(c);
+        // Wrap the channel column in a container with a zone ID for drop detection
+        let zone_id = WidgetId::from(format!("channel-zone-{}", c.id));
+        let channel_col = container(
+            column![strip, Space::new().height(SPACING_SM), card]
+                .align_x(Alignment::Center)
+        ).id(zone_id);
+
+        // Wrap in droppable for channel reordering DnD
+        iced_drop::droppable(channel_col)
+            .on_drop(move |point, rect| Message::DropChannel(channel_id, point, rect))
+            .on_click(Message::SelectChannel(Some(channel_id)))
+            .drag_overlay(true)
+            .into()
+    }
+
     /// View the channel strips area.
     ///
     // TODO: Master position should be configurable (left/right) in the future.
     fn view_channel_strips(&self) -> Element<'_, Message> {
-        let dragging = self.state.dragging_app.as_ref();
-        let editing = self.state.editing_channel.as_ref();
-        let has_active_snapshot = self.state.active_snapshot.is_some();
-        let selected_channel = self.state.selected_channel;
+        use crate::state::{ChannelFilter, ChannelKind};
 
-        // Build channel strip + app card columns
-        let available_outputs = &self.state.available_outputs;
-        let available_inputs = &self.state.available_inputs;
-        let channel_columns: Vec<Element<Message>> = self
-            .state
-            .channels
-            .iter()
-            .map(|c| {
-                let is_selected = selected_channel == Some(c.id);
-                let strip = channel_strip(c, dragging, editing, has_active_snapshot, available_outputs, available_inputs, is_selected);
-                let card = app_card(c);
-                column![strip, Space::new().height(SPACING_SM), card]
-                    .align_x(Alignment::Center)
-                    .into()
-            })
+        let filter = self.state.channel_filter;
+
+        // Collect IDs for each kind group (for first/last detection)
+        let output_ids: Vec<Uuid> = self.state.channels.iter()
+            .filter(|c| c.kind == ChannelKind::Output)
+            .map(|c| c.id)
             .collect();
+        let input_ids: Vec<Uuid> = self.state.channels.iter()
+            .filter(|c| c.kind == ChannelKind::Input)
+            .map(|c| c.id)
+            .collect();
+
+        // Build channel columns based on filter
+        let channel_columns: Vec<Element<Message>> = match filter {
+            ChannelFilter::All => {
+                let mut cols: Vec<Element<Message>> = self.state.channels.iter()
+                    .filter(|c| c.kind == ChannelKind::Output)
+                    .map(|c| self.build_channel_col(c, &output_ids, &input_ids))
+                    .collect();
+                let input_cols: Vec<Element<Message>> = self.state.channels.iter()
+                    .filter(|c| c.kind == ChannelKind::Input)
+                    .map(|c| self.build_channel_col(c, &output_ids, &input_ids))
+                    .collect();
+
+                // Add separator between groups if both have channels
+                if !cols.is_empty() && !input_cols.is_empty() {
+                    let group_separator: Element<Message> = container(
+                        column![
+                            Space::new().height(Fill),
+                            container(
+                                text("INPUTS").size(TEXT_CAPTION).color(TEXT_DIM)
+                            )
+                            .padding([SPACING_SM, SPACING_XS])
+                            .style(|_: &Theme| container::Style {
+                                background: Some(Background::Color(SURFACE)),
+                                border: Border::default().rounded(RADIUS_SM),
+                                ..container::Style::default()
+                            }),
+                            Space::new().height(Fill),
+                        ]
+                        .align_x(Alignment::Center)
+                    )
+                    .width(Length::Fixed(3.0))
+                    .height(Fill)
+                    .center_x(Fill)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+                        ..container::Style::default()
+                    })
+                    .into();
+                    cols.push(group_separator);
+                }
+                cols.extend(input_cols);
+                cols
+            }
+            ChannelFilter::Outputs => {
+                self.state.channels.iter()
+                    .filter(|c| c.kind == ChannelKind::Output)
+                    .map(|c| self.build_channel_col(c, &output_ids, &input_ids))
+                    .collect()
+            }
+            ChannelFilter::Inputs => {
+                self.state.channels.iter()
+                    .filter(|c| c.kind == ChannelKind::Input)
+                    .map(|c| self.build_channel_col(c, &output_ids, &input_ids))
+                    .collect()
+            }
+        };
 
         // Master strip (pinned to the left, outside scrollable area)
         let master = master_strip(
@@ -2226,7 +2425,6 @@ impl SootMix {
             self.state.master_recording_enabled,
         );
 
-        // Master column with spacer below to match app card area
         let master_column = column![master]
             .align_x(Alignment::Center);
 
@@ -2239,6 +2437,14 @@ impl SootMix {
             })
             .into();
 
+        // Filter buttons (segment control)
+        let filter_row = row![
+            Self::filter_button("All", ChannelFilter::All, filter),
+            Self::filter_button("Outputs", ChannelFilter::Outputs, filter),
+            Self::filter_button("Inputs", ChannelFilter::Inputs, filter),
+        ]
+        .spacing(SPACING_XS);
+
         // Channel columns in a scrollable row
         let channels_row = row(channel_columns)
             .spacing(SPACING)
@@ -2249,7 +2455,13 @@ impl SootMix {
                 scrollable::Scrollbar::default(),
             ));
 
-        row![master_column, separator, scrollable_channels]
+        let channels_area = column![
+            filter_row,
+            Space::new().height(SPACING_SM),
+            scrollable_channels,
+        ];
+
+        row![master_column, separator, channels_area]
             .spacing(SPACING)
             .align_y(Alignment::Start)
             .into()
@@ -2297,6 +2509,33 @@ impl SootMix {
         ]
         .align_y(Alignment::Center)
         .into()
+    }
+
+    /// Create a filter button element for the channel filter row.
+    fn filter_button(label: &str, target: crate::state::ChannelFilter, current: crate::state::ChannelFilter) -> Element<'_, Message> {
+        let is_active = current == target;
+        button(text(label).size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(move |_theme: &Theme, status| {
+                let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(if is_active {
+                        PRIMARY
+                    } else if is_hovered {
+                        SURFACE_LIGHT
+                    } else {
+                        SURFACE
+                    })),
+                    text_color: if is_active { SOOTMIX_DARK.canvas } else { TEXT },
+                    border: Border::default()
+                        .rounded(RADIUS_SM)
+                        .color(if is_active { PRIMARY } else { SOOTMIX_DARK.border_subtle })
+                        .width(1.0),
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::SetChannelFilter(target))
+            .into()
     }
 
     /// Get the application theme.
@@ -3822,6 +4061,37 @@ impl SootMix {
         }
     }
 
+    /// Move a channel left (-1) or right (+1) within its kind group.
+    fn move_channel(&mut self, channel_id: Uuid, direction: i32) {
+        let Some(idx) = self.state.channels.iter().position(|c| c.id == channel_id) else {
+            return;
+        };
+        let kind = self.state.channels[idx].kind;
+
+        // Collect indices of channels with the same kind
+        let group_indices: Vec<usize> = self.state.channels.iter()
+            .enumerate()
+            .filter(|(_, c)| c.kind == kind)
+            .map(|(i, _)| i)
+            .collect();
+
+        let Some(pos_in_group) = group_indices.iter().position(|&i| i == idx) else {
+            return;
+        };
+
+        let target_pos = if direction < 0 {
+            if pos_in_group == 0 { return; }
+            pos_in_group - 1
+        } else {
+            if pos_in_group >= group_indices.len() - 1 { return; }
+            pos_in_group + 1
+        };
+
+        let target_idx = group_indices[target_pos];
+        debug!("Moving channel {} from index {} to {}", channel_id, idx, target_idx);
+        self.state.channels.swap(idx, target_idx);
+    }
+
     /// Save current mixer configuration to disk.
     fn save_config(&self) {
         if let Some(ref cm) = self.config_manager {
@@ -4123,6 +4393,11 @@ impl SootMix {
                         } else {
                             Some(app_info.icon)
                         },
+                        media_name: if app_info.media_name.is_empty() {
+                            None
+                        } else {
+                            Some(app_info.media_name)
+                        },
                     });
                 }
 
@@ -4244,6 +4519,7 @@ impl SootMix {
                         name: app_info.name,
                         binary: if app_info.binary.is_empty() { None } else { Some(app_info.binary) },
                         icon: if app_info.icon.is_empty() { None } else { Some(app_info.icon) },
+                        media_name: if app_info.media_name.is_empty() { None } else { Some(app_info.media_name) },
                     });
                 }
             }

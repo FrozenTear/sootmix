@@ -147,7 +147,20 @@ fn app_item<'a>(
         .iter()
         .find(|c| c.assigned_apps.iter().any(|a| a == &app_id));
 
-    let display_name = clean_app_name(&app.name);
+    // Use media_name for display only for generic Chromium/Electron apps
+    // (e.g., show "YouTube Music" instead of "Chromium").
+    // For distinctive apps (Zen, Firefox, etc.), use the app name directly.
+    let binary = app.binary.as_deref().unwrap_or("");
+    let is_generic = crate::state::is_generic_app_identity(&app.name, binary);
+    let raw_name = if is_generic {
+        app.media_name
+            .as_deref()
+            .filter(|m| !m.is_empty() && !matches!(*m, "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"))
+            .unwrap_or(&app.name)
+    } else {
+        &app.name
+    };
+    let display_name = clean_app_name(raw_name);
     let is_assigned = assigned_channel.is_some();
 
     let name_text = text(display_name)
@@ -177,27 +190,25 @@ fn app_item<'a>(
     let content = column![name_text, Space::new().height(SPACING_XS), status,]
         .align_x(Alignment::Center);
 
-    let app_id_clone = app_id.clone();
+    let app_id_for_drop = app_id.clone();
+    let app_id_for_click = app_id.clone();
 
-    button(content)
+    let tile = container(content)
         .padding([SPACING_SM, SPACING])
         .width(100)
-        .style(move |_theme: &Theme, status| {
-            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            button::Style {
+        .style(move |_theme: &Theme| {
+            container::Style {
                 background: Some(Background::Color(if is_being_dragged {
                     PRIMARY
-                } else if is_hovered {
-                    SURFACE_LIGHT
                 } else if is_assigned {
                     SURFACE
                 } else {
                     BACKGROUND
                 })),
                 text_color: if is_being_dragged {
-                    SOOTMIX_DARK.canvas
+                    SOOTMIX_DARK.canvas.into()
                 } else {
-                    TEXT
+                    TEXT.into()
                 },
                 border: Border::default()
                     .rounded(RADIUS_SM)
@@ -205,8 +216,6 @@ fn app_item<'a>(
                         PRIMARY
                     } else if is_assigned {
                         SUCCESS
-                    } else if is_hovered {
-                        SOOTMIX_DARK.border_emphasis
                     } else {
                         SOOTMIX_DARK.border_subtle
                     })
@@ -220,10 +229,14 @@ fn app_item<'a>(
                 } else {
                     iced::Shadow::default()
                 },
-                ..button::Style::default()
+                ..container::Style::default()
             }
-        })
-        .on_press(Message::StartDraggingApp(node_id, app_id_clone))
+        });
+
+    iced_drop::droppable(tile)
+        .on_drop(move |point, rect| Message::DropApp(node_id, app_id_for_drop.clone(), point, rect))
+        .on_click(Message::StartDraggingApp(node_id, app_id_for_click))
+        .drag_overlay(true)
         .into()
 }
 
@@ -231,11 +244,10 @@ fn app_item<'a>(
 fn clean_app_name(name: &str) -> String {
     let cleaned = name
         .replace(" (Virtual Sink)", "")
-        .replace("Audio", "")
         .trim()
         .to_string();
 
-    truncate_string(&cleaned, 12)
+    truncate_string(&cleaned, 16)
 }
 
 /// Truncate a string to max length with ellipsis.

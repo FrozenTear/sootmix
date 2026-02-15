@@ -1361,6 +1361,79 @@ fn bind_node_from_global(
     Ok(())
 }
 
+/// Bind a playback stream node to get its full properties via the info event.
+/// The registry global callback only provides a subset of properties; binding
+/// gives us application.process.id, application.process.binary, media.name, etc.
+fn bind_stream_for_info(
+    global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    state: &Rc<RefCell<PwThreadState>>,
+    registry: &pipewire::registry::RegistryRc,
+) -> Result<(), String> {
+    let node_id = global.id;
+
+    if state.borrow().bound_nodes.contains_key(&node_id) {
+        return Ok(());
+    }
+
+    let node: Node = registry
+        .bind(global)
+        .map_err(|e| format!("Failed to bind stream node {}: {:?}", node_id, e))?;
+
+    let state_clone = state.clone();
+    let listener = node
+        .add_listener_local()
+        .info(move |info| {
+            if let Some(props) = info.props() {
+                let mut st = state_clone.borrow_mut();
+                if let Some(pw_node) = st.nodes.get_mut(&node_id) {
+                    let mut changed = false;
+                    // Update properties that weren't in the global callback
+                    for (k, v) in props.iter() {
+                        let val = v.to_string();
+                        if pw_node.properties.get(k).map(|old| old != &val).unwrap_or(true) {
+                            pw_node.properties.insert(k.to_string(), val);
+                            changed = true;
+                        }
+                    }
+                    if pw_node.binary_name.is_none() {
+                        if let Some(binary) = props.get("application.process.binary") {
+                            pw_node.binary_name = Some(binary.to_string());
+                            changed = true;
+                        }
+                    }
+                    if pw_node.media_name.is_none() {
+                        if let Some(media) = props.get("media.name") {
+                            pw_node.media_name = Some(media.to_string());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        debug!(
+                            "Stream info updated: id={}, binary={:?}, media.name={:?}, has_pid={}",
+                            node_id, pw_node.binary_name, pw_node.media_name,
+                            pw_node.properties.contains_key("application.process.id")
+                        );
+                        let updated = pw_node.clone();
+                        let _ = st.event_tx.send(PwEvent::NodeChanged(updated));
+                    }
+                }
+            }
+        })
+        .param(move |_seq, _id, _index, _next, _pod| {})
+        .register();
+
+    state.borrow_mut().bound_nodes.insert(
+        node_id,
+        BoundNode {
+            proxy: node,
+            _listener: listener,
+        },
+    );
+
+    debug!("Bound playback stream {} for property discovery", node_id);
+    Ok(())
+}
+
 fn setup_registry_listener(
     registry: &pipewire::registry::RegistryRc,
     state: Rc<RefCell<PwThreadState>>,
@@ -1401,15 +1474,25 @@ fn setup_registry_listener(
                     if let Some(binary) = props.get("application.process.binary") {
                         node.binary_name = Some(binary.to_string());
                     }
+                    if let Some(media) = props.get("media.name") {
+                        node.media_name = Some(media.to_string());
+                    }
 
                     for (k, v) in props.iter() {
                         node.properties.insert(k.to_string(), v.to_string());
                     }
 
-                    debug!(
-                        "Node added: id={}, name={}, class={:?}",
-                        node.id, node.name, node.media_class
-                    );
+                    if node.is_playback_stream() {
+                        debug!(
+                            "Playback stream: id={}, name={}, app={:?}, binary={:?}, media.name={:?}",
+                            node.id, node.name, node.app_name, node.binary_name, node.media_name
+                        );
+                    } else {
+                        debug!(
+                            "Node added: id={}, name={}, class={:?}",
+                            node.id, node.name, node.media_class
+                        );
+                    }
 
                     let should_bind = node.name.starts_with("sootmix.")
                         || node.media_class == MediaClass::AudioSink;
@@ -1417,6 +1500,12 @@ fn setup_registry_listener(
                     if should_bind {
                         if let Err(e) = bind_node_from_global(global, &state_add, &registry_clone) {
                             warn!("Failed to bind node {}: {}", node.id, e);
+                        }
+                    } else if node.is_playback_stream() {
+                        // Bind playback streams to get full properties (PID, binary, media.name)
+                        // which aren't available in the registry global callback
+                        if let Err(e) = bind_stream_for_info(global, &state_add, &registry_clone) {
+                            warn!("Failed to bind stream {} for info: {}", node.id, e);
                         }
                     }
 

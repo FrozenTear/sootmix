@@ -185,6 +185,15 @@ impl MeterDisplayState {
 // Re-export ChannelKind from the IPC crate for consistency.
 pub use sootmix_ipc::ChannelKind;
 
+/// Filter for which channels to display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelFilter {
+    #[default]
+    All,
+    Outputs,
+    Inputs,
+}
+
 /// A virtual mixer channel created by SootMix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixerChannel {
@@ -402,6 +411,170 @@ pub fn linear_to_db(linear: f32) -> f32 {
     }
 }
 
+/// Well-known domain-to-friendly-name mapping for Chromium PWAs.
+fn friendly_name_from_url(url: &str) -> Option<String> {
+    let domain = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()?;
+
+    let name = match domain {
+        "music.youtube.com" => "YouTube Music",
+        "youtube.com" | "www.youtube.com" => "YouTube",
+        "discord.com" | "www.discord.com" => "Discord",
+        "open.spotify.com" => "Spotify Web",
+        "web.whatsapp.com" => "WhatsApp",
+        "web.telegram.org" => "Telegram",
+        "meet.google.com" => "Google Meet",
+        "teams.microsoft.com" => "Teams",
+        "netflix.com" | "www.netflix.com" => "Netflix",
+        "twitch.tv" | "www.twitch.tv" => "Twitch",
+        "soundcloud.com" | "www.soundcloud.com" => "SoundCloud",
+        "tidal.com" | "listen.tidal.com" => "Tidal",
+        _ => {
+            let parts: Vec<&str> = domain.split('.').collect();
+            let main = if parts.len() >= 2 {
+                parts[parts.len() - 2]
+            } else {
+                parts[0]
+            };
+            return Some(prettify_package_name(main));
+        }
+    };
+    Some(name.to_string())
+}
+
+/// Extract app name from an Electron .asar path or binary path.
+fn app_name_from_path(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    if path.contains("app.asar") {
+        let parent = p.parent()?;
+        let dir_name = parent.file_name()?.to_str()?;
+        Some(prettify_package_name(dir_name))
+    } else {
+        let stem = p.file_stem()?.to_str()?;
+        if matches!(stem, "electron" | "chromium" | "chrome" | "google-chrome") {
+            None
+        } else {
+            Some(prettify_package_name(stem))
+        }
+    }
+}
+
+/// Convert a package-style name to a friendly display name.
+fn prettify_package_name(name: &str) -> String {
+    name.split(|c: char| c == '-' || c == '_')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    format!("{}{}", upper, chars.as_str())
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Check cmdline args for Chromium PWA, Electron, or user-data-dir identifiers.
+fn identify_from_cmdline_args(args: &[String]) -> Option<String> {
+    // Check for --app=<URL> (Chromium PWA)
+    for arg in args {
+        if let Some(url) = arg.strip_prefix("--app=") {
+            if let Some(name) = friendly_name_from_url(url) {
+                return Some(name);
+            }
+        }
+    }
+    // Check for Electron app (.asar in args)
+    for arg in args {
+        if arg.contains(".asar") {
+            if let Some(name) = app_name_from_path(arg) {
+                return Some(name);
+            }
+        }
+    }
+    // Check --user-data-dir (Electron/Chromium audio subprocesses)
+    // e.g., --user-data-dir=/home/soot/.config/YouTube Music → "YouTube Music"
+    for arg in args {
+        if let Some(dir) = arg.strip_prefix("--user-data-dir=") {
+            if let Some(name) = std::path::Path::new(dir).file_name().and_then(|n| n.to_str()) {
+                if !name.is_empty() && !matches!(name, "chromium" | "chrome" | "google-chrome" | "BraveSoftware" | "microsoft-edge") {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a friendly app name by reading /proc/<pid>/cmdline.
+fn resolve_app_name_from_pid(pid_str: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid_str)).ok()?;
+    let args: Vec<String> = cmdline
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+
+    if args.is_empty() {
+        return None;
+    }
+
+    if let Some(name) = identify_from_cmdline_args(&args) {
+        return Some(name);
+    }
+
+    // Walk up the process tree to find identifying info
+    if let Some(name) = resolve_name_from_parent_pid(pid_str) {
+        return Some(name);
+    }
+
+    // Check binary path for distinctive name
+    app_name_from_path(&args[0])
+}
+
+fn resolve_name_from_parent_pid(pid_str: &str) -> Option<String> {
+    let mut current_pid = pid_str.to_string();
+    for _ in 0..10 {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", current_pid)).ok()?;
+        let ppid = status
+            .lines()
+            .find(|l| l.starts_with("PPid:"))?
+            .split_whitespace()
+            .nth(1)?
+            .to_string();
+
+        if ppid == "0" || ppid == "1" {
+            return None;
+        }
+
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", &ppid)).ok()?;
+        let args: Vec<String> = cmdline
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+
+        if let Some(name) = identify_from_cmdline_args(&args) {
+            return Some(name);
+        }
+        if let Some(first) = args.first() {
+            if let Some(name) = app_name_from_path(first) {
+                return Some(name);
+            }
+        }
+
+        current_pid = ppid;
+    }
+    None
+}
+
 /// Information about an audio application.
 #[derive(Debug, Clone)]
 pub struct AppInfo {
@@ -413,12 +586,59 @@ pub struct AppInfo {
     pub binary: Option<String>,
     /// Icon name hint (if available).
     pub icon: Option<String>,
+    /// Media name from PipeWire (e.g., page title for Chromium PWAs).
+    pub media_name: Option<String>,
+}
+
+/// Check if a media name is generic/unhelpful for identification.
+fn is_generic_media_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"
+    )
+}
+
+/// Check if an app's name/binary is generic (Chromium/Electron), meaning we
+/// should prefer media_name or PID-resolved name for identification.
+pub fn is_generic_app_identity(name: &str, binary: &str) -> bool {
+    let generic_names = [
+        "Chromium",
+        "Chrome",
+        "Google Chrome",
+        "Microsoft Edge",
+        "Brave Browser",
+    ];
+    let generic_binaries = [
+        "electron",
+        "chromium",
+        "chrome",
+        "google-chrome",
+        "msedge",
+        "brave",
+    ];
+
+    generic_names.iter().any(|g| name == *g)
+        || generic_binaries.iter().any(|g| binary == *g)
 }
 
 impl AppInfo {
     /// Get identifier used for matching and assignment.
+    /// Only prefers media_name for generic Chromium/Electron apps where the app name
+    /// is unhelpful. For distinctive apps (Firefox, Zen, etc.), uses app name/binary.
     pub fn identifier(&self) -> &str {
-        self.binary.as_deref().unwrap_or(&self.name)
+        let binary = self.binary.as_deref().unwrap_or("");
+        if is_generic_app_identity(&self.name, binary) {
+            if let Some(ref media) = self.media_name {
+                if !media.is_empty() && !is_generic_media_name(media) {
+                    return media;
+                }
+            }
+        }
+        if !binary.is_empty() {
+            binary
+        } else {
+            &self.name
+        }
     }
 }
 
@@ -686,6 +906,8 @@ pub struct AppState {
     pub last_error: Option<String>,
     /// App being dragged for assignment (node_id, app_name).
     pub dragging_app: Option<(u32, String)>,
+    /// Channel display filter (All, Outputs, Inputs).
+    pub channel_filter: ChannelFilter,
     /// Channel being renamed (channel_id, current_edit_value).
     pub editing_channel: Option<(Uuid, String)>,
     /// Apps waiting to be re-routed after a sink rename (channel_id, app_node_ids).
@@ -760,6 +982,7 @@ impl AppState {
             settings_open: false,
             last_error: None,
             dragging_app: None,
+            channel_filter: ChannelFilter::default(),
             editing_channel: None,
             pending_reroute: None,
             startup_complete: false,
@@ -872,22 +1095,43 @@ impl AppState {
                     && !name.contains("loopback")
                     && !name.starts_with("filter-chain")
             })
-            .map(|node| AppInfo {
-                node_id: node.id,
-                // Use app_name if available, otherwise description, then name
-                name: node
-                    .app_name
-                    .clone()
-                    .or_else(|| {
-                        if !node.description.is_empty() {
-                            Some(node.description.clone())
-                        } else {
-                            None
+            .map(|node| {
+                let mut media_name = node.properties.get("media.name").cloned();
+
+                // If media_name is missing/generic, or the app itself is generic
+                // (Chromium/Electron), try PID-based resolution
+                let media_is_generic = media_name
+                    .as_deref()
+                    .map_or(true, |m| m.is_empty() || is_generic_media_name(m));
+                let app_is_generic = is_generic_app_identity(
+                    node.app_name.as_deref().unwrap_or(""),
+                    node.binary_name.as_deref().unwrap_or(""),
+                );
+                if media_is_generic || app_is_generic {
+                    if let Some(pid) = node.properties.get("application.process.id") {
+                        if let Some(resolved) = resolve_app_name_from_pid(pid) {
+                            media_name = Some(resolved);
                         }
-                    })
-                    .unwrap_or_else(|| node.name.clone()),
-                binary: node.binary_name.clone(),
-                icon: None,
+                    }
+                }
+
+                AppInfo {
+                    node_id: node.id,
+                    name: node
+                        .app_name
+                        .clone()
+                        .or_else(|| {
+                            if !node.description.is_empty() {
+                                Some(node.description.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| node.name.clone()),
+                    binary: node.binary_name.clone(),
+                    icon: None,
+                    media_name,
+                }
             })
             .collect();
     }

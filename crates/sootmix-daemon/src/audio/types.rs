@@ -16,6 +16,7 @@ pub struct PwNode {
     pub media_class: MediaClass,
     pub app_name: Option<String>,
     pub binary_name: Option<String>,
+    pub media_name: Option<String>,
     #[allow(dead_code)]
     pub ports: Vec<PwPort>,
     pub properties: HashMap<String, String>,
@@ -30,6 +31,7 @@ impl PwNode {
             media_class: MediaClass::Unknown(String::new()),
             app_name: None,
             binary_name: None,
+            media_name: None,
             ports: Vec::new(),
             properties: HashMap::new(),
         }
