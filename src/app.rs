@@ -2374,27 +2374,22 @@ impl SootMix {
                 if !cols.is_empty() && !input_cols.is_empty() {
                     let group_separator: Element<Message> = container(
                         column![
-                            Space::new().height(Fill),
-                            container(
-                                text("INPUTS").size(TEXT_CAPTION).color(TEXT_DIM)
-                            )
-                            .padding([SPACING_SM, SPACING_XS])
-                            .style(|_: &Theme| container::Style {
-                                background: Some(Background::Color(SURFACE)),
-                                border: Border::default().rounded(RADIUS_SM),
-                                ..container::Style::default()
-                            }),
-                            Space::new().height(Fill),
+                            container(Space::new().width(1).height(SPACING * 3.0))
+                                .style(|_: &Theme| container::Style {
+                                    background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+                                    ..container::Style::default()
+                                }),
+                            text("IN").size(TEXT_CAPTION).color(TEXT_DIM),
+                            container(Space::new().width(1).height(SPACING * 3.0))
+                                .style(|_: &Theme| container::Style {
+                                    background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+                                    ..container::Style::default()
+                                }),
                         ]
                         .align_x(Alignment::Center)
+                        .spacing(SPACING_XS)
                     )
-                    .width(Length::Fixed(3.0))
-                    .height(Fill)
-                    .center_x(Fill)
-                    .style(|_: &Theme| container::Style {
-                        background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
-                        ..container::Style::default()
-                    })
+                    .center_y(Length::Fixed(CHANNEL_STRIP_HEIGHT))
                     .into();
                     cols.push(group_separator);
                 }
@@ -2425,7 +2420,9 @@ impl SootMix {
             self.state.master_recording_enabled,
         );
 
-        let master_column = column![master]
+        // Top padding aligns master with channels (which sit below the filter row)
+        let filter_row_height = TEXT_SMALL + SPACING_XS * 2.0 + SPACING_SM;
+        let master_column = column![Space::new().height(filter_row_height), master]
             .align_x(Alignment::Center);
 
         // Separator between master and channel strips
