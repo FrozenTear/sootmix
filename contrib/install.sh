@@ -371,6 +371,10 @@ install_binary() {
     info "Extracting..."
     tar -xzf "$archive_name"
 
+    # Enter extracted directory
+    local extract_dir="sootmix-${version}-${arch}-unknown-linux-gnu"
+    cd "$extract_dir"
+
     # Install binaries
     info "Installing to $PREFIX..."
 
