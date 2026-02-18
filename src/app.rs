@@ -542,6 +542,12 @@ impl SootMix {
             }
 
             // ==================== Channel Drag & Drop ====================
+            Message::ChannelDragActive => {
+                self.state.dragging_channel = true;
+            }
+            Message::ChannelDragCancelled => {
+                self.state.dragging_channel = false;
+            }
             Message::DropChannel(source_id, point, _rect) => {
                 return iced_drop::zones_on_point(
                     move |zones| Message::HandleChannelDrop(source_id, zones),
@@ -551,6 +557,7 @@ impl SootMix {
                 );
             }
             Message::HandleChannelDrop(source_id, zones) => {
+                self.state.dragging_channel = false;
                 use iced::advanced::widget::Id as WidgetId;
 
                 let delete_zone = WidgetId::from("channel-delete-zone");
@@ -2346,6 +2353,8 @@ impl SootMix {
         // Wrap in droppable for channel reordering DnD
         iced_drop::droppable(channel_col)
             .on_drop(move |point, rect| Message::DropChannel(channel_id, point, rect))
+            .on_drag(|_point, _rect| Message::ChannelDragActive)
+            .on_cancel(Message::ChannelDragCancelled)
             .on_click(Message::SelectChannel(Some(channel_id)))
             .drag_overlay(true)
             .into()
@@ -2445,47 +2454,48 @@ impl SootMix {
             })
             .into();
 
-        // Filter buttons (segment control)
-        let filter_row = row![
-            Self::filter_button("All", ChannelFilter::All, filter),
-            Self::filter_button("Outputs", ChannelFilter::Outputs, filter),
-            Self::filter_button("Inputs", ChannelFilter::Inputs, filter),
-        ]
-        .spacing(SPACING_XS);
-
-        // Delete drop zone at the end of the channel row
-        let delete_zone_id = iced::advanced::widget::Id::from("channel-delete-zone");
-        let delete_zone: Element<Message> = container(
-            column![
-                text("\u{1F5D1}").size(24.0).color(MUTED_COLOR),
-                text("Drop here\nto delete").size(TEXT_SMALL).color(TEXT_DIM)
-                    .center(),
+        // Top row: either filter buttons or delete drop zone (during channel drag)
+        let top_row: Element<Message> = if self.state.dragging_channel {
+            // Full-width delete drop zone replaces filter row during drag
+            let delete_zone_id = iced::advanced::widget::Id::from("channel-delete-zone");
+            container(
+                row![
+                    text("\u{1F5D1}").size(16.0).color(MUTED_COLOR),
+                    text("Drop here to delete").size(TEXT_SMALL).color(MUTED_COLOR),
+                ]
+                .spacing(SPACING_SM)
+                .align_y(Alignment::Center)
+            )
+            .id(delete_zone_id)
+            .width(Fill)
+            .padding([SPACING_XS, SPACING_SM])
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.10,
+                    ..MUTED_COLOR
+                })),
+                border: Border::default()
+                    .rounded(RADIUS)
+                    .color(Color { a: 0.3, ..MUTED_COLOR })
+                    .width(2.0),
+                ..container::Style::default()
+            })
+            .into()
+        } else {
+            // Normal filter buttons (segment control)
+            row![
+                Self::filter_button("All", ChannelFilter::All, filter),
+                Self::filter_button("Outputs", ChannelFilter::Outputs, filter),
+                Self::filter_button("Inputs", ChannelFilter::Inputs, filter),
             ]
-            .align_x(Alignment::Center)
-            .spacing(SPACING_SM)
-        )
-        .id(delete_zone_id)
-        .width(CHANNEL_STRIP_WIDTH)
-        .height(CHANNEL_STRIP_HEIGHT)
-        .center_x(Fill)
-        .center_y(Fill)
-        .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(Color {
-                a: 0.06,
-                ..MUTED_COLOR
-            })),
-            border: Border::default()
-                .rounded(RADIUS)
-                .color(Color { a: 0.2, ..MUTED_COLOR })
-                .width(2.0),
-            ..container::Style::default()
-        })
-        .into();
+            .spacing(SPACING_XS)
+            .into()
+        };
 
         // Channel columns in a scrollable row
-        let mut all_columns = channel_columns;
-        all_columns.push(delete_zone);
-        let channels_row = row(all_columns)
+        let channels_row = row(channel_columns)
             .spacing(SPACING)
             .align_y(Alignment::Start);
 
@@ -2495,7 +2505,7 @@ impl SootMix {
             ));
 
         let channels_area = column![
-            filter_row,
+            top_row,
             Space::new().height(SPACING_SM),
             scrollable_channels,
         ];
