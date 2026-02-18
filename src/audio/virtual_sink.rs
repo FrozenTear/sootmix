@@ -228,7 +228,17 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
 
     // Find the loopback capture node
     let full_loopback_name = format!("capture.{}", loopback_node_name);
-    let loopback_capture_node_id = find_node_by_name_and_class(&full_loopback_name, "Stream/Input/Audio").ok();
+    let loopback_capture_node_id = match find_node_by_name_and_class(&full_loopback_name, "Stream/Input/Audio") {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                "Failed to find capture stream node '{}' for virtual source '{}': {}. \
+                 Input channel mic linking will not work.",
+                full_loopback_name, source_node_name, e
+            );
+            None
+        }
+    };
 
     // Track the process
     if let Some(ref mut map) = *get_processes() {

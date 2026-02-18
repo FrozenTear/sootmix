@@ -520,7 +520,17 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
 
     // Find the capture stream node (the input side that captures from the mic)
     let input_node_name = format!("input.{}", loopback_node_name);
-    let capture_stream_node_id = find_node_by_name_and_class(&input_node_name, "Stream/Input/Audio").ok();
+    let capture_stream_node_id = match find_node_by_name_and_class(&input_node_name, "Stream/Input/Audio") {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                "Failed to find capture stream node '{}' for virtual source '{}': {}. \
+                 Input channel mic linking will not work.",
+                input_node_name, name, e
+            );
+            None
+        }
+    };
 
     if let Some(ref mut map) = *get_processes() {
         map.insert(source_node_id, child);

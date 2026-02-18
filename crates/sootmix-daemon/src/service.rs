@@ -1439,6 +1439,11 @@ impl DaemonService {
                             capture_node_id,
                         });
                     }
+                } else {
+                    error!(
+                        "Input channel has no capture stream node — mic linking skipped. \
+                         The pw-loopback capture node was not found during virtual source creation."
+                    );
                 }
             }
             PwEvent::RecordingSourceCreated { name, node_id } => {
