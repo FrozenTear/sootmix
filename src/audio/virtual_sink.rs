@@ -114,7 +114,7 @@ pub fn create_virtual_sink_full(name: &str, description: &str) -> Result<Virtual
     // The object.linger=true keeps the stream alive and prevents WirePlumber from
     // resetting it. session.suspend-timeout-enabled=false prevents auto-suspend.
     let playback_props = format!(
-        "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR] \
+        "media.class=Stream/Output/Audio node.autoconnect=false node.dont-move=true audio.position=[FL FR] \
          object.linger=true session.suspend-timeout-enabled=false stream.capture.sink=false"
     );
 
@@ -203,7 +203,7 @@ pub fn create_virtual_source(name: &str, description: &str) -> Result<VirtualSou
     // IMPORTANT: We use node.autoconnect=false so we can explicitly link to
     // the user's selected input device rather than the system default.
     let capture_props = format!(
-        "media.class=Stream/Input/Audio node.autoconnect=false audio.position=[MONO] \
+        "media.class=Stream/Input/Audio node.autoconnect=false node.dont-move=true audio.position=[MONO] \
          object.linger=true session.suspend-timeout-enabled=false"
     );
 

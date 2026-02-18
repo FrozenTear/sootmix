@@ -136,7 +136,7 @@ pub fn create_virtual_sink_full(
     );
 
     let playback_props =
-        "media.class=Stream/Output/Audio node.autoconnect=false audio.position=[FL FR]".to_string();
+        "media.class=Stream/Output/Audio node.autoconnect=false node.dont-move=true audio.position=[FL FR]".to_string();
 
     info!(
         "Creating virtual sink: {} (description: {})",
@@ -479,13 +479,15 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
 
     // Build capture props - ALWAYS disable autoconnect to prevent WirePlumber from
     // linking the capture stream to all available sources. We'll manage links ourselves.
+    // node.dont-move=true prevents WirePlumber from moving the stream when the default
+    // input device changes (e.g. headset plugged in).
     let capture_props = if let Some(device) = target_device {
         format!(
-            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[MONO] target.object=\"{}\"",
+            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false node.dont-move=true audio.position=[MONO] target.object=\"{}\"",
             device
         )
     } else {
-        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false audio.position=[MONO]".to_string()
+        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false node.dont-move=true audio.position=[MONO]".to_string()
     };
 
     // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
