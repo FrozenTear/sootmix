@@ -497,7 +497,7 @@ pub fn channel_strip<'a>(
         let selected_output = output_device_name
             .clone()
             .map(|name| {
-                if name == "Default" {
+                if name == "system-default" {
                     "Default".to_string()
                 } else {
                     available_outputs
@@ -523,7 +523,7 @@ pub fn channel_strip<'a>(
                 text("Output").size(TEXT_SMALL).color(TEXT_DIM),
                 pick_list(output_options, selected_output, move |selection: String| {
                     let device = if selection == "Default" {
-                        None
+                        Some("system-default".to_string())
                     } else {
                         let full_name = display_to_full
                             .iter()
