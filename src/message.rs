@@ -55,6 +55,10 @@ pub enum Message {
     /// Set the channel filter (All, Outputs, Inputs).
     SetChannelFilter(ChannelFilter),
 
+    /// Channel drag is active (set while dragging to show delete zone in filter row).
+    ChannelDragActive,
+    /// Channel drag was cancelled (right-click during drag).
+    ChannelDragCancelled,
     /// Channel dropped at a point (source_channel_id, cursor_point, drag_bounds).
     DropChannel(Uuid, iced::Point, iced::Rectangle),
     /// Zone resolution result for channel drop (source_channel_id, zones).

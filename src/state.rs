@@ -906,6 +906,8 @@ pub struct AppState {
     pub last_error: Option<String>,
     /// App being dragged for assignment (node_id, app_name).
     pub dragging_app: Option<(u32, String)>,
+    /// Whether a channel strip is currently being dragged (for showing delete zone).
+    pub dragging_channel: bool,
     /// Channel display filter (All, Outputs, Inputs).
     pub channel_filter: ChannelFilter,
     /// Channel being renamed (channel_id, current_edit_value).
@@ -982,6 +984,7 @@ impl AppState {
             settings_open: false,
             last_error: None,
             dragging_app: None,
+            dragging_channel: false,
             channel_filter: ChannelFilter::default(),
             editing_channel: None,
             pending_reroute: None,
