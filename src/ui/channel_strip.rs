@@ -254,7 +254,7 @@ pub fn channel_strip<'a>(
 
     // === DELETE BUTTON ===
     let delete_button = button(text("\u{00D7}").size(TEXT_BODY).color(TEXT_DIM))
-        .padding([SPACING_XS, SPACING_SM])
+        .padding([SPACING_SM, SPACING_SM])
         .style(|_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
@@ -496,19 +496,18 @@ pub fn channel_strip<'a>(
 
         let selected_output = output_device_name
             .clone()
-            .and_then(|name| {
+            .map(|name| {
                 if name == "Default" {
-                    None
+                    "Default".to_string()
                 } else {
-                    Some(
-                        available_outputs
-                            .iter()
-                            .find(|d| d.description == name || d.name == name)
-                            .map(|d| truncate_string(&d.description, max_display_chars))
-                            .unwrap_or_else(|| truncate_string(&name, max_display_chars)),
-                    )
+                    available_outputs
+                        .iter()
+                        .find(|d| d.description == name || d.name == name)
+                        .map(|d| truncate_string(&d.description, max_display_chars))
+                        .unwrap_or_else(|| truncate_string(&name, max_display_chars))
                 }
-            });
+            })
+            .or_else(|| Some("Default".to_string()));
 
         let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
         if !has_hw_outputs {
