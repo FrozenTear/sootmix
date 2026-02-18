@@ -496,18 +496,19 @@ pub fn channel_strip<'a>(
 
         let selected_output = output_device_name
             .clone()
-            .map(|name| {
+            .and_then(|name| {
                 if name == "Default" {
-                    name
+                    None
                 } else {
-                    available_outputs
-                        .iter()
-                        .find(|d| d.description == name || d.name == name)
-                        .map(|d| truncate_string(&d.description, max_display_chars))
-                        .unwrap_or_else(|| truncate_string(&name, max_display_chars))
+                    Some(
+                        available_outputs
+                            .iter()
+                            .find(|d| d.description == name || d.name == name)
+                            .map(|d| truncate_string(&d.description, max_display_chars))
+                            .unwrap_or_else(|| truncate_string(&name, max_display_chars)),
+                    )
                 }
-            })
-            .or_else(|| Some("Default".to_string()));
+            });
 
         let has_hw_outputs = available_outputs.iter().any(|d| d.name != "system-default");
         if !has_hw_outputs {
@@ -534,13 +535,14 @@ pub fn channel_strip<'a>(
                     };
                     Message::ChannelOutputDeviceChanged(id, device)
                 },)
+                    .placeholder("Default")
                     .text_size(TEXT_SMALL)
                     .padding([SPACING_SM, SPACING_SM])
                     .width(Length::Fixed(CHANNEL_STRIP_WIDTH - PADDING * 2.0))
                     .style(|_theme: &Theme, _status| {
                         pick_list::Style {
                             text_color: TEXT,
-                            placeholder_color: TEXT_DIM,
+                            placeholder_color: TEXT,
                             handle_color: SOOTMIX_DARK.text_muted,
                             background: Background::Color(SOOTMIX_DARK.surface_raised),
                             border: Border::default()
