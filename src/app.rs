@@ -1849,7 +1849,10 @@ impl SootMix {
 
     /// Routing section for bottom panel.
     fn view_bottom_routing_section(channel: &MixerChannel) -> Element<'_, Message> {
-        let output_name = channel.output_device_name.clone().unwrap_or_else(|| "Default".to_string());
+        let output_name = channel.output_device_name.as_deref()
+            .map(|n| if n == "system-default" { "Default" } else { n })
+            .unwrap_or("Default")
+            .to_string();
         let volume_db = channel.volume_db;
         container(
             column![
@@ -3064,10 +3067,20 @@ impl SootMix {
             }
         } else {
             // Look up target device ID first to avoid borrow conflicts
+            // For "system-default", resolve via WirePlumber to find the actual default sink
             let target_device_id = device_name.and_then(|name| {
-                self.state.available_outputs.iter()
-                    .find(|d| d.description == name || d.name == name)
-                    .map(|d| d.node_id)
+                if name == "system-default" {
+                    let default_name = crate::audio::filter_chain::find_default_sink_name();
+                    default_name.and_then(|dn| {
+                        self.state.available_outputs.iter()
+                            .find(|d| d.name == dn)
+                            .map(|d| d.node_id)
+                    })
+                } else {
+                    self.state.available_outputs.iter()
+                        .find(|d| d.description == name || d.name == name)
+                        .map(|d| d.node_id)
+                }
             });
 
             // Get channel info for loopback lookup
@@ -3528,9 +3541,18 @@ impl SootMix {
                 // Route to saved output device if configured
                 if let Some(loopback_id) = loopback_output_node_id {
                     let target_device_id = output_device_name.as_ref().and_then(|name| {
-                        self.state.available_outputs.iter()
-                            .find(|d| d.description == *name || d.name == *name)
-                            .map(|d| d.node_id)
+                        if name == "system-default" {
+                            let default_name = crate::audio::filter_chain::find_default_sink_name();
+                            default_name.and_then(|dn| {
+                                self.state.available_outputs.iter()
+                                    .find(|d| d.name == dn)
+                                    .map(|d| d.node_id)
+                            })
+                        } else {
+                            self.state.available_outputs.iter()
+                                .find(|d| d.description == *name || d.name == *name)
+                                .map(|d| d.node_id)
+                        }
                     });
 
                     // If no saved device, route to default
