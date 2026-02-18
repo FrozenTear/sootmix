@@ -553,8 +553,16 @@ impl SootMix {
             Message::HandleChannelDrop(source_id, zones) => {
                 use iced::advanced::widget::Id as WidgetId;
 
-                // Find which channel zone was dropped on
-                if let Some(target_id) = zones.iter().find_map(|(zone_id, _)| {
+                let delete_zone = WidgetId::from("channel-delete-zone");
+
+                // Check if dropped on the delete zone
+                if zones.iter().any(|(zone_id, _)| *zone_id == delete_zone) {
+                    debug!("DnD: channel dropped on delete zone, deleting");
+                    self.cmd_delete_channel(source_id);
+                    self.save_config();
+                }
+                // Otherwise, find which channel zone was dropped on for reordering
+                else if let Some(target_id) = zones.iter().find_map(|(zone_id, _)| {
                     self.state.channels.iter().find(|c| {
                         *zone_id == WidgetId::from(format!("channel-zone-{}", c.id))
                     }).map(|c| c.id)
@@ -2445,8 +2453,39 @@ impl SootMix {
         ]
         .spacing(SPACING_XS);
 
+        // Delete drop zone at the end of the channel row
+        let delete_zone_id = iced::advanced::widget::Id::from("channel-delete-zone");
+        let delete_zone: Element<Message> = container(
+            column![
+                text("\u{1F5D1}").size(24.0).color(MUTED_COLOR),
+                text("Drop here\nto delete").size(TEXT_SMALL).color(TEXT_DIM)
+                    .center(),
+            ]
+            .align_x(Alignment::Center)
+            .spacing(SPACING_SM)
+        )
+        .id(delete_zone_id)
+        .width(CHANNEL_STRIP_WIDTH)
+        .height(CHANNEL_STRIP_HEIGHT)
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.06,
+                ..MUTED_COLOR
+            })),
+            border: Border::default()
+                .rounded(RADIUS)
+                .color(Color { a: 0.2, ..MUTED_COLOR })
+                .width(2.0),
+            ..container::Style::default()
+        })
+        .into();
+
         // Channel columns in a scrollable row
-        let channels_row = row(channel_columns)
+        let mut all_columns = channel_columns;
+        all_columns.push(delete_zone);
+        let channels_row = row(all_columns)
             .spacing(SPACING)
             .align_y(Alignment::Start);
 

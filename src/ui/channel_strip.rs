@@ -253,14 +253,16 @@ pub fn channel_strip<'a>(
     };
 
     // === DELETE BUTTON ===
-    let delete_button = button(text("\u{00D7}").size(TEXT_BODY).color(TEXT_DIM))
-        .padding([SPACING_SM, SPACING_SM])
+    let delete_button = button(
+        text("\u{00D7}").size(TEXT_BODY + 2.0)
+    )
+        .padding([SPACING_XS, SPACING_SM])
         .style(|_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
                 background: Some(Background::Color(if is_hovered {
                     Color {
-                        a: 0.15,
+                        a: 0.2,
                         ..MUTED_COLOR
                     }
                 } else {
@@ -556,11 +558,22 @@ pub fn channel_strip<'a>(
         }
     };
 
+    // === MOVE ARROWS ROW (centered, compact) ===
+    let arrows_row: Element<Message> = if !is_first_in_group || !is_last_in_group {
+        row![left_btn, right_btn]
+            .spacing(SPACING_XS)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        Space::new().width(0).height(0).into()
+    };
+
     // === ASSEMBLE CHANNEL STRIP ===
     let content = column![
-        // Header: type badge (if input) + name + arrows + delete
-        row![type_badge, name_element, Space::new().width(Fill), left_btn, right_btn, delete_button,].align_y(Alignment::Center),
-        Space::new().height(SPACING_SM),
+        // Header: type badge (if input) + name + delete
+        row![type_badge, name_element, Space::new().width(Fill), delete_button,].align_y(Alignment::Center),
+        // Move arrows (centered, own row)
+        container(arrows_row).center_x(Fill),
         // Controls: EQ + FX
         fx_btn,
         Space::new().height(SPACING),
