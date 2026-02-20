@@ -388,8 +388,9 @@ impl SootMix {
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.input_device_name = device_name.clone();
                 }
-                // Route the selected input device to the channel's loopback capture
-                if let Some(ref device_name) = device_name {
+                if self.daemon_connected {
+                    self.cmd_set_channel_output(channel_id, device_name.as_deref());
+                } else if let Some(ref device_name) = device_name {
                     self.route_input_device_to_channel(channel_id, device_name);
                 }
                 self.save_config();

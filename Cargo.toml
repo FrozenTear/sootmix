@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "sootmix"
-version = "0.2.3-1"
+version = "0.2.3-4"
 edition = "2021"
 authors = ["SootMix Contributors"]
 description = "Audio routing and mixing application for Linux using PipeWire"
