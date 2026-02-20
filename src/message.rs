@@ -93,6 +93,8 @@ pub enum Message {
     ChannelNoiseSuppressionToggled(Uuid),
     /// VAD threshold changed for noise suppression (channel_id, threshold 0-100%).
     ChannelVADThresholdChanged(Uuid, f32),
+    /// VAD threshold slider released (channel_id). Sends the final value to the daemon.
+    ChannelVADThresholdReleased(Uuid),
     /// Hardware microphone gain changed (channel_id, gain_db -12 to +12).
     ChannelInputGainChanged(Uuid, f32),
     /// Hardware microphone gain slider released (channel_id).

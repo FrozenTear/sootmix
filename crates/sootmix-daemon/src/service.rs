@@ -639,6 +639,11 @@ pub struct DaemonState {
     pub last_reconnect_attempt: Option<Instant>,
     /// Number of consecutive reconnection failures (for exponential backoff)
     pub reconnect_failures: u32,
+    /// Pending replacement commands after a noise filter or virtual source destroy.
+    /// When toggling noise suppression, we need to destroy the old node before creating
+    /// the replacement to avoid same-name node conflicts. This map stores the create
+    /// command to dispatch after the destroy event is received.
+    pub pending_ns_replacements: HashMap<Uuid, PwCommand>,
 }
 
 impl DaemonState {
@@ -666,6 +671,7 @@ impl DaemonState {
             refresh_counter: 0,
             last_reconnect_attempt: None,
             reconnect_failures: 0,
+            pending_ns_replacements: HashMap::new(),
         }
     }
 
@@ -1396,10 +1402,25 @@ impl DaemonService {
                 self.try_auto_route_pending_apps(channel_id);
             }
             PwEvent::VirtualSinkDestroyed { node_id } => {
+                let mut replacement_channel_id = None;
                 for channel in &mut self.state.channels {
                     if channel.pw_sink_id == Some(node_id) {
                         channel.pw_sink_id = None;
                         channel.pw_loopback_output_id = None;
+                    }
+                    // Also handle input channel source destruction (used when enabling NS)
+                    if channel.pw_source_id == Some(node_id) {
+                        channel.pw_source_id = None;
+                        channel.pw_loopback_capture_id = None;
+                        replacement_channel_id = Some(channel.id);
+                    }
+                }
+                // Check for pending replacement (e.g., creating noise filter after
+                // the plain virtual source was destroyed when toggling NS on)
+                if let Some(ch_id) = replacement_channel_id {
+                    if let Some(cmd) = self.state.pending_ns_replacements.remove(&ch_id) {
+                        info!("Dispatching pending replacement for channel {}", ch_id);
+                        self.send_pw_command(cmd);
                     }
                 }
             }
@@ -1410,7 +1431,7 @@ impl DaemonService {
                 meter_levels,
             } => {
                 // Get channel info and update state
-                let (target_mic, capture_id) = if let Some(channel) =
+                let (target_mic, capture_id, volume, muted) = if let Some(channel) =
                     self.state.channels.iter_mut().find(|c| c.id == channel_id)
                 {
                     channel.pw_source_id = Some(source_node_id);
@@ -1420,10 +1441,27 @@ impl DaemonService {
                         "Virtual source created for input channel '{}': source={}, capture={:?}",
                         channel.name, source_node_id, loopback_capture_node_id
                     );
-                    (channel.input_device_name.clone(), loopback_capture_node_id)
+                    (
+                        channel.input_device_name.clone(),
+                        loopback_capture_node_id,
+                        channel.volume_linear(),
+                        channel.muted,
+                    )
                 } else {
-                    (None, None)
+                    (None, None, 1.0, false)
                 };
+
+                // Apply saved volume and mute to the new source node
+                self.send_pw_command(PwCommand::SetVolume {
+                    node_id: source_node_id,
+                    volume,
+                });
+                if muted {
+                    self.send_pw_command(PwCommand::SetMute {
+                        node_id: source_node_id,
+                        muted: true,
+                    });
+                }
 
                 // Link the capture node to the target mic (or system default)
                 if let Some(capture_node_id) = capture_id {
@@ -1465,17 +1503,41 @@ impl DaemonService {
                     channel_id, source_node_id
                 );
                 // Update channel state - apps should connect to the noise-filtered source
-                if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
+                let (volume, muted) = if let Some(channel) =
+                    self.state.channels.iter_mut().find(|c| c.id == channel_id)
+                {
                     channel.noise_suppression_enabled = true;
                     channel.pw_source_id = Some(source_node_id);
                     // Clear the old loopback capture ID since we destroyed it
                     channel.pw_loopback_capture_id = None;
+                    (channel.volume_linear(), channel.muted)
+                } else {
+                    (1.0, false)
+                };
+
+                // Apply saved volume and mute to the new noise filter source node
+                self.send_pw_command(PwCommand::SetVolume {
+                    node_id: source_node_id,
+                    volume,
+                });
+                if muted {
+                    self.send_pw_command(PwCommand::SetMute {
+                        node_id: source_node_id,
+                        muted: true,
+                    });
                 }
             }
             PwEvent::NativeNoiseFilterDestroyed { channel_id } => {
                 info!("Native noise filter destroyed for channel {}", channel_id);
                 if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
                     channel.noise_suppression_enabled = false;
+                    channel.pw_source_id = None;
+                }
+                // Check for pending replacement (e.g., creating a plain virtual source
+                // after noise filter was destroyed when toggling NS off)
+                if let Some(cmd) = self.state.pending_ns_replacements.remove(&channel_id) {
+                    info!("Dispatching pending replacement for channel {}", channel_id);
+                    self.send_pw_command(cmd);
                 }
             }
             PwEvent::NativeNoiseFilterFailed { channel_id, error } => {
@@ -1797,31 +1859,42 @@ impl DaemonService {
                 "Enabling noise suppression for channel '{}' (target_mic: {:?})",
                 channel_name, target_mic
             );
-            // First destroy the existing loopback to avoid node name conflicts
-            if let Some(source_id) = existing_source_id {
-                info!(
-                    "Destroying existing loopback source {} before creating noise filter",
-                    source_id
-                );
-                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
-            }
-            // Then create the noise filter (which creates its own Audio/Source)
-            self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
+            let create_cmd = PwCommand::CreateNativeNoiseFilter {
                 channel_id: id,
                 name: channel_name,
                 target_mic,
                 vad_threshold,
-            });
+            };
+            if let Some(source_id) = existing_source_id {
+                // Defer the noise filter creation until the old loopback is destroyed,
+                // to avoid same-name node conflicts (same race as the disable path).
+                info!(
+                    "Destroying existing loopback source {} before creating noise filter",
+                    source_id
+                );
+                self.state.pending_ns_replacements.insert(id, create_cmd);
+                self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
+            } else {
+                // No existing source, create directly
+                self.send_pw_command(create_cmd);
+            }
         } else {
             info!("Disabling noise suppression for channel '{}'", channel_name);
-            // First destroy the noise filter
+            // Store the replacement command to dispatch AFTER the noise filter is fully
+            // destroyed. Sending both commands at once causes a race: both spawn_cli_work
+            // threads run concurrently, and the new pw-loopback's find_node_by_name can
+            // find the old (dying) noise filter node instead of the newly created one.
+            self.state.pending_ns_replacements.insert(
+                id,
+                PwCommand::CreateVirtualSource {
+                    channel_id: id,
+                    name: channel_name,
+                    target_device: target_mic,
+                },
+            );
+            // Destroy the noise filter; NativeNoiseFilterDestroyed handler will
+            // dispatch the pending CreateVirtualSource.
             self.send_pw_command(PwCommand::DestroyNativeNoiseFilter { channel_id: id });
-            // Then recreate the regular loopback
-            self.send_pw_command(PwCommand::CreateVirtualSource {
-                channel_id: id,
-                name: channel_name,
-                target_device: target_mic,
-            });
         }
 
         Ok(())
@@ -1874,16 +1947,17 @@ impl DaemonService {
                 threshold, channel_name
             );
 
-            // Destroy the existing filter
+            // Defer the new filter creation until the old one is fully destroyed
+            self.state.pending_ns_replacements.insert(
+                id,
+                PwCommand::CreateNativeNoiseFilter {
+                    channel_id: id,
+                    name: channel_name,
+                    target_mic,
+                    vad_threshold: threshold,
+                },
+            );
             self.send_pw_command(PwCommand::DestroyNativeNoiseFilter { channel_id: id });
-
-            // Create new filter with updated threshold
-            self.send_pw_command(PwCommand::CreateNativeNoiseFilter {
-                channel_id: id,
-                name: channel_name,
-                target_mic,
-                vad_threshold: threshold,
-            });
         }
 
         self.save_config();

@@ -396,6 +396,7 @@ fn noise_suppression_section<'a>(channel: &'a MixerChannel) -> Element<'a, Messa
         let vad_slider = slider(0.0..=100.0, vad_threshold, move |v| {
             Message::ChannelVADThresholdChanged(id, v)
         })
+        .on_release(Message::ChannelVADThresholdReleased(id))
         .step(1.0)
         .width(Length::Fill)
         .style(|_theme: &Theme, _status| slider::Style {

@@ -23,7 +23,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// Commands sent from the service to the PipeWire thread.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum PwCommand {
     CreateVirtualSink {
         channel_id: Uuid,

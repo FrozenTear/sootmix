@@ -453,12 +453,19 @@ impl SootMix {
             }
 
             Message::ChannelVADThresholdChanged(channel_id, threshold) => {
-                // Update local state
+                // Update local state only (don't send to daemon until released,
+                // since each change destroys/recreates the entire noise filter process)
                 if let Some(channel) = self.state.channel_mut(channel_id) {
                     channel.vad_threshold = threshold;
                 }
-                // Send to daemon
-                self.cmd_set_channel_vad_threshold(channel_id, threshold);
+            }
+
+            Message::ChannelVADThresholdReleased(channel_id) => {
+                // Send the final threshold to the daemon
+                if let Some(channel) = self.state.channel(channel_id) {
+                    let threshold = channel.vad_threshold;
+                    self.cmd_set_channel_vad_threshold(channel_id, threshold);
+                }
             }
 
             Message::ChannelInputGainChanged(channel_id, gain_db) => {
@@ -1945,6 +1952,7 @@ impl SootMix {
             let vad_slider = slider(0.0..=100.0, vad_threshold, move |v| {
                 Message::ChannelVADThresholdChanged(id, v)
             })
+            .on_release(Message::ChannelVADThresholdReleased(id))
             .width(80)
             .step(1.0);
 
