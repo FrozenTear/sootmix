@@ -131,6 +131,20 @@ pub enum Message {
     /// Close settings modal.
     CloseSettings,
 
+    // ==================== Daemon Service Controls ====================
+    /// Start the daemon systemd service.
+    DaemonStart,
+    /// Stop the daemon systemd service.
+    DaemonStop,
+    /// Restart the daemon systemd service.
+    DaemonRestart,
+    /// Toggle daemon autostart (enable/disable systemd service).
+    DaemonToggleAutostart(bool),
+    /// Result of a daemon service action (start/stop/restart).
+    DaemonActionComplete(Result<String, String>),
+    /// Result of checking whether daemon autostart is enabled.
+    DaemonAutoStartChecked(bool),
+
     // ==================== Routing Rules ====================
     /// Open the routing rules panel.
     OpenRoutingRulesPanel,

@@ -12,6 +12,8 @@ pub mod meter;
 pub mod plugin_chain;
 pub mod plugin_downloader;
 pub mod routing_rules_panel;
+pub mod settings_panel;
 pub mod theme;
 
 pub use plugin_downloader::plugin_downloader;
+pub use settings_panel::settings_panel;

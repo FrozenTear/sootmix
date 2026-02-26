@@ -427,6 +427,78 @@ pub fn send_daemon_command(cmd: DaemonCommand) -> Result<(), String> {
     }
 }
 
+// ==================== Systemd Service Controls ====================
+
+const SERVICE_NAME: &str = "sootmix-daemon.service";
+
+/// Start the daemon via systemd.
+pub async fn systemctl_start() -> Result<String, String> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "start", SERVICE_NAME])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    if output.status.success() {
+        Ok("Daemon started".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Stop the daemon via systemd.
+pub async fn systemctl_stop() -> Result<String, String> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "stop", SERVICE_NAME])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    if output.status.success() {
+        Ok("Daemon stopped".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Restart the daemon via systemd.
+pub async fn systemctl_restart() -> Result<String, String> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", SERVICE_NAME])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    if output.status.success() {
+        Ok("Daemon restarted".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Check if the daemon systemd service is enabled (autostart).
+pub async fn systemctl_is_enabled() -> Result<bool, String> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", SERVICE_NAME])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(stdout == "enabled")
+}
+
+/// Enable or disable the daemon systemd service (autostart).
+pub async fn systemctl_set_enabled(enable: bool) -> Result<String, String> {
+    let action = if enable { "enable" } else { "disable" };
+    let output = tokio::process::Command::new("systemctl")
+        .args(["--user", action, SERVICE_NAME])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run systemctl: {}", e))?;
+    if output.status.success() {
+        Ok(format!("Daemon {}", if enable { "enabled" } else { "disabled" }))
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// Iced subscription for daemon events.
 pub fn daemon_subscription() -> iced::Subscription<DaemonEvent> {
     iced::Subscription::run(daemon_event_stream)

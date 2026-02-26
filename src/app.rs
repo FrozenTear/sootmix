@@ -707,9 +707,57 @@ impl SootMix {
             // ==================== Settings ====================
             Message::OpenSettings => {
                 self.state.settings_open = true;
+                return iced::Task::perform(
+                    daemon_client::systemctl_is_enabled(),
+                    |result| Message::DaemonAutoStartChecked(result.unwrap_or(false)),
+                );
             }
             Message::CloseSettings => {
                 self.state.settings_open = false;
+            }
+
+            // ==================== Daemon Service Controls ====================
+            Message::DaemonStart => {
+                self.state.daemon_action_pending = true;
+                return iced::Task::perform(
+                    daemon_client::systemctl_start(),
+                    Message::DaemonActionComplete,
+                );
+            }
+            Message::DaemonStop => {
+                self.state.daemon_action_pending = true;
+                return iced::Task::perform(
+                    daemon_client::systemctl_stop(),
+                    Message::DaemonActionComplete,
+                );
+            }
+            Message::DaemonRestart => {
+                self.state.daemon_action_pending = true;
+                return iced::Task::perform(
+                    daemon_client::systemctl_restart(),
+                    Message::DaemonActionComplete,
+                );
+            }
+            Message::DaemonToggleAutostart(enable) => {
+                return iced::Task::perform(
+                    daemon_client::systemctl_set_enabled(enable),
+                    move |result| {
+                        if result.is_ok() {
+                            Message::DaemonAutoStartChecked(enable)
+                        } else {
+                            Message::DaemonActionComplete(result)
+                        }
+                    },
+                );
+            }
+            Message::DaemonActionComplete(result) => {
+                self.state.daemon_action_pending = false;
+                if let Err(e) = result {
+                    warn!("Daemon action failed: {}", e);
+                }
+            }
+            Message::DaemonAutoStartChecked(enabled) => {
+                self.state.daemon_autostart = enabled;
             }
 
             // ==================== Layout & Selection ====================
@@ -1597,7 +1645,7 @@ impl SootMix {
                 ..container::Style::default()
             });
 
-        // Plugin downloader modal (shown as overlay)
+        // Modal overlays (only one shown at a time)
         if self.state.downloader_open {
             let downloader = crate::ui::plugin_downloader(
                 &self.state.downloader_search,
@@ -1605,7 +1653,6 @@ impl SootMix {
                 &self.state.installed_packs,
             );
 
-            // Modal backdrop
             let backdrop = button(Space::new().width(Fill).height(Fill))
                 .style(|_theme: &Theme, _status| button::Style {
                     background: Some(Background::Color(Color { a: 0.6, ..Color::BLACK })),
@@ -1613,13 +1660,40 @@ impl SootMix {
                 })
                 .on_press(Message::ClosePluginDownloader);
 
-            // Stack modal on top with centering
             iced::widget::stack![
                 main_container,
                 container(
                     iced::widget::stack![
                         backdrop,
                         container(downloader)
+                            .center_x(Fill)
+                            .center_y(Fill),
+                    ]
+                )
+                .width(Fill)
+                .height(Fill),
+            ]
+            .into()
+        } else if self.state.settings_open {
+            let panel = crate::ui::settings_panel(
+                self.daemon_connected,
+                self.state.daemon_autostart,
+                self.state.daemon_action_pending,
+            );
+
+            let backdrop = button(Space::new().width(Fill).height(Fill))
+                .style(|_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(Color { a: 0.6, ..Color::BLACK })),
+                    ..button::Style::default()
+                })
+                .on_press(Message::CloseSettings);
+
+            iced::widget::stack![
+                main_container,
+                container(
+                    iced::widget::stack![
+                        backdrop,
+                        container(panel)
                             .center_x(Fill)
                             .center_y(Fill),
                     ]

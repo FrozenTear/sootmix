@@ -984,6 +984,12 @@ pub struct AppState {
     /// Height of the bottom detail panel in pixels.
     pub bottom_panel_height: f32,
 
+    // ==================== Daemon Settings ====================
+    /// Whether the daemon systemd service is enabled (autostart on login).
+    pub daemon_autostart: bool,
+    /// Whether a daemon action (start/stop/restart) is in progress.
+    pub daemon_action_pending: bool,
+
     // ==================== Plugin Downloader ====================
     /// Whether the plugin downloader panel is open.
     pub downloader_open: bool,
@@ -1039,6 +1045,8 @@ impl AppState {
             left_sidebar_collapsed: false,
             bottom_panel_expanded: false,
             bottom_panel_height: 200.0,
+            daemon_autostart: false,
+            daemon_action_pending: false,
             downloader_open: false,
             downloader_search: String::new(),
             downloading: std::collections::HashMap::new(),
