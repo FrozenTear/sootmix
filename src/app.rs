@@ -707,10 +707,10 @@ impl SootMix {
             // ==================== Settings ====================
             Message::OpenSettings => {
                 self.state.settings_open = true;
-                return iced::Task::perform(
-                    daemon_client::systemctl_is_enabled(),
-                    |result| Message::DaemonAutoStartChecked(result.unwrap_or(false)),
-                );
+                return iced::Task::future(async {
+                    let result = daemon_client::systemctl_is_enabled().await;
+                    Message::DaemonAutoStartChecked(result.unwrap_or(false))
+                });
             }
             Message::CloseSettings => {
                 self.state.settings_open = false;
@@ -720,43 +720,48 @@ impl SootMix {
             Message::DaemonStart => {
                 self.state.daemon_action_pending = true;
                 daemon_client::set_auto_restart(true);
-                return iced::Task::perform(
-                    daemon_client::systemctl_start(),
-                    Message::DaemonActionComplete,
-                );
+                return iced::Task::future(async {
+                    let result = daemon_client::systemctl_start().await;
+                    Message::DaemonActionComplete(result.map(|s| format!("start:{}", s)))
+                });
             }
             Message::DaemonStop => {
                 self.state.daemon_action_pending = true;
+                self.daemon_connected = false;
                 daemon_client::set_auto_restart(false);
-                return iced::Task::perform(
-                    daemon_client::systemctl_stop(),
-                    Message::DaemonActionComplete,
-                );
+                return iced::Task::future(async {
+                    Message::DaemonActionComplete(daemon_client::systemctl_stop().await)
+                });
             }
             Message::DaemonRestart => {
                 self.state.daemon_action_pending = true;
+                self.daemon_connected = false;
                 daemon_client::set_auto_restart(true);
-                return iced::Task::perform(
-                    daemon_client::systemctl_restart(),
-                    Message::DaemonActionComplete,
-                );
+                return iced::Task::future(async {
+                    let result = daemon_client::systemctl_restart().await;
+                    Message::DaemonActionComplete(result.map(|s| format!("start:{}", s)))
+                });
             }
             Message::DaemonToggleAutostart(enable) => {
-                return iced::Task::perform(
-                    daemon_client::systemctl_set_enabled(enable),
-                    move |result| {
-                        if result.is_ok() {
-                            Message::DaemonAutoStartChecked(enable)
-                        } else {
-                            Message::DaemonActionComplete(result)
-                        }
-                    },
-                );
+                return iced::Task::future(async move {
+                    let result = daemon_client::systemctl_set_enabled(enable).await;
+                    if result.is_ok() {
+                        Message::DaemonAutoStartChecked(enable)
+                    } else {
+                        Message::DaemonActionComplete(result)
+                    }
+                });
             }
             Message::DaemonActionComplete(result) => {
                 self.state.daemon_action_pending = false;
-                if let Err(e) = result {
-                    warn!("Daemon action failed: {}", e);
+                match &result {
+                    Ok(msg) if msg.starts_with("start:") => {
+                        self.daemon_connected = true;
+                    }
+                    Err(e) => {
+                        warn!("Daemon action failed: {}", e);
+                    }
+                    _ => {}
                 }
             }
             Message::DaemonAutoStartChecked(enabled) => {

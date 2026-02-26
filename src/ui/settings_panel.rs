@@ -76,17 +76,52 @@ pub fn settings_panel<'a>(
     .align_y(Alignment::Center);
 
     // Action buttons
-    let start_btn = action_button("Start", daemon_action_pending || daemon_connected, || {
-        Message::DaemonStart
-    });
-    let stop_btn = action_button("Stop", daemon_action_pending || !daemon_connected, || {
-        Message::DaemonStop
-    });
-    let restart_btn = action_button("Restart", daemon_action_pending, || Message::DaemonRestart);
+    let start_disabled = daemon_action_pending || daemon_connected;
+    let stop_disabled = daemon_action_pending || !daemon_connected;
 
-    let buttons_row = row![start_btn, stop_btn, restart_btn,]
-        .spacing(SPACING_SM)
-        .align_y(Alignment::Center);
+    let btn_style = |_theme: &Theme, status: button::Status| {
+        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if is_hovered {
+                SURFACE_LIGHT
+            } else {
+                SURFACE
+            })),
+            text_color: TEXT,
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(SOOTMIX_DARK.border_default)
+                .width(1.0),
+            ..button::Style::default()
+        }
+    };
+
+    let btn_style_dim = |_theme: &Theme, _status: button::Status| button::Style {
+        background: Some(Background::Color(SURFACE)),
+        text_color: TEXT_DIM,
+        border: Border::default()
+            .rounded(RADIUS_SM)
+            .color(SOOTMIX_DARK.border_subtle)
+            .width(1.0),
+        ..button::Style::default()
+    };
+
+    let buttons_row = row![
+        button(text("Start").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(if start_disabled { btn_style_dim } else { btn_style })
+            .on_press_maybe(if start_disabled { None } else { Some(Message::DaemonStart) }),
+        button(text("Stop").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(if stop_disabled { btn_style_dim } else { btn_style })
+            .on_press_maybe(if stop_disabled { None } else { Some(Message::DaemonStop) }),
+        button(text("Restart").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(if daemon_action_pending { btn_style_dim } else { btn_style })
+            .on_press_maybe(if daemon_action_pending { None } else { Some(Message::DaemonRestart) }),
+    ]
+    .spacing(SPACING_SM)
+    .align_y(Alignment::Center);
 
     // Autostart toggle
     let autostart_check = checkbox(daemon_autostart)
@@ -119,16 +154,6 @@ pub fn settings_panel<'a>(
     ]
     .align_y(Alignment::Center);
 
-    // Pending indicator
-    let pending_indicator: Element<Message> = if daemon_action_pending {
-        text("Working...")
-            .size(TEXT_CAPTION)
-            .color(PRIMARY)
-            .into()
-    } else {
-        Space::new().height(0).into()
-    };
-
     // Main content
     let content = column![
         header,
@@ -140,8 +165,6 @@ pub fn settings_panel<'a>(
         status_row,
         Space::new().height(SPACING_SM),
         buttons_row,
-        Space::new().height(SPACING_XS),
-        pending_indicator,
         Space::new().height(SPACING_SM),
         autostart_toggle,
     ]
@@ -164,47 +187,4 @@ pub fn settings_panel<'a>(
             ..container::Style::default()
         })
         .into()
-}
-
-/// Create a styled action button.
-fn action_button<'a>(
-    label: &str,
-    disabled: bool,
-    on_press: impl Fn() -> Message + 'a,
-) -> Element<'a, Message> {
-    let label = label.to_string();
-    let mut btn = button(
-        text(label)
-            .size(TEXT_SMALL)
-            .color(if disabled { TEXT_DIM } else { TEXT }),
-    )
-    .padding([SPACING_XS, SPACING_SM])
-    .style(move |_theme: &Theme, status| {
-        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style {
-            background: Some(Background::Color(if disabled {
-                SURFACE
-            } else if is_hovered {
-                SURFACE_LIGHT
-            } else {
-                SURFACE
-            })),
-            text_color: if disabled { TEXT_DIM } else { TEXT },
-            border: Border::default()
-                .rounded(RADIUS_SM)
-                .color(if disabled {
-                    SOOTMIX_DARK.border_subtle
-                } else {
-                    SOOTMIX_DARK.border_default
-                })
-                .width(1.0),
-            ..button::Style::default()
-        }
-    });
-
-    if !disabled {
-        btn = btn.on_press(on_press());
-    }
-
-    btn.into()
 }
