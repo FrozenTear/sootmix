@@ -417,6 +417,14 @@ pub enum DaemonCommand {
 /// Uses RwLock instead of OnceLock to allow updating the sender on reconnection.
 static DAEMON_CMD_TX: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>> = std::sync::RwLock::new(None);
 
+/// Flag to suppress auto-restart when the user explicitly stops the daemon.
+static DAEMON_AUTO_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set whether the daemon subscription should auto-restart the daemon on disconnect.
+pub fn set_auto_restart(enabled: bool) {
+    DAEMON_AUTO_RESTART.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Send a command to the daemon.
 pub fn send_daemon_command(cmd: DaemonCommand) -> Result<(), String> {
     let guard = DAEMON_CMD_TX.read().map_err(|e| format!("Lock poisoned: {}", e))?;
@@ -571,8 +579,9 @@ fn daemon_event_stream() -> impl futures::Stream<Item = DaemonEvent> + Send {
                 Err(e) => {
                     warn!("Failed to connect to daemon: {}", e);
 
-                    // Try to start the daemon if we haven't already
-                    if !start_attempted {
+                    // Try to start the daemon if we haven't already and auto-restart is enabled
+                    let auto_restart = DAEMON_AUTO_RESTART.load(std::sync::atomic::Ordering::Relaxed);
+                    if !start_attempted && auto_restart {
                         start_attempted = true;
                         info!("Attempting to start sootmix-daemon...");
                         if let Err(start_err) = try_start_daemon().await {

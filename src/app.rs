@@ -719,6 +719,7 @@ impl SootMix {
             // ==================== Daemon Service Controls ====================
             Message::DaemonStart => {
                 self.state.daemon_action_pending = true;
+                daemon_client::set_auto_restart(true);
                 return iced::Task::perform(
                     daemon_client::systemctl_start(),
                     Message::DaemonActionComplete,
@@ -726,6 +727,7 @@ impl SootMix {
             }
             Message::DaemonStop => {
                 self.state.daemon_action_pending = true;
+                daemon_client::set_auto_restart(false);
                 return iced::Task::perform(
                     daemon_client::systemctl_stop(),
                     Message::DaemonActionComplete,
@@ -733,6 +735,7 @@ impl SootMix {
             }
             Message::DaemonRestart => {
                 self.state.daemon_action_pending = true;
+                daemon_client::set_auto_restart(true);
                 return iced::Task::perform(
                     daemon_client::systemctl_restart(),
                     Message::DaemonActionComplete,
