@@ -4475,6 +4475,7 @@ impl SootMix {
                         } else {
                             Some(app_info.media_name)
                         },
+                        stream_index: app_info.stream_index,
                     });
                 }
 
@@ -4597,6 +4598,7 @@ impl SootMix {
                         binary: if app_info.binary.is_empty() { None } else { Some(app_info.binary) },
                         icon: if app_info.icon.is_empty() { None } else { Some(app_info.icon) },
                         media_name: if app_info.media_name.is_empty() { None } else { Some(app_info.media_name) },
+                        stream_index: app_info.stream_index,
                     });
                 }
             }

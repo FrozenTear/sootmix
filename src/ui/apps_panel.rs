@@ -26,7 +26,7 @@ pub fn apps_panel<'a>(
     let title = text("Audio Apps").size(TEXT_BODY).color(TEXT);
 
     // Count unique apps (deduplicated)
-    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for app in apps {
         seen_ids.insert(app.identifier());
     }
@@ -44,7 +44,7 @@ pub fn apps_panel<'a>(
 
     // === APP ITEMS ===
     // Deduplicate apps by identifier - group all streams from the same app together
-    let mut app_groups: HashMap<&str, (Vec<&AppInfo>, usize)> = HashMap::new();
+    let mut app_groups: HashMap<String, (Vec<&AppInfo>, usize)> = HashMap::new();
     for app in apps {
         let id = app.identifier();
         app_groups
@@ -52,7 +52,9 @@ pub fn apps_panel<'a>(
             .or_insert_with(|| (Vec::new(), 0))
             .0
             .push(app);
-        app_groups.get_mut(id).unwrap().1 += 1;
+    }
+    for group in app_groups.values_mut() {
+        group.1 = group.0.len();
     }
 
     // Convert to sorted list (by first occurrence order, roughly)
@@ -135,9 +137,9 @@ fn app_item<'a>(
     channels: &'a [MixerChannel],
     dragging: Option<&(u32, String)>,
 ) -> Element<'a, Message> {
-    let app_id = app.identifier().to_string();
+    let app_id = app.identifier();
     let node_id = app.node_id;
-    let _ = stream_count; // Reserved for future use (showing stream count badge)
+    let _ = stream_count;
 
     // Check if this app is currently being dragged
     let is_being_dragged = dragging.map(|(_, id)| id == &app_id).unwrap_or(false);
@@ -160,7 +162,11 @@ fn app_item<'a>(
     } else {
         &app.name
     };
-    let display_name = clean_app_name(raw_name);
+    let display_name = if app.stream_index > 0 {
+        format!("{} #{}", clean_app_name(raw_name), app.stream_index)
+    } else {
+        clean_app_name(raw_name)
+    };
     let is_assigned = assigned_channel.is_some();
 
     let name_text = text(display_name)

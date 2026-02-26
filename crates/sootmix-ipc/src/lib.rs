@@ -94,13 +94,24 @@ pub struct AppInfo {
     pub media_name: String,
     /// PipeWire node ID.
     pub node_id: u32,
+    /// Stream index for multi-stream apps (0 = single stream, 1+ = indexed).
+    pub stream_index: u32,
 }
 
 impl AppInfo {
     /// Get identifier used for matching and assignment.
-    /// Only prefers media_name for generic Chromium/Electron apps where the app name
-    /// is unhelpful. For distinctive apps (Firefox, Zen, etc.), uses app name/binary.
-    pub fn identifier(&self) -> &str {
+    /// Returns base identifier with `#N` suffix when stream_index > 1.
+    pub fn identifier(&self) -> String {
+        let base = self.base_identifier();
+        if self.stream_index > 1 {
+            format!("{}#{}", base, self.stream_index)
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// Get the base identifier without any stream index suffix.
+    pub fn base_identifier(&self) -> &str {
         if is_generic_app_identity(&self.name, &self.binary) {
             if !self.media_name.is_empty() && !is_generic_media_name(&self.media_name) {
                 return &self.media_name;

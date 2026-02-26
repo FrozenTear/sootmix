@@ -588,6 +588,8 @@ pub struct AppInfo {
     pub icon: Option<String>,
     /// Media name from PipeWire (e.g., page title for Chromium PWAs).
     pub media_name: Option<String>,
+    /// Stream index for multi-stream apps (0 = single stream, 1+ = indexed).
+    pub stream_index: u32,
 }
 
 /// Check if a media name is generic/unhelpful for identification.
@@ -621,11 +623,43 @@ pub fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         || generic_binaries.iter().any(|g| binary == *g)
 }
 
+/// Assign stream indices to apps that share the same base identifier.
+/// Groups with >1 member get 1-based indices sorted by node_id.
+/// Single-stream apps keep index 0 (no suffix in identifier).
+fn assign_stream_indices(apps: &mut [AppInfo]) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, app) in apps.iter().enumerate() {
+        groups
+            .entry(app.base_identifier().to_string())
+            .or_default()
+            .push(i);
+    }
+
+    for (_, indices) in &groups {
+        if indices.len() > 1 {
+            let mut sorted = indices.clone();
+            sorted.sort_by_key(|&i| apps[i].node_id);
+            for (rank, &idx) in sorted.iter().enumerate() {
+                apps[idx].stream_index = (rank + 1) as u32;
+            }
+        }
+    }
+}
+
 impl AppInfo {
     /// Get identifier used for matching and assignment.
-    /// Only prefers media_name for generic Chromium/Electron apps where the app name
-    /// is unhelpful. For distinctive apps (Firefox, Zen, etc.), uses app name/binary.
-    pub fn identifier(&self) -> &str {
+    /// Returns base identifier with `#N` suffix when stream_index > 1.
+    pub fn identifier(&self) -> String {
+        let base = self.base_identifier();
+        if self.stream_index > 1 {
+            format!("{}#{}", base, self.stream_index)
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// Get the base identifier without any stream index suffix.
+    pub fn base_identifier(&self) -> &str {
         let binary = self.binary.as_deref().unwrap_or("");
         if is_generic_app_identity(&self.name, binary) {
             if let Some(ref media) = self.media_name {
@@ -1086,7 +1120,7 @@ impl AppState {
 
     /// Update available apps from PipeWire graph.
     pub fn update_available_apps(&mut self) {
-        self.available_apps = self
+        let mut apps: Vec<AppInfo> = self
             .pw_graph
             .playback_streams()
             .iter()
@@ -1134,9 +1168,13 @@ impl AppState {
                     binary: node.binary_name.clone(),
                     icon: None,
                     media_name,
+                    stream_index: 0,
                 }
             })
             .collect();
+
+        assign_stream_indices(&mut apps);
+        self.available_apps = apps;
     }
 
     /// Update available input devices from PipeWire graph.

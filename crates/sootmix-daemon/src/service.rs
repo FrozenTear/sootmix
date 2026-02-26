@@ -237,6 +237,32 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         || generic_binaries.iter().any(|g| binary == *g)
 }
 
+/// Assign stream indices to apps that share the same base identifier.
+/// Groups with >1 member get 1-based indices sorted by node_id.
+/// Single-stream apps keep index 0 (no suffix in identifier).
+fn assign_stream_indices(apps: &mut [AppState]) {
+    // Group indices by base_identifier
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, app) in apps.iter().enumerate() {
+        groups
+            .entry(app.base_identifier().to_string())
+            .or_default()
+            .push(i);
+    }
+
+    for (_, indices) in &groups {
+        if indices.len() > 1 {
+            // Sort by node_id (lower = earlier = #1)
+            let mut sorted = indices.clone();
+            sorted.sort_by_key(|&i| apps[i].node_id);
+            for (rank, &idx) in sorted.iter().enumerate() {
+                apps[idx].stream_index = (rank + 1) as u32;
+            }
+        }
+        // Single-stream apps already have stream_index = 0
+    }
+}
+
 /// Well-known domain-to-friendly-name mapping for Chromium PWAs.
 fn friendly_name_from_url(url: &str) -> Option<String> {
     // Extract the domain from the URL
@@ -417,10 +443,24 @@ pub struct AppState {
     pub name: String,
     pub binary: Option<String>,
     pub media_name: Option<String>,
+    /// Stream index for multi-stream apps (0 = single stream, 1+ = indexed).
+    pub stream_index: u32,
 }
 
 impl AppState {
-    pub fn identifier(&self) -> &str {
+    /// Get identifier used for matching and assignment.
+    /// Returns base identifier with `#N` suffix when stream_index > 1.
+    pub fn identifier(&self) -> String {
+        let base = self.base_identifier();
+        if self.stream_index > 1 {
+            format!("{}#{}", base, self.stream_index)
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// Get the base identifier without any stream index suffix.
+    pub fn base_identifier(&self) -> &str {
         let binary = self.binary.as_deref().unwrap_or("");
         if is_generic_app_identity(&self.name, binary) {
             if let Some(ref media) = self.media_name {
@@ -444,6 +484,7 @@ impl AppState {
             icon: String::new(),
             media_name: self.media_name.clone().unwrap_or_default(),
             node_id: self.node_id,
+            stream_index: self.stream_index,
         }
     }
 }
@@ -707,7 +748,7 @@ impl DaemonState {
     }
 
     pub fn update_available_apps(&mut self) {
-        self.apps = self
+        let mut apps: Vec<AppState> = self
             .pw_graph
             .playback_streams()
             .iter()
@@ -753,9 +794,13 @@ impl DaemonState {
                         .unwrap_or_else(|| node.name.clone()),
                     binary: node.binary_name.clone(),
                     media_name,
+                    stream_index: 0,
                 }
             })
             .collect();
+
+        assign_stream_indices(&mut apps);
+        self.apps = apps;
     }
 
     pub fn get_routing_rules(&self) -> Vec<RoutingRuleInfo> {
@@ -827,7 +872,7 @@ impl DaemonService {
             .state
             .apps
             .iter()
-            .map(|a| (a.node_id, a.identifier().to_string()))
+            .map(|a| (a.node_id, a.identifier()))
             .collect();
 
         // Update the app list
@@ -835,6 +880,25 @@ impl DaemonService {
 
         // Find new and removed apps
         let new_app_ids: HashSet<u32> = self.state.apps.iter().map(|a| a.node_id).collect();
+
+        // Migrate assigned_apps in channels when identifiers change
+        // (e.g., stream index transitions from single→multi or multi→single)
+        for app in &self.state.apps {
+            if let Some(old_id) = old_identifiers.get(&app.node_id) {
+                let new_id = app.identifier();
+                if *old_id != new_id {
+                    for channel in &mut self.state.channels {
+                        if let Some(pos) = channel.assigned_apps.iter().position(|a| a == old_id) {
+                            debug!(
+                                "Migrating assigned app '{}' -> '{}' in channel '{}'",
+                                old_id, new_id, channel.name
+                            );
+                            channel.assigned_apps[pos] = new_id.clone();
+                        }
+                    }
+                }
+            }
+        }
 
         // Emit signals for newly discovered apps or apps whose identity changed
         for app in &self.state.apps {
@@ -845,9 +909,7 @@ impl DaemonService {
                 );
                 self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
             } else if let Some(old_id) = old_identifiers.get(&app.node_id) {
-                if old_id != app.identifier() {
-                    // Identity changed (e.g., PID resolution resolved "Chromium" → "equibop")
-                    // Re-emit as remove + discover so the GUI updates
+                if *old_id != app.identifier() {
                     debug!(
                         "App identity changed: {} -> {} (node {})",
                         old_id, app.identifier(), app.node_id
@@ -2267,7 +2329,7 @@ impl DaemonService {
             .state
             .channels
             .iter()
-            .find(|c| c.assigned_apps.contains(&app_identifier.to_string()));
+            .find(|c| c.assigned_apps.contains(&app_identifier));
 
         if let Some(channel) = assigned_to_channel {
             // This app is assigned to one of our channels, but this link goes elsewhere!
