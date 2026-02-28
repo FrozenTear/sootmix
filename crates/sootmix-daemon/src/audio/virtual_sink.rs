@@ -496,7 +496,7 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
     let playback_props = format!(
         "media.class=Audio/Source node.name={} node.description=\"{}\" \
          node.virtual=false device.class=audio-input \
-         audio.position=[MONO] priority.session=2000",
+         audio.position=[FL,FR] priority.session=2000",
         source_name, name
     );
 
