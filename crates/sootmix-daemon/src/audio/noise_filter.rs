@@ -121,7 +121,7 @@ context.modules = [
     ));
 
     // If a specific input device is specified, target it
-    if let Some(device) = input_device_name {
+    if let Some(device) = input_device_name.filter(|d| *d != "system-default") {
         config.push_str(&format!(
             r#"                target.object = "{device}"
 "#
@@ -218,7 +218,7 @@ context.modules = [
 "#
     ));
 
-    if let Some(device) = input_device_name {
+    if let Some(device) = input_device_name.filter(|d| *d != "system-default") {
         config.push_str(&format!(
             r#"                target.object = "{device}"
 "#

@@ -510,6 +510,7 @@ impl PwGraphState {
             .values()
             .filter(|n| {
                 n.media_class == MediaClass::AudioSink
+                    && !n.name.starts_with("sootmix.")
                     && !exclude_names.iter().any(|ex| n.name.contains(ex))
             })
             .map(|n| OutputInfo {
@@ -523,7 +524,7 @@ impl PwGraphState {
     pub fn input_devices(&self, exclude_names: &[&str]) -> Vec<InputInfo> {
         self.nodes
             .values()
-            .filter(|n| n.is_audio_input() && !exclude_names.iter().any(|ex| n.name.contains(ex)))
+            .filter(|n| n.is_audio_input() && !n.name.starts_with("sootmix.") && !exclude_names.iter().any(|ex| n.name.contains(ex)))
             .map(|n| InputInfo {
                 node_id: n.id,
                 name: n.name.clone(),
@@ -1527,14 +1528,16 @@ impl DaemonService {
 
                 // Link the capture node to the target mic (or system default)
                 if let Some(capture_node_id) = capture_id {
-                    if let Some(mic_name) = target_mic {
+                    if let Some(mic_name) =
+                        target_mic.filter(|n| n != "system-default")
+                    {
                         // Specific mic selected
                         self.send_pw_command(PwCommand::LinkInputChannelToMic {
                             capture_node_id,
                             target_mic_name: mic_name,
                         });
                     } else {
-                        // No specific mic - link to system default
+                        // No specific mic (or "system-default") - link to system default
                         self.send_pw_command(PwCommand::LinkInputChannelToDefaultMic {
                             capture_node_id,
                         });
