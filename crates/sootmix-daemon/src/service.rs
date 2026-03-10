@@ -449,14 +449,9 @@ pub struct AppState {
 
 impl AppState {
     /// Get identifier used for matching and assignment.
-    /// Returns base identifier with `#N` suffix when stream_index > 1.
+    /// All streams from the same app share one identifier (grouped by base_identifier).
     pub fn identifier(&self) -> String {
-        let base = self.base_identifier();
-        if self.stream_index > 1 {
-            format!("{}#{}", base, self.stream_index)
-        } else {
-            base.to_string()
-        }
+        self.base_identifier().to_string()
     }
 
     /// Get the base identifier without any stream index suffix.
@@ -2149,11 +2144,14 @@ impl DaemonService {
             .pw_sink_id
             .ok_or_else(|| ServiceError::ChannelNotFound("No sink for channel".to_string()))?;
 
-        // Set the stream's target to our sink - this tells WirePlumber to stop
-        // auto-managing this stream and prevents it from recreating links to default sink
-        if let Err(e) = crate::audio::routing::set_stream_target(app_node_id, sink_node_id) {
-            warn!("Failed to set stream target: {}", e);
-        }
+        // Collect ALL node IDs that share this identifier (same app, multiple streams)
+        let all_node_ids: Vec<u32> = self
+            .state
+            .apps
+            .iter()
+            .filter(|a| a.identifier() == app_identifier)
+            .map(|a| a.node_id)
+            .collect();
 
         let our_sinks: Vec<u32> = self
             .state
@@ -2162,30 +2160,39 @@ impl DaemonService {
             .filter_map(|c| c.pw_sink_id)
             .collect();
 
-        // Destroy links to non-sootmix sinks FIRST
-        let links_to_destroy: Vec<u32> = self
-            .state
-            .pw_graph
-            .links_from_node(app_node_id)
-            .iter()
-            .filter(|link| !our_sinks.contains(&link.input_node))
-            .map(|l| l.id)
-            .collect();
+        // Route ALL matching nodes to the channel sink
+        for node_id in &all_node_ids {
+            // Set the stream's target to our sink - this tells WirePlumber to stop
+            // auto-managing this stream and prevents it from recreating links to default sink
+            if let Err(e) = crate::audio::routing::set_stream_target(*node_id, sink_node_id) {
+                warn!("Failed to set stream target for node {}: {}", node_id, e);
+            }
 
-        for link_id in links_to_destroy {
-            self.send_pw_command(PwCommand::DestroyLink { link_id });
-        }
+            // Destroy links to non-sootmix sinks FIRST
+            let links_to_destroy: Vec<u32> = self
+                .state
+                .pw_graph
+                .links_from_node(*node_id)
+                .iter()
+                .filter(|link| !our_sinks.contains(&link.input_node))
+                .map(|l| l.id)
+                .collect();
 
-        // Then create links to our sink
-        let port_pairs = self
-            .state
-            .pw_graph
-            .find_port_pairs(app_node_id, sink_node_id);
-        for (output_port, input_port) in port_pairs {
-            self.send_pw_command(PwCommand::CreateLink {
-                output_port,
-                input_port,
-            });
+            for link_id in links_to_destroy {
+                self.send_pw_command(PwCommand::DestroyLink { link_id });
+            }
+
+            // Then create links to our sink
+            let port_pairs = self
+                .state
+                .pw_graph
+                .find_port_pairs(*node_id, sink_node_id);
+            for (output_port, input_port) in port_pairs {
+                self.send_pw_command(PwCommand::CreateLink {
+                    output_port,
+                    input_port,
+                });
+            }
         }
 
         // Add to assigned apps list
@@ -2381,39 +2388,53 @@ impl DaemonService {
             .map(|c| c.pw_sink_id)
             .ok_or_else(|| ServiceError::ChannelNotFound(channel_id.to_string()))?;
 
-        // Clear the stream's target so WirePlumber can manage it again
-        if let Err(e) = crate::audio::routing::clear_stream_target(app_node_id) {
-            warn!("Failed to clear stream target: {}", e);
-        }
+        // Collect ALL node IDs that share this identifier (same app, multiple streams)
+        let all_node_ids: Vec<u32> = self
+            .state
+            .apps
+            .iter()
+            .filter(|a| a.identifier() == app_identifier)
+            .map(|a| a.node_id)
+            .collect();
 
-        // Find hardware sink to reconnect to
         let outputs = self.state.get_outputs();
-        if let Some(default) = outputs.first() {
-            let port_pairs = self
-                .state
-                .pw_graph
-                .find_port_pairs(app_node_id, default.node_id);
-            for (output_port, input_port) in port_pairs {
-                self.send_pw_command(PwCommand::CreateLink {
-                    output_port,
-                    input_port,
-                });
+        let default_output = outputs.first().map(|o| o.node_id);
+
+        // Unroute ALL matching nodes
+        for node_id in &all_node_ids {
+            // Clear the stream's target so WirePlumber can manage it again
+            if let Err(e) = crate::audio::routing::clear_stream_target(*node_id) {
+                warn!("Failed to clear stream target for node {}: {}", node_id, e);
             }
-        }
 
-        // Destroy links to our sink
-        if let Some(sink_id) = sink_node_id {
-            let links_to_destroy: Vec<u32> = self
-                .state
-                .pw_graph
-                .links
-                .values()
-                .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
-                .map(|l| l.id)
-                .collect();
+            // Find hardware sink to reconnect to
+            if let Some(default_id) = default_output {
+                let port_pairs = self
+                    .state
+                    .pw_graph
+                    .find_port_pairs(*node_id, default_id);
+                for (output_port, input_port) in port_pairs {
+                    self.send_pw_command(PwCommand::CreateLink {
+                        output_port,
+                        input_port,
+                    });
+                }
+            }
 
-            for link_id in links_to_destroy {
-                self.send_pw_command(PwCommand::DestroyLink { link_id });
+            // Destroy links to our sink
+            if let Some(sink_id) = sink_node_id {
+                let links_to_destroy: Vec<u32> = self
+                    .state
+                    .pw_graph
+                    .links
+                    .values()
+                    .filter(|l| l.output_node == *node_id && l.input_node == sink_id)
+                    .map(|l| l.id)
+                    .collect();
+
+                for link_id in links_to_destroy {
+                    self.send_pw_command(PwCommand::DestroyLink { link_id });
+                }
             }
         }
 

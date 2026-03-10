@@ -648,14 +648,9 @@ fn assign_stream_indices(apps: &mut [AppInfo]) {
 
 impl AppInfo {
     /// Get identifier used for matching and assignment.
-    /// Returns base identifier with `#N` suffix when stream_index > 1.
+    /// All streams from the same app share one identifier (grouped by base_identifier).
     pub fn identifier(&self) -> String {
-        let base = self.base_identifier();
-        if self.stream_index > 1 {
-            format!("{}#{}", base, self.stream_index)
-        } else {
-            base.to_string()
-        }
+        self.base_identifier().to_string()
     }
 
     /// Get the base identifier without any stream index suffix.

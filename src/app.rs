@@ -3323,41 +3323,51 @@ impl SootMix {
         };
 
         // Get app identifier for tracking
-        let app_identifier = self.state.available_apps.iter()
+        let app_identifier = match self.state.available_apps.iter()
             .find(|a| a.node_id == app_node_id)
-            .map(|a| a.identifier().to_string());
+            .map(|a| a.identifier())
+        {
+            Some(id) => id,
+            None => return false,
+        };
 
-        // First, disconnect the app from any existing sinks (except our own)
-        // This ensures audio ONLY goes through our virtual sink
-        let existing_links = self.state.pw_graph.links_from_node(app_node_id);
-        for link in existing_links {
-            // Don't destroy links to our own sinks
-            let is_our_sink = self.state.channels.iter()
-                .any(|c| c.pw_sink_id == Some(link.input_node));
-            if !is_our_sink {
-                info!("Disconnecting app from node {}: destroying link {}", link.input_node, link.id);
-                self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+        // Collect ALL node IDs that share this identifier (same app, multiple streams)
+        let all_node_ids: Vec<u32> = self.state.available_apps.iter()
+            .filter(|a| a.identifier() == app_identifier)
+            .map(|a| a.node_id)
+            .collect();
+
+        let mut any_linked = false;
+        for node_id in &all_node_ids {
+            // Disconnect the app from any existing sinks (except our own)
+            let existing_links = self.state.pw_graph.links_from_node(*node_id);
+            for link in existing_links {
+                let is_our_sink = self.state.channels.iter()
+                    .any(|c| c.pw_sink_id == Some(link.input_node));
+                if !is_our_sink {
+                    info!("Disconnecting app from node {}: destroying link {}", link.input_node, link.id);
+                    self.send_pw_command(PwCommand::DestroyLink { link_id: link.id });
+                }
+            }
+
+            // Find port pairs and create links
+            let port_pairs = self.state.pw_graph.find_port_pairs(*node_id, sink_id);
+            for (output_port, input_port) in port_pairs {
+                info!("Creating link: port {} -> port {}", output_port, input_port);
+                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+                any_linked = true;
             }
         }
 
-        // Find port pairs and create links
-        let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, sink_id);
-        if port_pairs.is_empty() {
-            warn!("No matching ports found for app {} -> sink {}", app_node_id, sink_id);
+        if !any_linked {
+            warn!("No matching ports found for app {} -> sink {}", app_identifier, sink_id);
             return false;
         }
 
-        for (output_port, input_port) in port_pairs {
-            info!("Creating link: port {} -> port {}", output_port, input_port);
-            self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
-        }
-
         // Add to assigned apps
-        if let Some(identifier) = app_identifier {
-            if let Some(channel) = self.state.channel_mut(channel_id) {
-                if !channel.assigned_apps.contains(&identifier) {
-                    channel.assigned_apps.push(identifier);
-                }
+        if let Some(channel) = self.state.channel_mut(channel_id) {
+            if !channel.assigned_apps.contains(&app_identifier) {
+                channel.assigned_apps.push(app_identifier);
             }
         }
 
@@ -3373,39 +3383,48 @@ impl SootMix {
         let sink_id = channel.pw_sink_id;
 
         // Get app identifier for tracking
-        let app_identifier = self.state.available_apps.iter()
+        let app_identifier = match self.state.available_apps.iter()
             .find(|a| a.node_id == app_node_id)
-            .map(|a| a.identifier().to_string());
+            .map(|a| a.identifier())
+        {
+            Some(id) => id,
+            None => return,
+        };
 
-        // FIRST: Connect to default output (before destroying old links)
-        // This ensures there's never a gap where the app has no audio output
-        if let Some(default_output) = self.get_output_device_node_id() {
-            info!("Reconnecting app {} to hardware sink {}", app_node_id, default_output);
-            let port_pairs = self.state.pw_graph.find_port_pairs(app_node_id, default_output);
-            for (output_port, input_port) in port_pairs {
-                self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+        // Collect ALL node IDs that share this identifier (same app, multiple streams)
+        let all_node_ids: Vec<u32> = self.state.available_apps.iter()
+            .filter(|a| a.identifier() == app_identifier)
+            .map(|a| a.node_id)
+            .collect();
+
+        let default_output = self.get_output_device_node_id();
+
+        for node_id in &all_node_ids {
+            // FIRST: Connect to default output (before destroying old links)
+            if let Some(default_id) = default_output {
+                info!("Reconnecting app node {} to hardware sink {}", node_id, default_id);
+                let port_pairs = self.state.pw_graph.find_port_pairs(*node_id, default_id);
+                for (output_port, input_port) in port_pairs {
+                    self.send_pw_command(PwCommand::CreateLink { output_port, input_port });
+                }
             }
-        } else {
-            warn!("No hardware sink found to reconnect app");
-        }
 
-        // THEN: Destroy links to our sink
-        if let Some(sink_id) = sink_id {
-            let links_to_destroy: Vec<u32> = self.state.pw_graph.links.values()
-                .filter(|l| l.output_node == app_node_id && l.input_node == sink_id)
-                .map(|l| l.id)
-                .collect();
-            for link_id in links_to_destroy {
-                info!("Destroying link {} from app to channel sink", link_id);
-                self.send_pw_command(PwCommand::DestroyLink { link_id });
+            // THEN: Destroy links to our sink
+            if let Some(sink_id) = sink_id {
+                let links_to_destroy: Vec<u32> = self.state.pw_graph.links.values()
+                    .filter(|l| l.output_node == *node_id && l.input_node == sink_id)
+                    .map(|l| l.id)
+                    .collect();
+                for link_id in links_to_destroy {
+                    info!("Destroying link {} from app to channel sink", link_id);
+                    self.send_pw_command(PwCommand::DestroyLink { link_id });
+                }
             }
         }
 
         // Remove from assigned apps
-        if let Some(identifier) = app_identifier {
-            if let Some(channel) = self.state.channel_mut(channel_id) {
-                channel.assigned_apps.retain(|a| a != &identifier);
-            }
+        if let Some(channel) = self.state.channel_mut(channel_id) {
+            channel.assigned_apps.retain(|a| a != &app_identifier);
         }
     }
 

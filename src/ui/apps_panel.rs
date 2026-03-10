@@ -162,11 +162,7 @@ fn app_item<'a>(
     } else {
         &app.name
     };
-    let display_name = if app.stream_index > 0 {
-        format!("{} #{}", clean_app_name(raw_name), app.stream_index)
-    } else {
-        clean_app_name(raw_name)
-    };
+    let display_name = clean_app_name(raw_name);
     let is_assigned = assigned_channel.is_some();
 
     let name_text = text(display_name)
