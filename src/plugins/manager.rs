@@ -4,7 +4,7 @@
 
 //! Plugin manager - discovery, lifecycle, and registry.
 
-use super::{native::{NativePluginLoader, check_plugin_permissions}, PluginFilter, PluginLoadError, PluginMetadata, PluginResult, PluginType};
+use super::{builtin::{self, BuiltinRegistry}, native::{NativePluginLoader, check_plugin_permissions}, PluginFilter, PluginLoadError, PluginMetadata, PluginResult, PluginType};
 #[cfg(feature = "lv2-plugins")]
 use super::lv2::Lv2PluginLoader;
 #[cfg(feature = "vst3-plugins")]
@@ -385,6 +385,24 @@ impl PluginManager {
             registry.scan()
         };
 
+        // Register built-in plugins
+        {
+            let builtin_registry = BuiltinRegistry::new();
+            let mut registry = self.registry.write();
+            for meta in builtin_registry.plugins() {
+                let plugin_meta = PluginMetadata {
+                    path: std::path::PathBuf::from(&meta.id),
+                    plugin_type: PluginType::Builtin,
+                    info: Some(meta.info.clone()),
+                    enabled: true,
+                };
+                registry.plugins.insert(meta.id.clone(), plugin_meta);
+            }
+            let builtin_count = builtin_registry.len();
+            count += builtin_count;
+            info!("Built-in plugins registered: {}", builtin_count);
+        }
+
         // Scan LV2 plugins
         #[cfg(feature = "lv2-plugins")]
         if let Some(ref mut lv2_loader) = self.lv2_loader {
@@ -490,9 +508,12 @@ impl PluginManager {
                 ));
             }
             PluginType::Builtin => {
-                return Err(PluginLoadError::Initialization(
-                    "Builtin plugins should be created directly".to_string(),
-                ));
+                let id = path.to_string_lossy();
+                builtin::create_builtin(&id).ok_or_else(|| {
+                    PluginLoadError::Initialization(
+                        format!("Unknown builtin plugin: {}", id),
+                    )
+                })?
             }
             #[cfg(feature = "lv2-plugins")]
             PluginType::Lv2 => {

@@ -533,8 +533,9 @@ impl DaemonDbusService {
         enabled: bool,
     ) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_channel_eq_enabled({}, {})", channel_id, enabled);
-        // TODO: Implement EQ
-        Ok(())
+        Err(zbus::fdo::Error::NotSupported(
+            "EQ is not yet implemented in the daemon".into(),
+        ))
     }
 
     /// Set EQ preset for a channel.
@@ -547,8 +548,9 @@ impl DaemonDbusService {
             "D-Bus: set_channel_eq_preset({}, {})",
             channel_id, preset_name
         );
-        // TODO: Implement EQ
-        Ok(())
+        Err(zbus::fdo::Error::NotSupported(
+            "EQ is not yet implemented in the daemon".into(),
+        ))
     }
 
     // ==================== Routing Rules ====================
@@ -565,22 +567,25 @@ impl DaemonDbusService {
     /// Add or update a routing rule.
     async fn set_routing_rule(&self, rule: RoutingRuleInfo) -> zbus::fdo::Result<()> {
         debug!("D-Bus: set_routing_rule({:?})", rule);
-        // TODO: Implement routing rules management
-        Ok(())
+        Err(zbus::fdo::Error::NotSupported(
+            "Routing rules are evaluated by the UI only. Daemon-side evaluation is not yet implemented.".into(),
+        ))
     }
 
     /// Delete a routing rule.
     async fn delete_routing_rule(&self, rule_id: &str) -> zbus::fdo::Result<()> {
         debug!("D-Bus: delete_routing_rule({})", rule_id);
-        // TODO: Implement routing rules management
-        Ok(())
+        Err(zbus::fdo::Error::NotSupported(
+            "Routing rules are evaluated by the UI only. Daemon-side evaluation is not yet implemented.".into(),
+        ))
     }
 
     /// Toggle a routing rule's enabled state.
     async fn toggle_routing_rule(&self, rule_id: &str) -> zbus::fdo::Result<()> {
         debug!("D-Bus: toggle_routing_rule({})", rule_id);
-        // TODO: Implement routing rules management
-        Ok(())
+        Err(zbus::fdo::Error::NotSupported(
+            "Routing rules are evaluated by the UI only. Daemon-side evaluation is not yet implemented.".into(),
+        ))
     }
 
     // ==================== Recording ====================
@@ -852,6 +857,38 @@ pub async fn emit_meter_update(
             INTERFACE_NAME,
             "MeterUpdate",
             &(data,),
+        )
+        .await
+}
+
+/// Emit MasterVolumeChanged signal (for external volume changes).
+pub async fn emit_master_volume_changed(
+    ctx: &zbus::SignalContext<'_>,
+    volume_db: f64,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "MasterVolumeChanged",
+            &(volume_db,),
+        )
+        .await
+}
+
+/// Emit MasterMuteChanged signal (for external mute changes).
+pub async fn emit_master_mute_changed(
+    ctx: &zbus::SignalContext<'_>,
+    muted: bool,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "MasterMuteChanged",
+            &(muted,),
         )
         .await
 }

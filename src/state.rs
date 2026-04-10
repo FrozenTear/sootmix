@@ -77,17 +77,17 @@ pub struct MeterDisplayState {
 impl MeterDisplayState {
     /// Clip threshold (0dBFS in linear scale).
     const CLIP_THRESHOLD: f32 = 1.0;
-    /// Peak hold time in seconds (industry standard: 2-3 seconds).
-    const PEAK_HOLD_TIME: f32 = 2.5;
-    /// Peak decay rate in linear units per second (IEC 60268-18 standard: ~20dB/s).
-    const PEAK_DECAY_RATE: f32 = 0.8;
+    /// Peak hold time in seconds.
+    const PEAK_HOLD_TIME: f32 = 2.0;
+    /// Peak decay rate in linear units per second.
+    const PEAK_DECAY_RATE: f32 = 0.5;
     /// Clip indicator auto-reset time in seconds.
     const CLIP_RESET_TIME: f32 = 3.0;
 
-    /// Attack time constant in seconds (fast attack to catch transients).
-    const ATTACK_TIME: f32 = 0.015;
-    /// Decay time constant in seconds (slower decay for smooth falloff).
-    const DECAY_TIME: f32 = 0.25;
+    /// Attack time constant in seconds (smooth rise over ~5 frames at 60Hz).
+    const ATTACK_TIME: f32 = 0.030;
+    /// Decay time constant in seconds (graceful tail-off like hardware VU meters).
+    const DECAY_TIME: f32 = 0.300;
 
     /// Calculate time-based exponential smoothing coefficient.
     /// Returns alpha for: new_value = old_value + alpha * (target - old_value)
@@ -287,6 +287,10 @@ pub struct MixerChannel {
     /// Hardware microphone gain in dB (-12.0 to +12.0). Controls the physical input device level.
     #[serde(default)]
     pub input_gain_db: f32,
+    /// Whether PFL (pre-fader listen) solo is active for this channel.
+    /// Routes this channel's audio to the monitor output device.
+    #[serde(skip)]
+    pub solo: bool,
 }
 
 fn default_vad_threshold() -> f32 {
@@ -337,6 +341,7 @@ impl MixerChannel {
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
             input_gain_db: 0.0,
+            solo: false,
         }
     }
 
@@ -375,6 +380,7 @@ impl MixerChannel {
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
             input_gain_db: 0.0,
+            solo: false,
         }
     }
 
@@ -593,7 +599,7 @@ pub struct AppInfo {
 }
 
 /// Check if a media name is generic/unhelpful for identification.
-fn is_generic_media_name(name: &str) -> bool {
+pub fn is_generic_media_name(name: &str) -> bool {
     matches!(
         name,
         "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"
@@ -651,6 +657,28 @@ impl AppInfo {
     /// All streams from the same app share one identifier (grouped by base_identifier).
     pub fn identifier(&self) -> String {
         self.base_identifier().to_string()
+    }
+
+    /// Get a clean, human-friendly display name for the app.
+    /// For generic apps (Chromium/Electron), prefers media_name over app name.
+    /// Strips " (Virtual Sink)" suffix. Appends " #N" for multi-stream apps.
+    pub fn display_name(&self) -> String {
+        let binary = self.binary.as_deref().unwrap_or("");
+        let raw_name = if is_generic_app_identity(&self.name, binary) {
+            self.media_name
+                .as_deref()
+                .filter(|m| !m.is_empty() && !is_generic_media_name(m))
+                .unwrap_or(&self.name)
+        } else {
+            &self.name
+        };
+        let cleaned = raw_name.replace(" (Virtual Sink)", "");
+        let cleaned = cleaned.trim();
+        if self.stream_index > 0 {
+            format!("{} #{}", cleaned, self.stream_index)
+        } else {
+            cleaned.to_string()
+        }
     }
 
     /// Get the base identifier without any stream index suffix.
@@ -776,6 +804,7 @@ impl PwGraphState {
             .values()
             .filter(|n| {
                 n.media_class == MediaClass::AudioSink
+                    && !n.name.starts_with("sootmix.")
                     && !exclude_names.iter().any(|ex| n.name.contains(ex))
             })
             .map(|n| OutputDevice {
@@ -966,6 +995,8 @@ pub struct AppState {
     pub plugin_browser_channel: Option<Uuid>,
     /// Plugin editor open (channel_id, instance_id).
     pub plugin_editor_open: Option<(Uuid, Uuid)>,
+    /// Text being edited for a plugin parameter (instance_id, param_index) → text.
+    pub plugin_param_editing: std::collections::HashMap<(Uuid, u32), String>,
     /// Whether master recording output is enabled.
     pub master_recording_enabled: bool,
     /// Node ID of the virtual recording source (Audio/Source).
@@ -978,6 +1009,10 @@ pub struct AppState {
     pub bottom_panel_expanded: bool,
     /// Height of the bottom detail panel in pixels.
     pub bottom_panel_height: f32,
+
+    /// Selected monitor output device name for PFL solo routing.
+    /// Audio from soloed channels is sent to this device (e.g. headphones).
+    pub monitor_device: Option<String>,
 
     // ==================== Daemon Settings ====================
     /// Whether the daemon systemd service is enabled (autostart on login).
@@ -1034,12 +1069,14 @@ impl AppState {
             active_snapshot: None,
             plugin_browser_channel: None,
             plugin_editor_open: None,
+            plugin_param_editing: std::collections::HashMap::new(),
             master_recording_enabled: false,
             master_recording_source_id: None,
             selected_channel: None,
             left_sidebar_collapsed: false,
             bottom_panel_expanded: false,
             bottom_panel_height: 200.0,
+            monitor_device: None,
             daemon_autostart: false,
             daemon_action_pending: false,
             downloader_open: false,

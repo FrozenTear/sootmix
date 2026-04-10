@@ -13,8 +13,9 @@
 use crate::message::Message;
 use crate::plugins::{PluginMetadata, PluginType};
 use crate::ui::theme::*;
-use iced::widget::{button, column, container, row, scrollable, slider, text, Space};
+use iced::widget::{button, column, container, row, scrollable, slider, text, text_input, Space};
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
+use sootmix_plugin_api;
 use uuid::Uuid;
 
 // ============================================================================
@@ -378,7 +379,22 @@ pub fn plugin_browser(
         .align_x(Alignment::Center)
         .into()]
     } else {
-        available_plugins
+        let mut sorted = available_plugins;
+        sorted.sort_by(|a, b| {
+            // Builtins first, then alphabetically by name
+            let type_ord = |t: PluginType| match t {
+                PluginType::Builtin => 0,
+                _ => 1,
+            };
+            type_ord(a.plugin_type)
+                .cmp(&type_ord(b.plugin_type))
+                .then_with(|| {
+                    let name_a = a.info.as_ref().map(|i| i.name.as_str()).unwrap_or("");
+                    let name_b = b.info.as_ref().map(|i| i.name.as_str()).unwrap_or("");
+                    name_a.cmp(name_b)
+                })
+        });
+        sorted
             .iter()
             .map(|meta| plugin_browser_item(channel_id, meta))
             .collect()
@@ -454,12 +470,17 @@ pub fn plugin_browser(
 
 /// Create a single plugin item in the browser.
 fn plugin_browser_item(channel_id: Uuid, meta: &PluginMetadata) -> Element<'static, Message> {
-    let plugin_id = meta
-        .path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let plugin_id = if meta.plugin_type == PluginType::Builtin {
+        // Builtin IDs are dotted (e.g. "com.sootmix.gate") — file_stem() would
+        // wrongly strip the last component as a file extension.
+        meta.path.to_string_lossy().to_string()
+    } else {
+        meta.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
 
     let name = meta
         .info
@@ -558,12 +579,16 @@ pub struct PluginEditorParam {
     pub name: String,
     /// Unit label.
     pub unit: String,
-    /// Minimum value.
+    /// Minimum value (display range).
     pub min: f32,
-    /// Maximum value.
+    /// Maximum value (display range).
     pub max: f32,
-    /// Current value.
+    /// Current value (display range, denormalized).
     pub value: f32,
+    /// Parameter curve for normalization.
+    pub curve: sootmix_plugin_api::ParameterCurve,
+    /// Text being actively edited (None = show formatted value).
+    pub editing_text: Option<String>,
 }
 
 /// Create the plugin editor panel showing plugin parameters.
@@ -572,28 +597,34 @@ pub fn plugin_editor(
     plugin_name: &str,
     params: Vec<PluginEditorParam>,
 ) -> Element<'static, Message> {
-    // Header
+    let ghost_btn_style = |_theme: &Theme, status: button::Status| {
+        let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(if is_hovered {
+                Color { a: 0.15, ..MUTED_COLOR }
+            } else {
+                Color::TRANSPARENT
+            })),
+            text_color: TEXT_DIM,
+            border: Border::default().rounded(RADIUS_SM),
+            ..button::Style::default()
+        }
+    };
+
+    // Header with back arrow and close button
     let header = row![
+        button(text("\u{2190}").size(TEXT_HEADING))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(ghost_btn_style)
+            .on_press(Message::BackToPluginBrowser),
+        Space::new().width(SPACING_XS),
         text(format!("{} \u{2014} Parameters", plugin_name))
             .size(TEXT_HEADING)
             .color(TEXT),
         Space::new().width(Length::Fill),
         button(text("\u{00D7}").size(TEXT_HEADING))
             .padding([SPACING_XS, SPACING_SM])
-            .style(|_theme: &Theme, status| {
-                let is_hovered =
-                    matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: Some(Background::Color(if is_hovered {
-                        Color { a: 0.15, ..MUTED_COLOR }
-                    } else {
-                        Color::TRANSPARENT
-                    })),
-                    text_color: TEXT_DIM,
-                    border: Border::default().rounded(RADIUS_SM),
-                    ..button::Style::default()
-                }
-            })
+            .style(ghost_btn_style)
             .on_press(Message::ClosePluginEditor),
     ]
     .align_y(Alignment::Center);
@@ -646,20 +677,47 @@ pub fn plugin_editor(
         .into()
 }
 
-/// Create a parameter slider widget.
+/// Create a parameter slider widget with editable text value.
 fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'static, Message> {
     let param_index = param.index;
-    let display_value = if param.unit.is_empty() {
-        format!("{:.2}", param.value)
+    let unit = param.unit.clone();
+
+    // Text shown in the input: editing text if active, otherwise formatted value
+    let input_value = param.editing_text.unwrap_or_else(|| format!("{:.2}", param.value));
+
+    let name_text = text(param.name.clone()).size(TEXT_SMALL).color(TEXT);
+    let unit_text = if unit.is_empty() {
+        text(String::new()).size(0)
     } else {
-        format!("{:.2} {}", param.value, param.unit)
+        text(unit).size(TEXT_CAPTION).color(TEXT_DIM)
     };
 
-    let name_text = text(param.name).size(TEXT_SMALL).color(TEXT);
-    let value_text = text(display_value).size(TEXT_CAPTION).color(TEXT_DIM);
+    // Editable value input
+    let value_input = text_input("", &input_value)
+        .on_input(move |s| Message::PluginParamTextChanged(instance_id, param_index, s))
+        .on_submit(Message::PluginParamTextSubmit(instance_id, param_index))
+        .width(Length::Fixed(70.0))
+        .size(TEXT_CAPTION)
+        .style(|_theme: &Theme, _status| text_input::Style {
+            background: Background::Color(SURFACE),
+            border: Border::default()
+                .rounded(RADIUS_SM)
+                .color(SOOTMIX_DARK.border_subtle)
+                .width(1.0),
+            icon: TEXT_DIM,
+            placeholder: TEXT_DIM,
+            value: TEXT,
+            selection: SOOTMIX_DARK.accent_warm,
+        });
 
+    // Slider operates in display (denormalized) range.
+    // Normalize back to 0-1 before sending to the plugin.
+    let curve = param.curve;
+    let p_min = param.min;
+    let p_max = param.max;
     let slider_widget = slider(param.min..=param.max, param.value, move |v| {
-        Message::PluginParameterChanged(instance_id, param_index, v)
+        let normalized = sootmix_plugin_api::normalize(v, p_min, p_max, curve);
+        Message::PluginParameterChanged(instance_id, param_index, normalized)
     })
     .step(0.01)
     .width(Length::Fill)
@@ -681,7 +739,14 @@ fn parameter_slider(instance_id: Uuid, param: PluginEditorParam) -> Element<'sta
     });
 
     column![
-        row![name_text, Space::new().width(Length::Fill), value_text,].align_y(Alignment::Center),
+        row![
+            name_text,
+            Space::new().width(Length::Fill),
+            value_input,
+            Space::new().width(SPACING_XS),
+            unit_text,
+        ]
+        .align_y(Alignment::Center),
         slider_widget,
     ]
     .spacing(SPACING_XS)

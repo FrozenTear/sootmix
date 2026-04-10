@@ -24,6 +24,15 @@ pub enum SignalEvent {
     #[allow(dead_code)]
     OutputsChanged,
     MeterUpdate(Vec<sootmix_ipc::MeterData>),
+    /// Master volume changed externally (hardware knob, pavucontrol, etc.)
+    MasterVolumeChanged(f64),
+    /// Master mute changed externally.
+    MasterMuteChanged(bool),
+}
+
+/// Convert a linear volume value to dB.
+fn linear_to_db(linear: f32) -> f32 {
+    20.0 * linear.max(1e-10).log10()
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +79,12 @@ pub struct ChannelState {
     pub vad_threshold: f32,
     /// Hardware microphone gain in dB (-12.0 to +12.0). Controls the physical input device level.
     pub input_gain_db: f32,
+    /// Plugin chain configuration (round-tripped from config, not used by daemon at runtime).
+    pub plugin_chain: Vec<crate::config::PluginSlotConfig>,
+    /// Whether sidetone monitoring is enabled (UI-owned, round-tripped by daemon).
+    pub sidetone_enabled: bool,
+    /// Sidetone volume in dB (UI-owned, round-tripped by daemon).
+    pub sidetone_volume_db: f32,
 }
 
 impl ChannelState {
@@ -96,6 +111,9 @@ impl ChannelState {
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
             input_gain_db: 0.0,
+            plugin_chain: Vec::new(),
+            sidetone_enabled: false,
+            sidetone_volume_db: 0.0,
         }
     }
 
@@ -122,6 +140,9 @@ impl ChannelState {
             noise_suppression_enabled: false,
             vad_threshold: 95.0,
             input_gain_db: 0.0,
+            plugin_chain: Vec::new(),
+            sidetone_enabled: false,
+            sidetone_volume_db: 0.0,
         }
     }
 
@@ -148,6 +169,9 @@ impl ChannelState {
             noise_suppression_enabled: saved.noise_suppression_enabled,
             vad_threshold: saved.vad_threshold,
             input_gain_db: saved.input_gain_db,
+            plugin_chain: saved.plugin_chain.clone(),
+            sidetone_enabled: saved.sidetone_enabled,
+            sidetone_volume_db: saved.sidetone_volume_db,
         }
     }
 
@@ -681,6 +705,13 @@ pub struct DaemonState {
     /// the replacement to avoid same-name node conflicts. This map stores the create
     /// command to dispatch after the destroy event is received.
     pub pending_ns_replacements: HashMap<Uuid, PwCommand>,
+    /// Port pairs of links being intentionally destroyed during reroute.
+    /// Prevents `check_and_restore_managed_link` from restoring links that
+    /// were removed on purpose. Each entry is consumed (removed) when the
+    /// corresponding `LinkRemoved` event arrives.
+    pub suppressed_restores: HashSet<(u32, u32)>,
+    /// PFL/solo monitor device name (UI-owned, round-tripped by daemon).
+    pub monitor_device: Option<String>,
 }
 
 impl DaemonState {
@@ -709,6 +740,8 @@ impl DaemonState {
             last_reconnect_attempt: None,
             reconnect_failures: 0,
             pending_ns_replacements: HashMap::new(),
+            suppressed_restores: HashSet::new(),
+            monitor_device: mixer_config.master.monitor_device,
         }
     }
 
@@ -1158,6 +1191,7 @@ impl DaemonService {
                 self.state.auto_routed_apps.clear();
                 self.state.pending_auto_route_channels.clear();
                 self.state.pending_route_loopbacks.clear();
+                self.state.suppressed_restores.clear();
                 self.state.master_recording_source_id = None;
             }
             PwEvent::NodeAdded(node) => {
@@ -1322,13 +1356,13 @@ impl DaemonService {
                             "Loopback output node {} has new ports but no links, retrying route to hardware",
                             loopback_id
                         );
-                        let target_device_id = self.get_master_output_device_id();
-                        self.state.pending_route_loopbacks.insert(loopback_id);
-                        self.send_pw_command(PwCommand::RouteChannelToDevice {
-                            loopback_output_node: loopback_id,
+                        let target_device_id =
+                            self.desired_output_node_for_channel(channel_id);
+                        self.suppress_and_route(
+                            loopback_id,
                             target_device_id,
-                            channel_id: Some(channel_id),
-                        });
+                            Some(channel_id),
+                        );
                     }
                 }
 
@@ -1372,16 +1406,20 @@ impl DaemonService {
                         .collect();
 
                     for (channel_id, loopback_id) in orphaned_loopbacks {
-                        debug!(
-                            "Hardware sink {} got new port, retrying route for orphaned loopback {}",
-                            port_node_id, loopback_id
-                        );
-                        self.state.pending_route_loopbacks.insert(loopback_id);
-                        self.send_pw_command(PwCommand::RouteChannelToDevice {
-                            loopback_output_node: loopback_id,
-                            target_device_id: Some(port_node_id),
-                            channel_id: Some(channel_id),
-                        });
+                        let target =
+                            self.desired_output_node_for_channel(channel_id);
+                        // Only route if this hardware sink is the channel's intended target
+                        if target.map_or(false, |t| t == port_node_id) {
+                            debug!(
+                                "Hardware sink {} got new port, retrying route for orphaned loopback {}",
+                                port_node_id, loopback_id
+                            );
+                            self.suppress_and_route(
+                                loopback_id,
+                                target,
+                                Some(channel_id),
+                            );
+                        }
                     }
                 }
             }
@@ -1403,6 +1441,59 @@ impl DaemonService {
                 let removed_link = self.state.pw_graph.links.remove(&id);
                 if let Some(link) = removed_link {
                     self.check_and_restore_managed_link(&link);
+                }
+            }
+            PwEvent::RouteFinished {
+                loopback_output_node,
+                reason,
+            } => {
+                self.state
+                    .pending_route_loopbacks
+                    .remove(&loopback_output_node);
+                match &reason {
+                    crate::audio::pipewire_thread::RouteFinishReason::LinksCreated {
+                        count,
+                    } => {
+                        info!(
+                            "Route finished for loopback {}: {} links created",
+                            loopback_output_node, count
+                        );
+                    }
+                    other => {
+                        warn!(
+                            "Route finished for loopback {}: {:?}",
+                            loopback_output_node, other
+                        );
+                    }
+                }
+            }
+            PwEvent::NodeVolumeChanged {
+                node_id,
+                volumes,
+                muted,
+            } => {
+                if let Some(master_id) = self.get_master_output_device_id() {
+                    if node_id == master_id {
+                        if !volumes.is_empty() {
+                            let avg =
+                                volumes.iter().sum::<f32>() / volumes.len() as f32;
+                            let new_db = linear_to_db(avg);
+                            if (new_db - self.state.master_volume_db).abs() > 0.01 {
+                                self.state.master_volume_db = new_db;
+                                self.emit_signal(SignalEvent::MasterVolumeChanged(
+                                    new_db as f64,
+                                ));
+                            }
+                        }
+                        if let Some(m) = muted {
+                            if m != self.state.master_muted {
+                                self.state.master_muted = m;
+                                self.emit_signal(SignalEvent::MasterMuteChanged(m));
+                            }
+                        }
+                        // Don't save_config() — too frequent from hardware knobs.
+                        // Config is saved when user changes volume through SootMix.
+                    }
                 }
             }
             PwEvent::VirtualSinkCreated {
@@ -1442,15 +1533,14 @@ impl DaemonService {
                             muted: true,
                         });
                     }
-                    // Route loopback output to master output device
-                    // Look up the master output device ID by name
-                    let target_device_id = self.get_master_output_device_id();
-                    self.state.pending_route_loopbacks.insert(loopback_id);
-                    self.send_pw_command(PwCommand::RouteChannelToDevice {
-                        loopback_output_node: loopback_id,
+                    // Route loopback output to the channel's configured device (or master fallback)
+                    let target_device_id =
+                        self.desired_output_node_for_channel(channel_id);
+                    self.suppress_and_route(
+                        loopback_id,
                         target_device_id,
-                        channel_id: Some(channel_id),
-                    });
+                        Some(channel_id),
+                    );
                 }
 
                 // Mark channel for pending auto-routing (ports may not be ready yet)
@@ -1638,6 +1728,7 @@ impl DaemonService {
                 volume_db: self.state.master_volume_db,
                 muted: self.state.master_muted,
                 output_device: self.state.master_output.clone(),
+                monitor_device: self.state.monitor_device.clone(),
             },
             channels: self
                 .state
@@ -1653,13 +1744,15 @@ impl DaemonService {
                     eq_enabled: c.eq_enabled,
                     eq_preset: c.eq_preset.clone(),
                     assigned_apps: c.assigned_apps.clone(),
-                    plugin_chain: Vec::new(),
+                    plugin_chain: c.plugin_chain.clone(),
                     output_device_name: c.output_device_name.clone(),
                     kind: c.kind,
                     input_device_name: c.input_device_name.clone(),
                     noise_suppression_enabled: c.noise_suppression_enabled,
                     vad_threshold: c.vad_threshold,
                     input_gain_db: c.input_gain_db,
+                    sidetone_enabled: c.sidetone_enabled,
+                    sidetone_volume_db: c.sidetone_volume_db,
                 })
                 .collect(),
         };
@@ -2211,6 +2304,36 @@ impl DaemonService {
         Ok(())
     }
 
+    /// Suppress restores for existing links from a loopback output, then
+    /// dispatch a `RouteChannelToDevice` command. This ensures that when the
+    /// old links are destroyed as part of the reroute, `check_and_restore_managed_link`
+    /// will not blindly recreate them.
+    fn suppress_and_route(
+        &mut self,
+        loopback_id: u32,
+        target_device_id: Option<u32>,
+        channel_id: Option<Uuid>,
+    ) {
+        // Record port pairs of existing links so their removal won't trigger restore
+        let pairs: Vec<(u32, u32)> = self
+            .state
+            .pw_graph
+            .links
+            .values()
+            .filter(|l| l.output_node == loopback_id)
+            .map(|l| (l.output_port, l.input_port))
+            .collect();
+        for pair in pairs {
+            self.state.suppressed_restores.insert(pair);
+        }
+        self.state.pending_route_loopbacks.insert(loopback_id);
+        self.send_pw_command(PwCommand::RouteChannelToDevice {
+            loopback_output_node: loopback_id,
+            target_device_id,
+            channel_id,
+        });
+    }
+
     /// Check if a removed link was one we manage (app→virtual_sink or
     /// loopback_output→hardware_device). If so, re-create it.
     /// This handles external tools (e.g. KDE audio control) or WirePlumber
@@ -2258,6 +2381,16 @@ impl DaemonService {
             .any(|c| c.pw_loopback_output_id == Some(link.output_node));
 
         if is_loopback_output {
+            // If this link was intentionally destroyed during a reroute, don't restore it
+            let port_pair = (link.output_port, link.input_port);
+            if self.state.suppressed_restores.remove(&port_pair) {
+                debug!(
+                    "Skipping restore for intentionally removed link {:?} (loopback {} -> node {})",
+                    port_pair, link.output_node, link.input_node
+                );
+                return;
+            }
+
             let target_is_hw_sink = self
                 .state
                 .pw_graph
@@ -2490,21 +2623,27 @@ impl DaemonService {
         };
 
         if channel_kind == ChannelKind::Input {
-            // For input channels, we need to recreate the virtual source with the new target
-            // Destroy the existing one first
+            // For input channels, we need to recreate the virtual source with the new target.
+            // Defer creation until the old source is confirmed destroyed to avoid same-name
+            // node conflicts. The VirtualSinkDestroyed handler dispatches pending replacements.
+            let create_cmd = PwCommand::CreateVirtualSource {
+                channel_id: channel_uuid,
+                name: channel_name.clone(),
+                target_device: device_name_opt,
+            };
             if let Some(source_id) = sink_id {
                 info!(
-                    "Recreating input channel '{}' with new mic: {:?}",
-                    channel_name, device_name_opt
+                    "Recreating input channel '{}' with new mic (deferred until destroy confirms)",
+                    channel_name
                 );
+                self.state
+                    .pending_ns_replacements
+                    .insert(channel_uuid, create_cmd);
                 self.send_pw_command(PwCommand::DestroyVirtualSink { node_id: source_id });
-            }
-            // Create new virtual source with the target mic
-            self.send_pw_command(PwCommand::CreateVirtualSource {
-                channel_id: channel_uuid,
-                name: channel_name,
-                target_device: device_name_opt,
-            });
+            } else {
+                // No existing source to destroy, create directly
+                self.send_pw_command(create_cmd);
+            };
         } else {
             // For output channels, route the loopback output to the new device
             let outputs = self.state.get_outputs();
@@ -2516,12 +2655,11 @@ impl DaemonService {
             });
 
             if let Some(loopback_id) = loopback_id {
-                self.state.pending_route_loopbacks.insert(loopback_id);
-                self.send_pw_command(PwCommand::RouteChannelToDevice {
-                    loopback_output_node: loopback_id,
+                self.suppress_and_route(
+                    loopback_id,
                     target_device_id,
-                    channel_id: Some(channel_uuid),
-                });
+                    Some(channel_uuid),
+                );
             }
         }
 
@@ -2556,12 +2694,7 @@ impl DaemonService {
             .collect();
 
         for (channel_id, loopback_id) in loopback_info {
-            self.state.pending_route_loopbacks.insert(loopback_id);
-            self.send_pw_command(PwCommand::RouteChannelToDevice {
-                loopback_output_node: loopback_id,
-                target_device_id,
-                channel_id: Some(channel_id),
-            });
+            self.suppress_and_route(loopback_id, target_device_id, Some(channel_id));
         }
 
         self.save_config();
@@ -2610,6 +2743,46 @@ impl DaemonService {
 
         // Last resort: WirePlumber default
         crate::audio::routing::get_default_sink_id()
+    }
+
+    /// Get the target output device node ID for a specific channel.
+    ///
+    /// Checks the channel's per-channel `output_device_name` first, then falls
+    /// back to `get_master_output_device_id()`. Handles the system-default
+    /// sentinel correctly (falls through to master resolution instead of
+    /// resolving to the synthetic node 0).
+    fn desired_output_node_for_channel(&self, channel_id: Uuid) -> Option<u32> {
+        let device_name = self
+            .state
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .and_then(|c| c.output_device_name.clone());
+
+        if let Some(ref name) = device_name {
+            // "system-default" means follow master resolution, not a specific device
+            if name == Self::SYSTEM_DEFAULT_SENTINEL {
+                return self.get_master_output_device_id();
+            }
+
+            // Scan pw_graph.nodes directly to avoid the synthetic node 0 in get_outputs()
+            for node in self.state.pw_graph.nodes.values() {
+                if node.media_class == MediaClass::AudioSink
+                    && !node.name.starts_with("sootmix.")
+                    && (node.description == *name || node.name == *name)
+                {
+                    return Some(node.id);
+                }
+            }
+
+            // Per-channel device not currently available; fall through to master
+            debug!(
+                "Per-channel output device '{}' not found for channel {}, falling back to master",
+                name, channel_id
+            );
+        }
+
+        self.get_master_output_device_id()
     }
 
     pub fn set_master_recording(&mut self, enabled: bool) -> Result<(), ServiceError> {
@@ -2806,8 +2979,6 @@ impl DaemonService {
     /// Finds channels whose loopback output has no remaining links and
     /// routes them to the configured master output or system default.
     fn try_fallback_orphaned_channels(&mut self) {
-        let target_device_id = self.get_master_output_device_id();
-
         let orphaned_loopbacks: Vec<(Uuid, u32, String)> = self
             .state
             .channels
@@ -2836,16 +3007,12 @@ impl DaemonService {
         }
 
         for (channel_id, loopback_id, channel_name) in orphaned_loopbacks {
+            let target_device_id = self.desired_output_node_for_channel(channel_id);
             info!(
                 "Fallback: re-routing orphaned channel '{}' (loopback {}) to device {:?}",
                 channel_name, loopback_id, target_device_id
             );
-            self.state.pending_route_loopbacks.insert(loopback_id);
-            self.send_pw_command(PwCommand::RouteChannelToDevice {
-                loopback_output_node: loopback_id,
-                target_device_id,
-                channel_id: Some(channel_id),
-            });
+            self.suppress_and_route(loopback_id, target_device_id, Some(channel_id));
         }
     }
 
@@ -2990,12 +3157,7 @@ impl DaemonService {
                 "Re-routing channel '{}' loopback output to device node {:?} (trigger: '{}' node {})",
                 channel_name, target_id, device_desc, device_node_id
             );
-            self.state.pending_route_loopbacks.insert(loopback_id);
-            self.send_pw_command(PwCommand::RouteChannelToDevice {
-                loopback_output_node: loopback_id,
-                target_device_id: target_id,
-                channel_id: Some(channel_id),
-            });
+            self.suppress_and_route(loopback_id, target_id, Some(channel_id));
         }
     }
 }

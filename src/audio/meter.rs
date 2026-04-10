@@ -12,8 +12,9 @@
 
 use crate::audio::meter_stream::AtomicMeterLevels;
 use crate::state::{db_to_linear, MeterDisplayState, MixerChannel};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tracing::debug;
 use uuid::Uuid;
 
 /// Per-channel meter state tracking.
@@ -46,6 +47,8 @@ pub struct MeterManager {
     channel_states: HashMap<Uuid, ChannelMeterState>,
     /// Phase counter for simulated animation.
     phase: f32,
+    /// Channels we've already logged an "inactive meter" warning for.
+    logged_inactive: HashSet<Uuid>,
 }
 
 impl MeterManager {
@@ -105,8 +108,10 @@ impl MeterManager {
             let phase = self.phase;
             let (level_left, level_right) = if let Some(ref real_levels) = channel.meter_levels {
                 if real_levels.is_active() {
+                    // Clear inactive log so it fires again if it flaps
+                    self.logged_inactive.remove(&channel.id);
                     // Use real audio levels from the plugin processing chain
-                    let (raw_left, raw_right) = real_levels.load();
+                    let (raw_left, raw_right) = real_levels.load_and_reset();
                     if raw_left > 0.01 || raw_right > 0.01 {
                         tracing::trace!(
                             "Meter read: ch={} raw=({:.4},{:.4}) is_input={}",
@@ -136,6 +141,12 @@ impl MeterManager {
                     }
                 } else {
                     // Real metering available but no audio data yet - use simulated
+                    if self.logged_inactive.insert(channel.id) {
+                        debug!(
+                            "Channel '{}' meter stream not active, using simulated levels",
+                            channel.name
+                        );
+                    }
                     calculate_simulated_level(phase, channel, state)
                 }
             } else {

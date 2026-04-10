@@ -23,7 +23,7 @@ use iced::{mouse, Color, Element, Length, Point, Rectangle, Renderer, Size, Them
 // ============================================================================
 
 /// Width of a single meter bar in pixels.
-const BAR_WIDTH: f32 = 5.0;
+const BAR_WIDTH: f32 = 8.0;
 
 /// Gap between stereo bars.
 const BAR_GAP: f32 = 2.0;
@@ -32,13 +32,13 @@ const BAR_GAP: f32 = 2.0;
 pub const METER_WIDTH: f32 = BAR_WIDTH * 2.0 + BAR_GAP;
 
 /// Peak hold indicator height.
-const PEAK_INDICATOR_HEIGHT: f32 = 2.0;
+const PEAK_INDICATOR_HEIGHT: f32 = 3.0;
 
 /// Segment gap for the "segmented LED" look (0 = solid, >0 = segmented).
-const SEGMENT_GAP: f32 = 1.0;
+const SEGMENT_GAP: f32 = 0.0;
 
 /// Segment height (including gap).
-const SEGMENT_HEIGHT: f32 = 4.0;
+const SEGMENT_HEIGHT: f32 = 3.5;
 
 // ============================================================================
 // LEVEL THRESHOLDS
@@ -63,7 +63,7 @@ const PEAK_INDICATOR_COLOR: Color = Color::from_rgb(1.0, 1.0, 1.0);
 // ============================================================================
 
 /// Height of the clip indicator at the top of the meter.
-const CLIP_INDICATOR_HEIGHT: f32 = 4.0;
+const CLIP_INDICATOR_HEIGHT: f32 = 5.0;
 
 /// VU meter state for canvas rendering.
 #[derive(Debug, Clone)]

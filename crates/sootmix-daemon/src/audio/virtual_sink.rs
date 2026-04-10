@@ -135,8 +135,10 @@ pub fn create_virtual_sink_full(
         sink_node_name, description
     );
 
-    let playback_props =
-        "media.class=Stream/Output/Audio node.autoconnect=false node.dont-move=true audio.position=[FL FR]".to_string();
+    let playback_props = format!(
+        "media.class=Stream/Output/Audio application.name=SootMix node.autoconnect=false node.dont-move=true audio.position=[FL FR] node.description=\"{}\"",
+        description
+    );
 
     info!(
         "Creating virtual sink: {} (description: {})",
@@ -477,18 +479,66 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
     let source_name = format!("sootmix.{}", safe_name);
     let loopback_node_name = format!("sootmix.{}.input", safe_name);
 
+    // Check if a node with this name already exists and destroy it first
+    // (handles races during rapid input device switching)
+    if let Ok(existing_id) = find_node_by_name_and_class(&source_name, "Audio/Source") {
+        warn!(
+            "Found existing orphaned source node '{}' (id={}), destroying it first",
+            source_name, existing_id
+        );
+
+        if let Some(ref mut map) = *get_processes() {
+            if let Some(mut child) = map.remove(&existing_id) {
+                info!(
+                    "Killing orphaned pw-loopback process for source node {}",
+                    existing_id
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+
+        if let Err(e) = Command::new("pw-cli")
+            .args(["destroy", &existing_id.to_string()])
+            .output()
+        {
+            warn!("pw-cli destroy failed for source node {}: {}", existing_id, e);
+        }
+        // Also destroy the capture stream node if it exists
+        let capture_stream_name = format!("input.{}", loopback_node_name);
+        if let Ok(capture_id) =
+            find_node_by_name_and_class(&capture_stream_name, "Stream/Input/Audio")
+        {
+            if let Some(ref mut map) = *get_processes() {
+                if let Some(mut child) = map.remove(&capture_id) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            if let Err(e) = Command::new("pw-cli")
+                .args(["destroy", &capture_id.to_string()])
+                .output()
+            {
+                warn!(
+                    "pw-cli destroy failed for capture stream node {}: {}",
+                    capture_id, e
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     // Build capture props - ALWAYS disable autoconnect to prevent WirePlumber from
     // linking the capture stream to all available sources. We'll manage links ourselves.
     // node.dont-move=true prevents WirePlumber from moving the stream when the default
     // input device changes (e.g. headset plugged in).
-    let capture_props = if let Some(device) = target_device {
-        format!(
-            "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false node.dont-move=true audio.position=[MONO] target.object=\"{}\"",
-            device
-        )
-    } else {
-        "media.class=Stream/Input/Audio node.passive=true node.autoconnect=false node.dont-move=true audio.position=[MONO]".to_string()
-    };
+    // target.object hides this stream from EasyEffects, which is what we want —
+    // EasyEffects should process the virtual source (Audio/Source), not this internal
+    // capture stream. The value is unused since autoconnect=false.
+    let capture_props = format!(
+        "media.class=Stream/Input/Audio application.name=SootMix node.autoconnect=false node.dont-move=true audio.position=[FL FR] target.object=sootmix.internal node.description=\"{}\"",
+        name
+    );
 
     // IMPORTANT: node.virtual=false prevents WirePlumber from hiding this node.
     // device.class=audio-input classifies it as a user-facing input device.

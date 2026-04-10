@@ -149,20 +149,7 @@ fn app_item<'a>(
         .iter()
         .find(|c| c.assigned_apps.iter().any(|a| a == &app_id));
 
-    // Use media_name for display only for generic Chromium/Electron apps
-    // (e.g., show "YouTube Music" instead of "Chromium").
-    // For distinctive apps (Zen, Firefox, etc.), use the app name directly.
-    let binary = app.binary.as_deref().unwrap_or("");
-    let is_generic = crate::state::is_generic_app_identity(&app.name, binary);
-    let raw_name = if is_generic {
-        app.media_name
-            .as_deref()
-            .filter(|m| !m.is_empty() && !matches!(*m, "Playback" | "Audio Stream" | "audio-volume-change" | "AudioStream"))
-            .unwrap_or(&app.name)
-    } else {
-        &app.name
-    };
-    let display_name = clean_app_name(raw_name);
+    let display_name = truncate_string(&app.display_name(), 16);
     let is_assigned = assigned_channel.is_some();
 
     let name_text = text(display_name)
@@ -240,16 +227,6 @@ fn app_item<'a>(
         .on_click(Message::StartDraggingApp(node_id, app_id_for_click))
         .drag_overlay(true)
         .into()
-}
-
-/// Clean up app name for display.
-fn clean_app_name(name: &str) -> String {
-    let cleaned = name
-        .replace(" (Virtual Sink)", "")
-        .trim()
-        .to_string();
-
-    truncate_string(&cleaned, 16)
 }
 
 /// Truncate a string to max length with ellipsis.

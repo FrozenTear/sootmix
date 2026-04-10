@@ -189,6 +189,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("Failed to emit MeterUpdate signal: {}", e);
                             }
                         }
+                        SignalEvent::MasterVolumeChanged(volume_db) => {
+                            if let Err(e) = dbus::emit_master_volume_changed(ctx, volume_db).await {
+                                warn!("Failed to emit MasterVolumeChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::MasterMuteChanged(muted) => {
+                            if let Err(e) = dbus::emit_master_mute_changed(ctx, muted).await {
+                                warn!("Failed to emit MasterMuteChanged signal: {}", e);
+                            }
+                        }
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {

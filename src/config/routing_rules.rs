@@ -131,6 +131,7 @@ impl MatchType {
 pub enum MatchTarget {
     /// Match against the app name.
     #[default]
+    #[serde(alias = "Name")]
     AppName,
     /// Match against the binary name.
     Binary,

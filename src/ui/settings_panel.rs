@@ -6,9 +6,10 @@
 //!
 //! Provides a modal UI for daemon service controls and application settings.
 
+use crate::audio::types::OutputDevice;
 use crate::message::Message;
 use crate::ui::theme::*;
-use iced::widget::{button, checkbox, column, container, row, text, Space};
+use iced::widget::{button, checkbox, column, container, pick_list, row, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
 
 /// Create the settings panel modal.
@@ -16,6 +17,8 @@ pub fn settings_panel<'a>(
     daemon_connected: bool,
     daemon_autostart: bool,
     daemon_action_pending: bool,
+    available_outputs: &[OutputDevice],
+    monitor_device: Option<&str>,
 ) -> Element<'a, Message> {
     // Header with title and close button
     let header = row![
@@ -154,6 +157,54 @@ pub fn settings_panel<'a>(
     ]
     .align_y(Alignment::Center);
 
+    // --- Monitor Output section ---
+    let monitor_divider = container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+            ..container::Style::default()
+        });
+
+    let monitor_label = text("Monitor Output (PFL)")
+        .size(TEXT_BODY)
+        .color(TEXT);
+
+    let monitor_hint = text("Solo'd channels route audio here (e.g. headphones)")
+        .size(TEXT_SMALL)
+        .color(TEXT_DIM);
+
+    let hw_outputs: Vec<String> = available_outputs
+        .iter()
+        .filter(|d| d.name != "system-default")
+        .map(|d| d.description.clone())
+        .collect();
+
+    let selected_monitor = monitor_device.map(|name| {
+        available_outputs
+            .iter()
+            .find(|d| d.description == name || d.name == name)
+            .map(|d| d.description.clone())
+            .unwrap_or_else(|| name.to_string())
+    });
+
+    let monitor_picker = pick_list(hw_outputs, selected_monitor, |selection: String| {
+        Message::MonitorDeviceChanged(selection)
+    })
+    .placeholder("Select a device for solo monitoring")
+    .text_size(TEXT_SMALL)
+    .padding([SPACING_SM, SPACING_SM])
+    .width(Length::Fill)
+    .style(|_theme: &Theme, _status| pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: TEXT_DIM,
+        handle_color: SOOTMIX_DARK.text_muted,
+        background: Background::Color(SURFACE),
+        border: Border::default()
+            .rounded(RADIUS_SM)
+            .color(SOOTMIX_DARK.border_default)
+            .width(1.0),
+    });
+
     // Main content
     let content = column![
         header,
@@ -167,6 +218,14 @@ pub fn settings_panel<'a>(
         buttons_row,
         Space::new().height(SPACING_SM),
         autostart_toggle,
+        Space::new().height(SPACING_SM),
+        monitor_divider,
+        Space::new().height(SPACING_SM),
+        monitor_label,
+        Space::new().height(SPACING_XS),
+        monitor_hint,
+        Space::new().height(SPACING_SM),
+        monitor_picker,
     ]
     .padding(PADDING)
     .spacing(SPACING_XS);

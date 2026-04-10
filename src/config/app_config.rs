@@ -132,6 +132,19 @@ pub struct SavedChannel {
     /// Sidetone volume in dB.
     #[serde(default = "default_sidetone_db")]
     pub sidetone_volume_db: f32,
+    /// Whether noise suppression is enabled. Daemon-owned field, round-tripped by UI.
+    #[serde(default)]
+    pub noise_suppression_enabled: bool,
+    /// VAD threshold for noise suppression (0-100%). Daemon-owned field, round-tripped by UI.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    /// Hardware microphone gain in dB. Daemon-owned field, round-tripped by UI.
+    #[serde(default)]
+    pub input_gain_db: f32,
+}
+
+fn default_vad_threshold() -> f32 {
+    95.0
 }
 
 fn default_sidetone_db() -> f32 {
@@ -149,6 +162,9 @@ pub struct MasterConfig {
     pub muted: bool,
     /// Selected output device name.
     pub output_device: Option<String>,
+    /// Selected monitor output device name (for PFL solo routing).
+    #[serde(default)]
+    pub monitor_device: Option<String>,
 }
 
 /// Complete mixer state configuration for persistence.

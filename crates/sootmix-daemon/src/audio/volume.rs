@@ -69,35 +69,6 @@ pub fn set_mute(node_id: u32, muted: bool) -> Result<(), VolumeError> {
     Ok(())
 }
 
-/// Get current volume of a node. Returns (volume, is_muted).
-#[allow(dead_code)]
-pub fn get_volume(node_id: u32) -> Result<(f32, bool), VolumeError> {
-    let output = Command::new("wpctl")
-        .args(["get-volume", &node_id.to_string()])
-        .output()
-        .map_err(|e| VolumeError::WpctlFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VolumeError::OperationFailed(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut volume = 1.0;
-    let mut muted = false;
-
-    for part in stdout.split_whitespace() {
-        if let Ok(v) = part.parse::<f32>() {
-            volume = v;
-        }
-        if part.contains("MUTED") {
-            muted = true;
-        }
-    }
-
-    Ok((volume, muted))
-}
-
 /// Set volume on the default sink.
 #[allow(dead_code)]
 pub fn set_default_sink_volume(volume: f32) -> Result<(), VolumeError> {

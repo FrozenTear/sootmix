@@ -458,7 +458,7 @@ fn process_capture(user_data: &mut StreamUserData, samples: &mut [f32], n_frames
     // Calculate peak levels for metering (RT-safe)
     if let Some(ref meter_levels) = user_data.meter_levels {
         let (peak_left, peak_right) = calculate_stereo_peaks(samples);
-        meter_levels.store(peak_left, peak_right);
+        meter_levels.store_max(peak_left, peak_right);
     }
 
     // Write processed audio to shared buffer for playback stream

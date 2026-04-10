@@ -14,7 +14,7 @@
 
 use crate::audio::types::{InputDevice, OutputDevice};
 use crate::message::Message;
-use crate::state::{ChannelKind, MeterDisplayState, MixerChannel};
+use crate::state::{AppInfo, ChannelKind, MeterDisplayState, MixerChannel};
 use crate::ui::meter::vu_meter;
 use crate::ui::plugin_chain::fx_button;
 use crate::ui::theme::{self, *};
@@ -165,8 +165,7 @@ pub fn channel_strip<'a>(
     });
 
     // === MUTE BUTTON ===
-    let mute_icon = if muted { "M" } else { "S" };
-    let mute_button = button(text(mute_icon).size(TEXT_BODY))
+    let mute_button = button(text("M").size(TEXT_BODY))
         .padding([SPACING_SM, SPACING])
         .style(move |_theme: &Theme, status| {
             let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -189,6 +188,32 @@ pub fn channel_strip<'a>(
             }
         })
         .on_press(Message::ChannelMuteToggled(id));
+
+    // === SOLO BUTTON ===
+    let solo_active = channel.solo;
+    let solo_button = button(text("S").size(TEXT_BODY))
+        .padding([SPACING_SM, SPACING])
+        .style(move |_theme: &Theme, status| {
+            let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            let bg_color = if solo_active {
+                if is_hovered {
+                    lighten(WARNING, 0.15)
+                } else {
+                    WARNING
+                }
+            } else if is_hovered {
+                SURFACE_LIGHT
+            } else {
+                SURFACE
+            };
+            button::Style {
+                background: Some(Background::Color(bg_color)),
+                text_color: if solo_active { BACKGROUND } else { TEXT },
+                border: Border::default().rounded(RADIUS_SM),
+                ..button::Style::default()
+            }
+        })
+        .on_press(Message::ChannelSoloToggled(id));
 
     // === SAVE TO SNAPSHOT BUTTON ===
     let save_button: Element<Message> = if has_active_snapshot {
@@ -583,8 +608,8 @@ pub fn channel_strip<'a>(
         // Volume readout
         container(volume_text).center_x(Fill),
         Space::new().height(SPACING_SM),
-        // Mute + Save
-        row![mute_button, Space::new().width(SPACING_SM), save_button,].align_y(Alignment::Center),
+        // Mute + Solo + Save
+        row![mute_button, Space::new().width(SPACING_XS), solo_button, Space::new().width(SPACING_SM), save_button,].align_y(Alignment::Center),
         Space::new().height(SPACING),
         // Device picker (output or input)
         device_picker,
@@ -877,7 +902,7 @@ const APP_TILE_SIZE: f32 = 32.0;
 const APP_ICONS_PER_ROW: usize = 3;
 
 
-pub fn app_card(channel: &MixerChannel) -> Element<'_, Message> {
+pub fn app_card<'a>(channel: &'a MixerChannel, available_apps: &'a [AppInfo]) -> Element<'a, Message> {
     let id = channel.id;
     let assigned_apps = &channel.assigned_apps;
 
@@ -903,7 +928,7 @@ pub fn app_card(channel: &MixerChannel) -> Element<'_, Message> {
             let end = (i + APP_ICONS_PER_ROW).min(total);
             let row_tiles: Vec<Element<Message>> = assigned_apps[i..end]
                 .iter()
-                .map(|app_id| app_icon_tile(id, app_id))
+                .map(|app_id| app_icon_tile(id, app_id, available_apps))
                 .collect();
             grid_rows.push(row(row_tiles).spacing(SPACING_XS).into());
             i = end;
@@ -985,11 +1010,12 @@ fn input_channel_card(channel: &MixerChannel) -> Element<'static, Message> {
 }
 
 /// A single app icon tile: colored square with 2-char initials.
-fn app_icon_tile(channel_id: Uuid, app_id: &str) -> Element<'_, Message> {
-    let initials = app_initials(app_id);
+fn app_icon_tile<'a>(channel_id: Uuid, app_id: &'a str, available_apps: &[AppInfo]) -> Element<'a, Message> {
+    // Look up the friendly display name from available apps
+    let display_name = resolve_app_display_name(app_id, available_apps);
+    let initials = app_initials(&display_name);
     let color = app_color(app_id);
     let app_id_owned = app_id.to_string();
-    let display_name = app_id.to_string();
 
     let tile_size: f32 = 32.0;
 
@@ -1041,6 +1067,17 @@ fn app_icon_tile(channel_id: Uuid, app_id: &str) -> Element<'_, Message> {
     )
     .gap(4)
     .into()
+}
+
+/// Resolve an app identifier to a friendly display name.
+/// Looks up the app in the available apps list and returns the display name
+/// (e.g., "Overwatch #1" instead of "wine64-preloader#1").
+fn resolve_app_display_name(app_id: &str, available_apps: &[AppInfo]) -> String {
+    available_apps
+        .iter()
+        .find(|a| a.identifier() == app_id)
+        .map(|app| app.display_name())
+        .unwrap_or_else(|| app_id.to_string())
 }
 
 /// Get 2-character initials from an app identifier.

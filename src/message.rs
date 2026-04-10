@@ -76,6 +76,8 @@ pub enum Message {
     MasterMuteToggled,
     /// Output device changed.
     OutputDeviceChanged(String),
+    /// Monitor output device changed (for PFL solo routing).
+    MonitorDeviceChanged(String),
     /// Toggle master recording output.
     ToggleMasterRecording,
 
@@ -85,6 +87,8 @@ pub enum Message {
     NewInputChannelRequested,
     /// Channel input device changed (channel_id, device_name or None for default).
     ChannelInputDeviceChanged(Uuid, Option<String>),
+    /// Toggle PFL solo on a channel (routes to monitor output device).
+    ChannelSoloToggled(Uuid),
     /// Toggle sidetone (input monitoring) on an input channel.
     ChannelSidetoneToggled(Uuid),
     /// Sidetone volume changed (channel_id, volume_db).
@@ -204,10 +208,16 @@ pub enum Message {
     TogglePluginBypass(Uuid, Uuid),
     /// Open the plugin parameter editor (channel_id, instance_id).
     OpenPluginEditor(Uuid, Uuid),
-    /// Close the plugin editor.
+    /// Close the plugin editor (and all plugin modals).
     ClosePluginEditor,
-    /// Plugin parameter changed (instance_id, param_index, value).
+    /// Go back from plugin editor to FX browser.
+    BackToPluginBrowser,
+    /// Plugin parameter changed (instance_id, param_index, normalized_value).
     PluginParameterChanged(Uuid, u32, f32),
+    /// Plugin parameter text input changed (instance_id, param_index, text).
+    PluginParamTextChanged(Uuid, u32, String),
+    /// Plugin parameter text submitted (instance_id, param_index).
+    PluginParamTextSubmit(Uuid, u32),
     /// Plugin chain loaded from persistence (channel_id).
     PluginChainLoaded(Uuid),
     /// Plugin sidechain source changed (channel_id, slot_index, source_channel_id or None).

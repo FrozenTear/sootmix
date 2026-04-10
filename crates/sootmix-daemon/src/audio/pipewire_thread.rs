@@ -161,7 +161,32 @@ pub enum PwEvent {
         channel_id: Uuid,
         error: String,
     },
+    /// A RouteChannelToDevice command has completed (success or failure).
+    RouteFinished {
+        loopback_output_node: u32,
+        reason: RouteFinishReason,
+    },
+    /// External volume/mute change detected on a hardware node.
+    NodeVolumeChanged {
+        node_id: u32,
+        /// Channel volumes in linear scale.
+        volumes: Vec<f32>,
+        muted: Option<bool>,
+    },
     Error(String),
+}
+
+/// Why a route operation finished.
+#[derive(Debug, Clone)]
+pub enum RouteFinishReason {
+    /// Links were successfully created.
+    LinksCreated { count: usize },
+    /// No target device could be resolved.
+    NoTargetDevice,
+    /// Target device exists but no port pairs could be matched.
+    NoPortPairs,
+    /// Native loopback was rerouted via WirePlumber metadata.
+    NativeRerouted,
 }
 
 #[derive(Debug, Error)]
@@ -980,6 +1005,10 @@ fn handle_command(
                 }
                 // Native routing via metadata doesn't require manual link creation
                 // WirePlumber will handle it
+                let _ = state.borrow().event_tx.send(PwEvent::RouteFinished {
+                    loopback_output_node,
+                    reason: RouteFinishReason::NativeRerouted,
+                });
                 return;
             }
 
@@ -1059,6 +1088,7 @@ fn handle_command(
             };
 
             // Dispatch CLI link operations to a background thread
+            let num_pairs = port_pairs.len();
             spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                 for link_id in links_to_destroy {
                     debug!("Destroying existing link {} from loopback output", link_id);
@@ -1070,21 +1100,39 @@ fn handle_command(
                 if target_node_id.is_none() {
                     warn!("No target device found for routing");
                     let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
+                    let _ = event_tx.send(PwEvent::RouteFinished {
+                        loopback_output_node,
+                        reason: RouteFinishReason::NoTargetDevice,
+                    });
                     return;
                 }
 
-                for (output_port, input_port) in port_pairs {
+                if num_pairs == 0 {
+                    warn!("No port pairs found for routing loopback {}", loopback_output_node);
+                    let _ = event_tx.send(PwEvent::RouteFinished {
+                        loopback_output_node,
+                        reason: RouteFinishReason::NoPortPairs,
+                    });
+                    return;
+                }
+
+                for (output_port, input_port) in &port_pairs {
                     info!(
                         "Creating link from loopback: {} -> {}",
                         output_port, input_port
                     );
-                    if let Err(e) = crate::audio::routing::create_link(output_port, input_port) {
+                    if let Err(e) = crate::audio::routing::create_link(*output_port, *input_port) {
                         warn!(
                             "Failed to create link {} -> {}: {}",
                             output_port, input_port, e
                         );
                     }
                 }
+
+                let _ = event_tx.send(PwEvent::RouteFinished {
+                    loopback_output_node,
+                    reason: RouteFinishReason::LinksCreated { count: num_pairs },
+                });
             });
         }
 
@@ -1325,6 +1373,40 @@ fn handle_command(
     }
 }
 
+/// Parse volume and mute state from a SPA Props pod.
+///
+/// Returns (channel_volumes_linear, muted) extracted from the pod's properties.
+fn parse_props_volume(pod: &Pod) -> Option<(Vec<f32>, Option<bool>)> {
+    use libspa::pod::deserialize::PodDeserializer;
+    use libspa::pod::Value;
+
+    let bytes = pod.as_bytes();
+    let (_, value) = PodDeserializer::deserialize_any_from(bytes).ok()?;
+
+    if let Value::Object(obj) = value {
+        let mut volumes: Option<Vec<f32>> = None;
+        let mut muted: Option<bool> = None;
+
+        for prop in &obj.properties {
+            if prop.key == libspa::sys::SPA_PROP_channelVolumes {
+                if let Value::ValueArray(libspa::pod::ValueArray::Float(ref v)) = prop.value {
+                    volumes = Some(v.clone());
+                }
+            } else if prop.key == libspa::sys::SPA_PROP_mute {
+                if let Value::Bool(m) = prop.value {
+                    muted = Some(m);
+                }
+            }
+        }
+
+        if volumes.is_some() || muted.is_some() {
+            return Some((volumes.unwrap_or_default(), muted));
+        }
+    }
+
+    None
+}
+
 fn bind_node_from_global(
     global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
     state: &Rc<RefCell<PwThreadState>>,
@@ -1338,16 +1420,34 @@ fn bind_node_from_global(
 
     debug!("Binding node proxy for node {}", node_id);
 
+    let event_tx = state.borrow().event_tx.clone();
+
     let node: Node = registry
         .bind(global)
         .map_err(|e| format!("Failed to bind node {}: {:?}", node_id, e))?;
 
     let listener = node
         .add_listener_local()
-        .param(move |_seq, _id, _index, _next, _pod| {
-            trace!("Received param update for bound node");
+        .param(move |_seq, id, _index, _next, pod| {
+            if id != ParamType::Props {
+                return;
+            }
+            if let Some(pod) = pod {
+                if let Some((volumes, muted)) = parse_props_volume(pod) {
+                    let _ = event_tx.send(PwEvent::NodeVolumeChanged {
+                        node_id,
+                        volumes,
+                        muted,
+                    });
+                }
+            }
         })
         .register();
+
+    // Subscribe to Props param updates so we get notified of volume/mute changes
+    node.subscribe_params(&[ParamType::Props]);
+    // Request current Props value immediately
+    node.enum_params(0, Some(ParamType::Props), 0, u32::MAX);
 
     state.borrow_mut().bound_nodes.insert(
         node_id,

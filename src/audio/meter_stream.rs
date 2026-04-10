@@ -74,6 +74,53 @@ impl AtomicMeterLevels {
         (left, right)
     }
 
+    /// Store peak levels using max-hold (called from RT thread).
+    /// Only updates if the new value exceeds the stored value.
+    #[inline]
+    pub fn store_max(&self, left: f32, right: f32) {
+        let left_bits = left.to_bits();
+        loop {
+            let current = self.peak_left.load(Ordering::Relaxed);
+            if f32::from_bits(current) >= left {
+                break;
+            }
+            match self.peak_left.compare_exchange_weak(
+                current,
+                left_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        let right_bits = right.to_bits();
+        loop {
+            let current = self.peak_right.load(Ordering::Relaxed);
+            if f32::from_bits(current) >= right {
+                break;
+            }
+            match self.peak_right.compare_exchange_weak(
+                current,
+                right_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        self.active.store(1, Ordering::Relaxed);
+    }
+
+    /// Load peak levels and reset to zero (called from UI thread).
+    #[inline]
+    pub fn load_and_reset(&self) -> (f32, f32) {
+        let left = f32::from_bits(self.peak_left.swap(0, Ordering::Relaxed));
+        let right = f32::from_bits(self.peak_right.swap(0, Ordering::Relaxed));
+        (left, right)
+    }
+
     /// Check if this meter is active (receiving audio).
     #[inline]
     pub fn is_active(&self) -> bool {
@@ -381,7 +428,7 @@ fn meter_process_callback(stream: &Stream, user_data: &mut MeterUserData) {
     let peak_right = peak_right.clamp(0.0, 2.0);
 
     // Store in atomic levels
-    user_data.levels.store(peak_left, peak_right);
+    user_data.levels.store_max(peak_left, peak_right);
 
     trace!(
         "Meter {}: L={:.3} R={:.3} (samples={})",

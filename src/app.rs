@@ -218,7 +218,17 @@ impl SootMix {
         let params: Vec<crate::ui::plugin_chain::PluginEditorParam> = (0..param_count)
             .filter_map(|idx| {
                 let param_info = self.plugin_manager.get_parameter_info(instance_id, idx)?;
-                let value = self.plugin_manager.get_parameter(instance_id, idx)?;
+                let normalized = self.plugin_manager.get_parameter(instance_id, idx)?;
+                // Denormalize for display: internal 0-1 → real-world range
+                let value = sootmix_plugin_api::denormalize(
+                    normalized,
+                    param_info.min,
+                    param_info.max,
+                    param_info.curve,
+                );
+                let editing_text = self.state.plugin_param_editing
+                    .get(&(instance_id, idx))
+                    .cloned();
                 Some(crate::ui::plugin_chain::PluginEditorParam {
                     index: idx,
                     name: param_info.name.to_string(),
@@ -226,6 +236,8 @@ impl SootMix {
                     min: param_info.min,
                     max: param_info.max,
                     value,
+                    curve: param_info.curve,
+                    editing_text,
                 })
             })
             .collect();
@@ -430,6 +442,95 @@ impl SootMix {
                         }
                     }
                 }
+                self.save_config();
+            }
+
+            Message::ChannelSoloToggled(channel_id) => {
+                let (solo_enabled, output_node) = self.state.channel(channel_id)
+                    .map(|c| {
+                        let node = if c.is_input() {
+                            c.pw_source_id
+                        } else {
+                            c.pw_loopback_output_id
+                        };
+                        (c.solo, node)
+                    })
+                    .unwrap_or((false, None));
+
+                let new_state = !solo_enabled;
+                if let Some(channel) = self.state.channel_mut(channel_id) {
+                    channel.solo = new_state;
+                }
+
+                if let Some(source_node_id) = output_node {
+                    if let Some(monitor_id) = self.get_monitor_device_node_id() {
+                        if new_state {
+                            let port_pairs = self.state.pw_graph.find_port_pairs(source_node_id, monitor_id);
+                            for (out_port, in_port) in &port_pairs {
+                                self.send_pw_command(PwCommand::CreateLink {
+                                    output_port: *out_port,
+                                    input_port: *in_port,
+                                });
+                            }
+                        } else {
+                            let links: Vec<u32> = self.state.pw_graph.links.values()
+                                .filter(|l| l.output_node == source_node_id && l.input_node == monitor_id)
+                                .map(|l| l.id)
+                                .collect();
+                            for link_id in links {
+                                self.send_pw_command(PwCommand::DestroyLink { link_id });
+                            }
+                        }
+                    } else if new_state {
+                        warn!("Solo toggled but no monitor device configured");
+                    }
+                }
+            }
+
+            Message::MonitorDeviceChanged(name) => {
+                // Tear down existing solo links for all soloed channels → old monitor device
+                if let Some(old_monitor_id) = self.get_monitor_device_node_id() {
+                    let soloed: Vec<(Uuid, Option<u32>)> = self.state.channels.iter()
+                        .filter(|c| c.solo)
+                        .map(|c| {
+                            let node = if c.is_input() { c.pw_source_id } else { c.pw_loopback_output_id };
+                            (c.id, node)
+                        })
+                        .collect();
+                    for (_id, output_node) in &soloed {
+                        if let Some(source_node_id) = output_node {
+                            let links: Vec<u32> = self.state.pw_graph.links.values()
+                                .filter(|l| l.output_node == *source_node_id && l.input_node == old_monitor_id)
+                                .map(|l| l.id)
+                                .collect();
+                            for link_id in links {
+                                self.send_pw_command(PwCommand::DestroyLink { link_id });
+                            }
+                        }
+                    }
+                }
+
+                self.state.monitor_device = Some(name);
+
+                // Re-create solo links for all soloed channels → new monitor device
+                if let Some(new_monitor_id) = self.get_monitor_device_node_id() {
+                    let soloed: Vec<Option<u32>> = self.state.channels.iter()
+                        .filter(|c| c.solo)
+                        .map(|c| if c.is_input() { c.pw_source_id } else { c.pw_loopback_output_id })
+                        .collect();
+                    for output_node in &soloed {
+                        if let Some(source_node_id) = output_node {
+                            let port_pairs = self.state.pw_graph.find_port_pairs(*source_node_id, new_monitor_id);
+                            for (out_port, in_port) in &port_pairs {
+                                self.send_pw_command(PwCommand::CreateLink {
+                                    output_port: *out_port,
+                                    input_port: *in_port,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 self.save_config();
             }
 
@@ -1095,8 +1196,7 @@ impl SootMix {
                     }
                 }
 
-                // Close browser after adding
-                self.state.plugin_browser_channel = None;
+                // Keep browser open so user can add more plugins
             }
             Message::RemovePluginFromChannel(channel_id, instance_id) => {
                 info!("Removing plugin {} from channel {}", instance_id, channel_id);
@@ -1189,13 +1289,66 @@ impl SootMix {
             }
             Message::OpenPluginEditor(channel_id, instance_id) => {
                 info!("Opening editor for plugin {} in channel {}", instance_id, channel_id);
-                self.state.plugin_editor_open = Some((channel_id, instance_id));
+                // Verify the instance is accessible before switching view
+                if let Some(info) = self.get_plugin_editor_info(instance_id) {
+                    debug!(
+                        "Plugin editor info: name='{}', params={}",
+                        info.0,
+                        info.1.len()
+                    );
+                    // Editor takes priority over browser in the modal chain
+                    self.state.plugin_editor_open = Some((channel_id, instance_id));
+                } else {
+                    warn!(
+                        "Cannot open editor for instance {}: get_plugin_editor_info returned None. \
+                         has_info={}, param_count={:?}",
+                        instance_id,
+                        self.plugin_manager.get_info(instance_id).is_some(),
+                        self.plugin_manager.get_parameter_count(instance_id),
+                    );
+                }
             }
             Message::ClosePluginEditor => {
+                // X closes editor and browser completely
                 self.state.plugin_editor_open = None;
+                self.state.plugin_browser_channel = None;
+                self.state.plugin_param_editing.clear();
+            }
+            Message::BackToPluginBrowser => {
+                // Return to FX browser, keep browser_channel set
+                self.state.plugin_editor_open = None;
+                self.state.plugin_param_editing.clear();
+            }
+            Message::PluginParamTextChanged(instance_id, param_idx, text) => {
+                self.state.plugin_param_editing.insert((instance_id, param_idx), text);
+            }
+            Message::PluginParamTextSubmit(instance_id, param_idx) => {
+                if let Some(text) = self.state.plugin_param_editing.remove(&(instance_id, param_idx)) {
+                    // Parse the text as a number and normalize
+                    if let Ok(display_value) = text.trim().parse::<f32>() {
+                        if let Some(param_info) = self.plugin_manager.get_parameter_info(instance_id, param_idx) {
+                            let clamped = display_value.clamp(param_info.min, param_info.max);
+                            let normalized = sootmix_plugin_api::normalize(
+                                clamped,
+                                param_info.min,
+                                param_info.max,
+                                param_info.curve,
+                            );
+                            // Reuse the existing parameter change handler
+                            return self.update(Message::PluginParameterChanged(
+                                instance_id,
+                                param_idx,
+                                normalized,
+                            ));
+                        }
+                    }
+                }
             }
             Message::PluginParameterChanged(instance_id, param_idx, value) => {
                 debug!("Plugin {} parameter {} changed to {}", instance_id, param_idx, value);
+
+                // Clear any active text editing for this param (slider moved)
+                self.state.plugin_param_editing.remove(&(instance_id, param_idx));
 
                 // Update the plugin instance parameter (direct, for immediate UI feedback)
                 self.plugin_manager.set_parameter(instance_id, param_idx, value);
@@ -1398,7 +1551,7 @@ impl SootMix {
             Message::Tick => {
                 // Calculate delta time for meter updates
                 let now = Instant::now();
-                let dt = now.duration_since(self.last_tick).as_secs_f32();
+                let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.050);
                 self.last_tick = now;
 
                 // Update VU meters
@@ -1598,31 +1751,6 @@ impl SootMix {
             Space::new().height(0).into()
         };
 
-        // Plugin browser/editor (shown when open)
-        let plugin_panel: Element<Message> = if let Some(channel_id) = self.state.plugin_browser_channel {
-            let channel_name = self.state.channel(channel_id)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            let chain_info = self.get_plugin_chain_info(channel_id);
-            let available_plugins = self.plugin_manager.list_plugins(&PluginFilter::default());
-
-            row![
-                crate::ui::plugin_chain::plugin_chain_panel(channel_id, &channel_name, chain_info),
-                Space::new().width(SPACING),
-                crate::ui::plugin_chain::plugin_browser(channel_id, available_plugins),
-            ]
-            .spacing(SPACING)
-            .into()
-        } else if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
-            if let Some((plugin_name, params)) = self.get_plugin_editor_info(instance_id) {
-                crate::ui::plugin_chain::plugin_editor(instance_id, &plugin_name, params)
-            } else {
-                Space::new().height(0).into()
-            }
-        } else {
-            Space::new().height(0).into()
-        };
-
         // Bottom detail panel
         let bottom_panel = self.view_bottom_panel();
 
@@ -1637,7 +1765,6 @@ impl SootMix {
             Space::new().height(SPACING_SM),
             apps,
             rules_panel,
-            plugin_panel,
             Space::new().height(SPACING_SM),
             bottom_panel,
             footer,
@@ -1687,6 +1814,8 @@ impl SootMix {
                 self.daemon_connected,
                 self.state.daemon_autostart,
                 self.state.daemon_action_pending,
+                &self.state.available_outputs,
+                self.state.monitor_device.as_deref(),
             );
 
             let backdrop = button(Space::new().width(Fill).height(Fill))
@@ -1702,6 +1831,71 @@ impl SootMix {
                     iced::widget::stack![
                         backdrop,
                         container(panel)
+                            .center_x(Fill)
+                            .center_y(Fill),
+                    ]
+                )
+                .width(Fill)
+                .height(Fill),
+            ]
+            .into()
+        } else if let Some((_channel_id, instance_id)) = self.state.plugin_editor_open {
+            // Editor modal takes priority over browser modal
+            if let Some((plugin_name, params)) = self.get_plugin_editor_info(instance_id) {
+                let editor = crate::ui::plugin_chain::plugin_editor(instance_id, &plugin_name, params);
+
+                let backdrop = button(Space::new().width(Fill).height(Fill))
+                    .style(|_theme: &Theme, _status| button::Style {
+                        background: Some(Background::Color(Color { a: 0.4, ..Color::BLACK })),
+                        ..button::Style::default()
+                    })
+                    .on_press(Message::ClosePluginEditor);
+
+                iced::widget::stack![
+                    main_container,
+                    container(
+                        iced::widget::stack![
+                            backdrop,
+                            container(editor)
+                                .center_x(Fill)
+                                .center_y(Fill),
+                        ]
+                    )
+                    .width(Fill)
+                    .height(Fill),
+                ]
+                .into()
+            } else {
+                warn!("Plugin editor instance not found, closing editor");
+                main_container.into()
+            }
+        } else if let Some(channel_id) = self.state.plugin_browser_channel {
+            let channel_name = self.state.channel(channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let chain_info = self.get_plugin_chain_info(channel_id);
+            let available_plugins = self.plugin_manager.list_plugins(&PluginFilter::default());
+
+            let fx_panel = row![
+                crate::ui::plugin_chain::plugin_chain_panel(channel_id, &channel_name, chain_info),
+                Space::new().width(SPACING),
+                crate::ui::plugin_chain::plugin_browser(channel_id, available_plugins),
+            ]
+            .spacing(SPACING);
+
+            let backdrop = button(Space::new().width(Fill).height(Fill))
+                .style(|_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(Color { a: 0.4, ..Color::BLACK })),
+                    ..button::Style::default()
+                })
+                .on_press(Message::ClosePluginBrowser);
+
+            iced::widget::stack![
+                main_container,
+                container(
+                    iced::widget::stack![
+                        backdrop,
+                        container(fx_panel)
                             .center_x(Fill)
                             .center_y(Fill),
                     ]
@@ -2433,7 +2627,7 @@ impl SootMix {
             &self.state.available_outputs, &self.state.available_inputs,
             is_selected, is_first, is_last,
         );
-        let card = app_card(c);
+        let card = app_card(c, &self.state.available_apps);
         // Wrap the channel column in a container with a zone ID for drop detection
         let zone_id = WidgetId::from(format!("channel-zone-{}", c.id));
         let channel_col = container(
@@ -2687,8 +2881,8 @@ impl SootMix {
     /// Subscription for external events.
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            // Tick every 50ms to poll PipeWire events and tray messages
-            iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick),
+            // Tick every 16ms (~60Hz) for smooth meter animation
+            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::Tick),
             // Listen for window close requests
             iced::window::close_requests().map(Message::WindowCloseRequested),
             // Listen for daemon events via D-Bus
@@ -3447,6 +3641,14 @@ impl SootMix {
             .filter_map(|c| c.pw_sink_id)
             .collect();
         find_hardware_sink(&self.state.pw_graph, &our_sink_ids)
+    }
+
+    /// Get the node ID of the selected monitor output device (for PFL solo routing).
+    fn get_monitor_device_node_id(&self) -> Option<u32> {
+        let device_name = self.state.monitor_device.as_ref()?;
+        self.state.available_outputs.iter()
+            .find(|d| d.description == *device_name || d.name == *device_name)
+            .map(|d| d.node_id)
     }
 
     /// Initialize snapshot A with current state if not already set.
@@ -4278,6 +4480,7 @@ impl SootMix {
                     volume_db: self.state.master_volume_db,
                     muted: self.state.master_muted,
                     output_device: self.state.output_device.clone(),
+                    monitor_device: self.state.monitor_device.clone(),
                 },
                 channels: self
                     .state
@@ -4299,6 +4502,9 @@ impl SootMix {
                         input_device_name: c.input_device_name.clone(),
                         sidetone_enabled: c.sidetone_enabled,
                         sidetone_volume_db: c.sidetone_volume_db,
+                        noise_suppression_enabled: c.noise_suppression_enabled,
+                        vad_threshold: c.vad_threshold,
+                        input_gain_db: c.input_gain_db,
                     })
                     .collect(),
             };
@@ -4320,6 +4526,7 @@ impl SootMix {
             self.state.master_volume_db = config.master.volume_db;
             self.state.master_muted = config.master.muted;
             self.state.output_device = config.master.output_device.clone();
+            self.state.monitor_device = config.master.monitor_device.clone();
 
             // Apply master volume/mute/device to output
             if let Some(ref device_name) = config.master.output_device {
@@ -4376,6 +4583,9 @@ impl SootMix {
                     channel.input_device_name = saved.input_device_name;
                     channel.sidetone_enabled = saved.sidetone_enabled;
                     channel.sidetone_volume_db = saved.sidetone_volume_db;
+                    channel.noise_suppression_enabled = saved.noise_suppression_enabled;
+                    channel.vad_threshold = saved.vad_threshold;
+                    channel.input_gain_db = saved.input_gain_db;
 
                     let id = channel.id;
                     let name = channel.name.clone();
@@ -4550,6 +4760,7 @@ impl SootMix {
                             noise_suppression_enabled: false,
                             vad_threshold: 95.0,
                             input_gain_db: ch_info.input_gain_db as f32,
+                            solo: false,
                         };
                         self.state.channels.push(channel);
                     }
@@ -4648,6 +4859,7 @@ impl SootMix {
                             noise_suppression_enabled: false,
                             vad_threshold: 95.0,
                             input_gain_db: ch_info.input_gain_db as f32,
+                            solo: false,
                         };
                         self.state.channels.push(channel);
                     }
@@ -4748,7 +4960,7 @@ impl SootMix {
                             );
                         }
                         if let Some(ref meter_levels) = channel.meter_levels {
-                            meter_levels.store(left_linear, right_linear);
+                            meter_levels.store_max(left_linear, right_linear);
                         }
                     } else {
                         debug!("MeterUpdate: channel {} not found in GUI state", id);
