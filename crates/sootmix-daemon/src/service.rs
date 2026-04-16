@@ -261,6 +261,16 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         || generic_binaries.iter().any(|g| binary == *g)
 }
 
+/// Wine launches every Windows app under the same wrapper binary, so
+/// `application.process.binary` is useless for distinguishing wine apps.
+/// When the binary matches a known wine wrapper we prefer `application.name`.
+fn is_wine_wrapper_binary(binary: &str) -> bool {
+    matches!(
+        binary,
+        "wine" | "wine-preloader" | "wine64-preloader" | "wineloader" | "wineloader64"
+    )
+}
+
 /// Assign stream indices to apps that share the same base identifier.
 /// Groups with >1 member get 1-based indices sorted by node_id.
 /// Single-stream apps keep index 0 (no suffix in identifier).
@@ -487,6 +497,14 @@ impl AppState {
                     return media;
                 }
             }
+        }
+        // Wine wrappers collide every Windows app under one binary
+        // ("wine64-preloader" etc.). Prefer the app's advertised name so
+        // Overwatch doesn't share an identifier with every other wine process.
+        // When the name equals the wrapper (Windows app never set its own
+        // PulseAudio client name) we fall through to the binary as before.
+        if is_wine_wrapper_binary(binary) && !self.name.is_empty() && self.name != binary {
+            return &self.name;
         }
         if !binary.is_empty() {
             binary

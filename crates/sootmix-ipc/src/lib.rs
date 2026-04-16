@@ -112,6 +112,18 @@ impl AppInfo {
                 return &self.media_name;
             }
         }
+        // Wine wrappers collide every Windows app under one binary
+        // ("wine64-preloader" etc.). Prefer the app's advertised name so
+        // Overwatch doesn't share an identifier with every other wine process.
+        // When the name equals the wrapper (Windows app never set its own
+        // PulseAudio client name) we fall through to the binary as before.
+        if !self.binary.is_empty()
+            && is_wine_wrapper_binary(&self.binary)
+            && !self.name.is_empty()
+            && self.name != self.binary
+        {
+            return &self.name;
+        }
         if !self.binary.is_empty() {
             &self.binary
         } else {
@@ -150,6 +162,16 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
 
     generic_names.iter().any(|g| name == *g)
         || generic_binaries.iter().any(|g| binary == *g)
+}
+
+/// Wine launches every Windows app under the same wrapper binary, so
+/// `application.process.binary` is useless for distinguishing wine apps.
+/// When the binary matches a known wine wrapper we prefer `application.name`.
+fn is_wine_wrapper_binary(binary: &str) -> bool {
+    matches!(
+        binary,
+        "wine" | "wine-preloader" | "wine64-preloader" | "wineloader" | "wineloader64"
+    )
 }
 
 /// Information about an audio output device.
