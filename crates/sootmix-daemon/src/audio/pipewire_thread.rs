@@ -8,6 +8,7 @@ use crate::audio::native_loopback::{AtomicMeterLevels, NativeLoopback};
 use crate::audio::pulse_meter::PulseAudioMeter;
 use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
 use pipewire::link::Link;
+use pipewire::metadata::{Metadata, MetadataListener};
 use pipewire::node::{Node, NodeListener};
 use pipewire::properties::properties;
 use pipewire::spa::param::ParamType;
@@ -173,6 +174,10 @@ pub enum PwEvent {
         volumes: Vec<f32>,
         muted: Option<bool>,
     },
+    /// WirePlumber's `default.audio.sink` metadata key changed.
+    /// Sent when a hardware sink is promoted/demoted as the system default
+    /// (e.g. Bluetooth headset reconnect, USB audio replug).
+    DefaultSinkChanged,
     Error(String),
 }
 
@@ -242,6 +247,9 @@ struct PwThreadState {
     /// Discovered node IDs for pending loopbacks: channel_id -> (main_node_id, secondary_node_id)
     /// For sinks: (sink_id, output_id), for sources: (source_id, capture_id)
     discovered_loopback_nodes: HashMap<Uuid, (Option<u32>, Option<u32>)>,
+    /// Bound "default" metadata object + listener. Kept here so the listener
+    /// stays alive for the lifetime of the PW thread. `(global_id, proxy, listener)`.
+    default_metadata: Option<(u32, Metadata, MetadataListener)>,
 }
 
 impl PwThreadState {
@@ -261,6 +269,7 @@ impl PwThreadState {
             pulse_meters: HashMap::new(),
             pending_loopback_nodes: HashMap::new(),
             discovered_loopback_nodes: HashMap::new(),
+            default_metadata: None,
         }
     }
 
@@ -975,39 +984,77 @@ fn handle_command(
                 .unwrap_or(false);
 
             if is_native {
-                // Native loopback: use WirePlumber metadata for re-routing
-                // This lets WirePlumber handle format conversion properly
-                if let Some(ch_id) = channel_id {
-                    let reroute_result = {
-                        let st = state.borrow();
-                        if let Some(loopback) = st.native_loopbacks.get(&ch_id) {
-                            Some(loopback.reroute_to_device(target_node_id))
-                        } else {
-                            None
-                        }
-                    };
+                // Native loopback path: update WirePlumber metadata so WP handles
+                // format conversion.
+                //
+                // Critical: we must also explicitly destroy stale links from the
+                // loopback output. WirePlumber doesn't reliably migrate manually-
+                // created links (those produced by our own `pw-link` calls) when
+                // `target.node` changes, so without this the old link stays alive
+                // alongside the new one and the channel plays on both devices at
+                // once. Destroy first, then set target.node, so WP's autoconnect
+                // creates a fresh link to the intended target with no race.
+                let links_to_destroy: Vec<u32> = {
+                    let s = state.borrow();
+                    s.links
+                        .values()
+                        .filter(|l| l.output_node == loopback_output_node)
+                        .map(|l| l.id)
+                        .collect()
+                };
 
-                    match reroute_result {
-                        Some(Ok(())) => {
-                            info!(
-                                "Native loopback {} re-routed to {:?}",
-                                ch_id, target_node_id
-                            );
-                        }
-                        Some(Err(e)) => {
-                            // Don't try CLI fallback - pw-link would fail due to format mismatch
-                            warn!("Native re-route failed: {}", e);
-                        }
-                        None => {
-                            warn!("Native loopback not found for channel {}", ch_id);
+                let playback_info: Option<(u32, bool)> = channel_id.and_then(|ch_id| {
+                    let st = state.borrow();
+                    st.native_loopbacks.get(&ch_id).map(|lb| {
+                        (lb.playback_node_id(), lb.is_source)
+                    })
+                });
+
+                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                    for link_id in links_to_destroy {
+                        debug!(
+                            "Destroying stale link {} from native loopback {}",
+                            link_id, loopback_output_node
+                        );
+                        if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+                            warn!("Failed to destroy stale link {}: {}", link_id, e);
                         }
                     }
-                }
-                // Native routing via metadata doesn't require manual link creation
-                // WirePlumber will handle it
-                let _ = state.borrow().event_tx.send(PwEvent::RouteFinished {
-                    loopback_output_node,
-                    reason: RouteFinishReason::NativeRerouted,
+
+                    match playback_info {
+                        Some((_, true)) => {
+                            warn!(
+                                "Native source reroute not implemented for channel {:?}",
+                                channel_id
+                            );
+                        }
+                        Some((pnid, false)) if pnid != u32::MAX => {
+                            info!(
+                                "Native loopback {:?} (node {}) reroute -> target {:?}",
+                                channel_id, pnid, target_node_id
+                            );
+                            if let Err(e) = crate::audio::native_loopback::set_playback_target_node(
+                                pnid,
+                                target_node_id,
+                            ) {
+                                warn!("Native re-route failed: {}", e);
+                            }
+                        }
+                        Some((_, false)) => {
+                            warn!(
+                                "Native loopback {:?} has no valid playback node id",
+                                channel_id
+                            );
+                        }
+                        None => {
+                            warn!("Native loopback not found for channel {:?}", channel_id);
+                        }
+                    }
+
+                    let _ = event_tx.send(PwEvent::RouteFinished {
+                        loopback_output_node,
+                        reason: RouteFinishReason::NativeRerouted,
+                    });
                 });
                 return;
             }
@@ -1713,6 +1760,47 @@ fn setup_registry_listener(
                     state_add.borrow_mut().ports.insert(global.id, port.clone());
                     let _ = event_tx_add.send(PwEvent::PortAdded(port));
                 }
+                ObjectType::Metadata => {
+                    // We only care about the "default" metadata, which publishes
+                    // `default.audio.sink` / `default.audio.source` keys. Hot-plug
+                    // events (Bluetooth reconnect, USB replug) cause WirePlumber
+                    // to update these, and we need to re-route system-default
+                    // channels when that happens.
+                    if props.get("metadata.name") != Some("default") {
+                        return;
+                    }
+                    if state_add.borrow().default_metadata.is_some() {
+                        return;
+                    }
+                    match registry_clone.bind::<Metadata, _>(global) {
+                        Ok(metadata) => {
+                            let event_tx_meta = event_tx_add.clone();
+                            let listener = metadata
+                                .add_listener_local()
+                                .property(move |_subject, key, _type_, _value| {
+                                    if key == Some("default.audio.sink") {
+                                        let _ =
+                                            event_tx_meta.send(PwEvent::DefaultSinkChanged);
+                                    }
+                                    0
+                                })
+                                .register();
+                            state_add
+                                .borrow_mut()
+                                .default_metadata = Some((global.id, metadata, listener));
+                            info!(
+                                "Bound 'default' metadata (id={}) for default-sink tracking",
+                                global.id
+                            );
+                            // Emit once so the service can reconcile with the
+                            // current default at startup.
+                            let _ = event_tx_add.send(PwEvent::DefaultSinkChanged);
+                        }
+                        Err(e) => {
+                            warn!("Failed to bind 'default' metadata {}: {:?}", global.id, e);
+                        }
+                    }
+                }
                 ObjectType::Link => {
                     let mut link = PwLink::new(global.id);
 
@@ -1754,6 +1842,13 @@ fn setup_registry_listener(
         .global_remove(move |id| {
             let mut state = state_remove.borrow_mut();
             state.bound_nodes.remove(&id);
+
+            if let Some((meta_id, _, _)) = state.default_metadata.as_ref() {
+                if *meta_id == id {
+                    debug!("'default' metadata {} removed, dropping proxy", id);
+                    state.default_metadata = None;
+                }
+            }
 
             if state.nodes.remove(&id).is_some() {
                 debug!("Node removed: {}", id);

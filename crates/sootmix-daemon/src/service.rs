@@ -1467,6 +1467,9 @@ impl DaemonService {
                     }
                 }
             }
+            PwEvent::DefaultSinkChanged => {
+                self.reroute_system_default_channels();
+            }
             PwEvent::NodeVolumeChanged {
                 node_id,
                 volumes,
@@ -3158,6 +3161,79 @@ impl DaemonService {
                 channel_name, target_id, device_desc, device_node_id
             );
             self.suppress_and_route(loopback_id, target_id, Some(channel_id));
+        }
+    }
+
+    /// Re-evaluate routing for channels whose effective output is the system
+    /// default. Called when WirePlumber updates the `default.audio.sink`
+    /// metadata — e.g. when a Bluetooth headset reconnects or a USB headset
+    /// is plugged in and gets promoted to default. Without this pass, such
+    /// channels stay linked to the previous default until the daemon restarts.
+    fn reroute_system_default_channels(&mut self) {
+        let new_default = match crate::audio::routing::get_default_sink_id() {
+            Some(id) => id,
+            None => {
+                debug!("DefaultSinkChanged fired but no default sink resolvable yet");
+                return;
+            }
+        };
+
+        let master_follows_default = self
+            .state
+            .master_output
+            .as_deref()
+            .map_or(true, |n| n == Self::SYSTEM_DEFAULT_SENTINEL);
+
+        let candidates: Vec<(Uuid, u32, String)> = self
+            .state
+            .channels
+            .iter()
+            .filter_map(|c| {
+                let loopback_id = c.pw_loopback_output_id?;
+                if self.state.pending_route_loopbacks.contains(&loopback_id) {
+                    return None;
+                }
+
+                // A channel follows the system default when either:
+                // - per-channel output is explicitly "system-default", or
+                // - per-channel output is unset AND master output is unset or
+                //   "system-default".
+                let follows_default = match c.output_device_name.as_deref() {
+                    Some(name) => name == Self::SYSTEM_DEFAULT_SENTINEL,
+                    None => master_follows_default,
+                };
+                if !follows_default {
+                    return None;
+                }
+
+                let linked_to_new_default = self
+                    .state
+                    .pw_graph
+                    .links
+                    .values()
+                    .any(|l| l.output_node == loopback_id && l.input_node == new_default);
+                if linked_to_new_default {
+                    return None;
+                }
+
+                Some((c.id, loopback_id, c.name.clone()))
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            debug!(
+                "DefaultSinkChanged: no system-default channels need re-routing (new default node {})",
+                new_default
+            );
+            return;
+        }
+
+        for (channel_id, loopback_id, channel_name) in candidates {
+            info!(
+                "Default sink changed: re-routing channel '{}' loopback {} to node {}",
+                channel_name, loopback_id, new_default
+            );
+            self.suppress_and_route(loopback_id, Some(new_default), Some(channel_id));
         }
     }
 }

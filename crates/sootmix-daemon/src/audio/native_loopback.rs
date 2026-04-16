@@ -557,45 +557,53 @@ impl NativeLoopback {
             self.channel_id, playback_node_id, target_node_id
         );
 
-        // Use pw-metadata to set target.node - this is the WirePlumber-native way
-        // WirePlumber will handle the actual link creation with proper format conversion
-        let args = if let Some(target_id) = target_node_id {
-            vec![
-                "-n".to_string(),
-                "default".to_string(),
-                playback_node_id.to_string(),
-                "target.node".to_string(),
-                format!("{{ \"name\": \"target.node\", \"value\": {} }}", target_id),
-            ]
-        } else {
-            // Clear the target to use system default
-            vec![
-                "-n".to_string(),
-                "default".to_string(),
-                "-d".to_string(),
-                playback_node_id.to_string(),
-                "target.node".to_string(),
-            ]
-        };
-
-        let output = std::process::Command::new("pw-metadata")
-            .args(&args)
-            .output()
-            .map_err(|e| format!("Failed to run pw-metadata: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Not fatal - WirePlumber may still route correctly via AUTOCONNECT
-            debug!("pw-metadata returned non-zero: {}", stderr);
-        }
-
-        Ok(())
+        set_playback_target_node(playback_node_id, target_node_id)
     }
 
     /// Get the playback stream node ID (for routing operations).
     pub fn playback_node_id(&self) -> u32 {
         self.playback_stream.node_id()
     }
+}
+
+/// Set (or clear) the `target.node` WirePlumber metadata for a playback stream.
+///
+/// Runs `pw-metadata` and blocks on the subprocess; callers that must not
+/// stall the PipeWire main loop should invoke this from a background thread.
+pub fn set_playback_target_node(
+    playback_node_id: u32,
+    target_node_id: Option<u32>,
+) -> Result<(), String> {
+    let args: Vec<String> = if let Some(target_id) = target_node_id {
+        vec![
+            "-n".to_string(),
+            "default".to_string(),
+            playback_node_id.to_string(),
+            "target.node".to_string(),
+            format!("{{ \"name\": \"target.node\", \"value\": {} }}", target_id),
+        ]
+    } else {
+        vec![
+            "-n".to_string(),
+            "default".to_string(),
+            "-d".to_string(),
+            playback_node_id.to_string(),
+            "target.node".to_string(),
+        ]
+    };
+
+    let output = std::process::Command::new("pw-metadata")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to run pw-metadata: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Not fatal - WirePlumber may still route correctly via AUTOCONNECT
+        debug!("pw-metadata returned non-zero: {}", stderr);
+    }
+
+    Ok(())
 }
 
 // ============================================================================
