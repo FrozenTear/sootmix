@@ -37,23 +37,6 @@ pub fn create_link(output_port: u32, input_port: u32) -> Result<(), RoutingError
 
     Ok(())
 }
-/// Destroy a link by its link ID.
-pub fn destroy_link(link_id: u32) -> Result<(), RoutingError> {
-    info!("Destroying link: {}", link_id);
-
-    let output = Command::new("pw-link")
-        .arg("-d")
-        .arg(link_id.to_string())
-        .output()
-        .map_err(|e| RoutingError::PwLinkFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(RoutingError::LinkFailed(stderr.to_string()));
-    }
-
-    Ok(())
-}
 /// Set the target sink for a stream node using WirePlumber metadata.
 /// This tells WirePlumber to route the stream to a specific sink and prevents
 /// it from auto-linking to the default sink.

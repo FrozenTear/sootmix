@@ -588,12 +588,62 @@ fn process_pending_cli_commands(state: &Rc<RefCell<PwThreadState>>) {
     });
 }
 
+/// Create a PipeWire link between two ports using the native `link-factory`.
+///
+/// Must be called on the PipeWire main-loop thread. Returns `Err` when:
+///   - either port is not yet in our registry-mirror state (fast path to let
+///     callers decide between CLI fallback and a retry), or
+///   - `core.create_object` fails (format mismatch, permission, etc.).
+///
+/// On success the returned Link proxy is parked in `created_links` keyed by
+/// `(output_port, input_port)` so it stays alive until the corresponding
+/// `LinkAdded` registry event fires (at which point the entry is removed by
+/// the registry listener). This mirrors the existing inline pattern.
+fn try_create_link_native(
+    core: &pipewire::core::CoreRc,
+    state: &Rc<RefCell<PwThreadState>>,
+    output_port: u32,
+    input_port: u32,
+) -> Result<(), String> {
+    let (out_node, in_node) = {
+        let s = state.borrow();
+        (
+            s.get_node_for_port(output_port),
+            s.get_node_for_port(input_port),
+        )
+    };
+    let out_node =
+        out_node.ok_or_else(|| format!("output port {} not in state", output_port))?;
+    let in_node =
+        in_node.ok_or_else(|| format!("input port {} not in state", input_port))?;
+
+    let link = core
+        .create_object::<Link>(
+            "link-factory",
+            &properties! {
+                "link.output.port" => output_port.to_string(),
+                "link.input.port" => input_port.to_string(),
+                "link.output.node" => out_node.to_string(),
+                "link.input.node" => in_node.to_string(),
+                "object.linger" => "true",
+            },
+        )
+        .map_err(|e| format!("create_object failed: {:?}", e))?;
+
+    info!("Native link created: {} -> {}", output_port, input_port);
+    state
+        .borrow_mut()
+        .created_links
+        .insert((output_port, input_port), CreatedLink { proxy: link });
+    Ok(())
+}
+
 fn handle_command(
     cmd: PwCommand,
     state: &Rc<RefCell<PwThreadState>>,
     main_loop_weak: &pipewire::main_loop::MainLoopWeak,
     core: &pipewire::core::CoreRc,
-    _registry: &pipewire::registry::RegistryRc,
+    registry: &pipewire::registry::RegistryRc,
 ) {
     match cmd {
         PwCommand::Shutdown => {
@@ -794,86 +844,39 @@ fn handle_command(
                 output_port, input_port
             );
 
-            let (out_node, in_node) = {
-                let s = state.borrow();
-                (
-                    s.get_node_for_port(output_port),
-                    s.get_node_for_port(input_port),
-                )
-            };
-
-            let out_node = match out_node {
-                Some(n) => n,
-                None => {
-                    warn!("Output port {} not found, using CLI fallback", output_port);
-                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port)
-                        {
-                            let _ = event_tx
-                                .send(PwEvent::Error(format!("Failed to create link: {}", e)));
-                        }
-                    });
-                    return;
-                }
-            };
-
-            let in_node = match in_node {
-                Some(n) => n,
-                None => {
-                    warn!("Input port {} not found, using CLI fallback", input_port);
-                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e) = crate::audio::routing::create_link(output_port, input_port)
-                        {
-                            let _ = event_tx
-                                .send(PwEvent::Error(format!("Failed to create link: {}", e)));
-                        }
-                    });
-                    return;
-                }
-            };
-
-            let link_result = core.create_object::<Link>(
-                "link-factory",
-                &properties! {
-                    "link.output.port" => output_port.to_string(),
-                    "link.input.port" => input_port.to_string(),
-                    "link.output.node" => out_node.to_string(),
-                    "link.input.node" => in_node.to_string(),
-                    "object.linger" => "true"
-                },
-            );
-
-            match link_result {
-                Ok(link) => {
-                    info!("Native link created: {} -> {}", output_port, input_port);
-                    state
-                        .borrow_mut()
-                        .created_links
-                        .insert((output_port, input_port), CreatedLink { proxy: link });
-                }
-                Err(e) => {
-                    warn!("Native link creation failed: {:?}, using CLI fallback", e);
-                    spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                        if let Err(e2) = crate::audio::routing::create_link(output_port, input_port)
-                        {
-                            let _ = event_tx
-                                .send(PwEvent::Error(format!("Failed to create link: {}", e2)));
-                        }
-                    });
-                }
+            if let Err(e) = try_create_link_native(core, state, output_port, input_port) {
+                // CLI fallback covers two narrow cases the native path can't
+                // handle yet: (1) the port isn't in our registry-mirror state
+                // (registry listener hasn't dispatched the global yet), and
+                // (2) core.create_object failed. Requeuing-on-PortAdded would
+                // eliminate this path but is out of scope here.
+                warn!(
+                    "Native create_link {} -> {} failed ({}), using CLI fallback",
+                    output_port, input_port, e
+                );
+                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                    if let Err(e2) = crate::audio::routing::create_link(output_port, input_port) {
+                        let _ = event_tx
+                            .send(PwEvent::Error(format!("Failed to create link: {}", e2)));
+                    }
+                });
             }
         }
 
         PwCommand::DestroyLink { link_id } => {
             debug!("Destroying link: {}", link_id);
-            // Destroy links SYNCHRONOUSLY to avoid race conditions with WirePlumber.
-            // If we destroy async and create sync, WirePlumber can re-route the stream
-            // to a different sink during the window between destroy and create.
-            if let Err(e) = crate::audio::routing::destroy_link(link_id) {
+            // Destroy via the native registry API on the main-loop socket.
+            // Same-socket ordering: any `core.create_object` issued after this
+            // call is serialized by the PipeWire daemon behind the destroy, so
+            // we don't need to wait for `LinkRemoved` before creating again.
+            // The cross-process WirePlumber race (WP reacting to `global_remove`
+            // before our next request lands) is orthogonal and exists equally
+            // in the old `pw-link -d` CLI path.
+            if let Err(e) = registry.destroy_global(link_id).into_result() {
                 let _ = state
                     .borrow()
                     .event_tx
-                    .send(PwEvent::Error(format!("Failed to destroy link: {}", e)));
+                    .send(PwEvent::Error(format!("Failed to destroy link: {:?}", e)));
             }
         }
 
@@ -1010,17 +1013,22 @@ fn handle_command(
                     })
                 });
 
-                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                    for link_id in links_to_destroy {
-                        debug!(
-                            "Destroying stale link {} from native loopback {}",
-                            link_id, loopback_output_node
-                        );
-                        if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                            warn!("Failed to destroy stale link {}: {}", link_id, e);
-                        }
+                // Destroy stale links natively on the main loop BEFORE we spawn
+                // the background worker for pw-metadata. Native destroys are a
+                // single IPC write on our socket and don't need a worker thread.
+                // Same-socket ordering guarantees these land at the PipeWire
+                // daemon before the pw-metadata change we issue afterwards.
+                for link_id in &links_to_destroy {
+                    debug!(
+                        "Destroying stale link {} from native loopback {}",
+                        link_id, loopback_output_node
+                    );
+                    if let Err(e) = registry.destroy_global(*link_id).into_result() {
+                        debug!("Failed to destroy stale link {}: {:?}", link_id, e);
                     }
+                }
 
+                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                     match playback_info {
                         Some((_, true)) => {
                             warn!(
@@ -1134,52 +1142,58 @@ fn handle_command(
                 Vec::new()
             };
 
-            // Dispatch CLI link operations to a background thread
+            // Destroy stale links + create new ones, all on the main loop.
+            // Native IPC writes are non-blocking, so no background worker is
+            // needed. Same-socket ordering means the daemon processes destroys
+            // before the creates we issue immediately after.
+            let event_tx = state.borrow().event_tx.clone();
             let num_pairs = port_pairs.len();
-            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                for link_id in links_to_destroy {
-                    debug!("Destroying existing link {} from loopback output", link_id);
-                    if let Err(e) = crate::audio::routing::destroy_link(link_id) {
-                        warn!("Failed to destroy link {}: {}", link_id, e);
-                    }
-                }
 
-                if target_node_id.is_none() {
-                    warn!("No target device found for routing");
-                    let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
-                    let _ = event_tx.send(PwEvent::RouteFinished {
-                        loopback_output_node,
-                        reason: RouteFinishReason::NoTargetDevice,
-                    });
-                    return;
+            for link_id in links_to_destroy {
+                debug!("Destroying existing link {} from loopback output", link_id);
+                if let Err(e) = registry.destroy_global(link_id).into_result() {
+                    debug!("Failed to destroy link {}: {:?}", link_id, e);
                 }
+            }
 
-                if num_pairs == 0 {
-                    warn!("No port pairs found for routing loopback {}", loopback_output_node);
-                    let _ = event_tx.send(PwEvent::RouteFinished {
-                        loopback_output_node,
-                        reason: RouteFinishReason::NoPortPairs,
-                    });
-                    return;
-                }
-
-                for (output_port, input_port) in &port_pairs {
-                    info!(
-                        "Creating link from loopback: {} -> {}",
-                        output_port, input_port
-                    );
-                    if let Err(e) = crate::audio::routing::create_link(*output_port, *input_port) {
-                        warn!(
-                            "Failed to create link {} -> {}: {}",
-                            output_port, input_port, e
-                        );
-                    }
-                }
-
+            if target_node_id.is_none() {
+                warn!("No target device found for routing");
+                let _ = event_tx.send(PwEvent::Error("No target device found".to_string()));
                 let _ = event_tx.send(PwEvent::RouteFinished {
                     loopback_output_node,
-                    reason: RouteFinishReason::LinksCreated { count: num_pairs },
+                    reason: RouteFinishReason::NoTargetDevice,
                 });
+                return;
+            }
+
+            if num_pairs == 0 {
+                warn!(
+                    "No port pairs found for routing loopback {}",
+                    loopback_output_node
+                );
+                let _ = event_tx.send(PwEvent::RouteFinished {
+                    loopback_output_node,
+                    reason: RouteFinishReason::NoPortPairs,
+                });
+                return;
+            }
+
+            for (output_port, input_port) in &port_pairs {
+                if let Err(e) = try_create_link_native(core, state, *output_port, *input_port) {
+                    warn!(
+                        "Failed to create link {} -> {}: {}",
+                        output_port, input_port, e
+                    );
+                    let _ = event_tx.send(PwEvent::Error(format!(
+                        "Failed to create link: {}",
+                        e
+                    )));
+                }
+            }
+
+            let _ = event_tx.send(PwEvent::RouteFinished {
+                loopback_output_node,
+                reason: RouteFinishReason::LinksCreated { count: num_pairs },
             });
         }
 
@@ -1322,9 +1336,12 @@ fn handle_command(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
                             );
-                            if let Err(e) =
-                                crate::audio::routing::create_link(mic_port.id, capture_port.id)
-                            {
+                            if let Err(e) = try_create_link_native(
+                                core,
+                                state,
+                                mic_port.id,
+                                capture_port.id,
+                            ) {
                                 warn!("Failed to link mic to capture stream: {}", e);
                             }
                             linked_capture_ports.insert(capture_port.id);
@@ -1404,9 +1421,12 @@ fn handle_command(
                                 "Creating link: mic port {} ({}) -> capture port {} ({})",
                                 mic_port.id, mic_port.name, capture_port.id, capture_port.name
                             );
-                            if let Err(e) =
-                                crate::audio::routing::create_link(mic_port.id, capture_port.id)
-                            {
+                            if let Err(e) = try_create_link_native(
+                                core,
+                                state,
+                                mic_port.id,
+                                capture_port.id,
+                            ) {
                                 warn!("Failed to link default mic to capture stream: {}", e);
                             }
                             linked_capture_ports.insert(capture_port.id);
