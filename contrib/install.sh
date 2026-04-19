@@ -321,6 +321,19 @@ restart_daemon_if_running() {
     fi
 }
 
+# Warn if the GUI is running — it needs to be relaunched manually since
+# it's a desktop app (no systemd unit, no known DISPLAY/session).
+warn_if_gui_running() {
+    if ! check_command pgrep; then
+        return
+    fi
+
+    if pgrep -x sootmix >/dev/null 2>&1; then
+        echo ""
+        warn "SootMix GUI is running — close and relaunch it to pick up the new version."
+    fi
+}
+
 # Install from pre-built binary
 install_binary() {
     info "Installing from pre-built binary..."
@@ -405,6 +418,7 @@ install_binary() {
 
     # Reload and restart daemon if running
     restart_daemon_if_running
+    warn_if_gui_running
 
     success "Binary installation complete!"
 }
@@ -459,6 +473,7 @@ install_source() {
 
     # Reload and restart daemon if running
     restart_daemon_if_running
+    warn_if_gui_running
 
     success "Source installation complete!"
 }
