@@ -987,16 +987,16 @@ fn handle_command(
                 .unwrap_or(false);
 
             if is_native {
-                // Native loopback path: update WirePlumber metadata so WP handles
-                // format conversion.
-                //
-                // Critical: we must also explicitly destroy stale links from the
-                // loopback output. WirePlumber doesn't reliably migrate manually-
-                // created links (those produced by our own `pw-link` calls) when
-                // `target.node` changes, so without this the old link stays alive
-                // alongside the new one and the channel plays on both devices at
-                // once. Destroy first, then set target.node, so WP's autoconnect
-                // creates a fresh link to the intended target with no race.
+                // Native loopback reroute. Ordering is load-bearing: set
+                // `target.node` metadata FIRST, then destroy stale links, both
+                // on our Core client socket. PipeWire's same-client FIFO
+                // guarantees the daemon applies set-before-destroy and fans
+                // events to WirePlumber in that order, so WP never observes an
+                // orphan stream with a stale `target.node` pointing at the old
+                // device. That state was the source of the double-audio bug:
+                // WP autoconnect would re-link to OLD after our destroy and
+                // before the subprocess pw-metadata write landed on a
+                // separate client socket.
                 let links_to_destroy: Vec<u32> = {
                     let s = state.borrow();
                     s.links
@@ -1013,57 +1013,96 @@ fn handle_command(
                     })
                 });
 
-                // Destroy stale links natively on the main loop BEFORE we spawn
-                // the background worker for pw-metadata. Native destroys are a
-                // single IPC write on our socket and don't need a worker thread.
-                // Same-socket ordering guarantees these land at the PipeWire
-                // daemon before the pw-metadata change we issue afterwards.
-                for link_id in &links_to_destroy {
-                    debug!(
-                        "Destroying stale link {} from native loopback {}",
-                        link_id, loopback_output_node
-                    );
-                    if let Err(e) = registry.destroy_global(*link_id).into_result() {
-                        debug!("Failed to destroy stale link {}: {:?}", link_id, e);
+                let mut used_fallback = false;
+
+                match playback_info {
+                    Some((_, true)) => {
+                        warn!(
+                            "Native source reroute not implemented for channel {:?}",
+                            channel_id
+                        );
+                    }
+                    Some((pnid, false)) if pnid != u32::MAX => {
+                        let metadata_set = {
+                            let s = state.borrow();
+                            if let Some((_, metadata, _)) = &s.default_metadata {
+                                match target_node_id {
+                                    Some(target_id) => {
+                                        let value = format!(
+                                            r#"{{"name":"target.node","value":{}}}"#,
+                                            target_id
+                                        );
+                                        metadata.set_property(
+                                            pnid,
+                                            "target.node",
+                                            None,
+                                            Some(&value),
+                                        );
+                                    }
+                                    None => {
+                                        metadata.set_property(pnid, "target.node", None, None);
+                                    }
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        };
+
+                        for link_id in &links_to_destroy {
+                            debug!(
+                                "Destroying stale link {} from native loopback {}",
+                                link_id, loopback_output_node
+                            );
+                            if let Err(e) = registry.destroy_global(*link_id).into_result() {
+                                warn!("Failed to destroy stale link {}: {:?}", link_id, e);
+                            }
+                        }
+
+                        if metadata_set {
+                            info!(
+                                "Native loopback {:?} (node {}) rerouted -> target {:?}",
+                                channel_id, pnid, target_node_id
+                            );
+                        } else {
+                            warn!(
+                                "default metadata not bound; falling back to subprocess for channel {:?}",
+                                channel_id
+                            );
+                            used_fallback = true;
+                            spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
+                                if let Err(e) =
+                                    crate::audio::native_loopback::set_playback_target_node(
+                                        pnid,
+                                        target_node_id,
+                                    )
+                                {
+                                    warn!("Native re-route failed: {}", e);
+                                }
+                                let _ = event_tx.send(PwEvent::RouteFinished {
+                                    loopback_output_node,
+                                    reason: RouteFinishReason::NativeRerouted,
+                                });
+                            });
+                        }
+                    }
+                    Some((_, false)) => {
+                        warn!(
+                            "Native loopback {:?} has no valid playback node id",
+                            channel_id
+                        );
+                    }
+                    None => {
+                        warn!("Native loopback not found for channel {:?}", channel_id);
                     }
                 }
 
-                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
-                    match playback_info {
-                        Some((_, true)) => {
-                            warn!(
-                                "Native source reroute not implemented for channel {:?}",
-                                channel_id
-                            );
-                        }
-                        Some((pnid, false)) if pnid != u32::MAX => {
-                            info!(
-                                "Native loopback {:?} (node {}) reroute -> target {:?}",
-                                channel_id, pnid, target_node_id
-                            );
-                            if let Err(e) = crate::audio::native_loopback::set_playback_target_node(
-                                pnid,
-                                target_node_id,
-                            ) {
-                                warn!("Native re-route failed: {}", e);
-                            }
-                        }
-                        Some((_, false)) => {
-                            warn!(
-                                "Native loopback {:?} has no valid playback node id",
-                                channel_id
-                            );
-                        }
-                        None => {
-                            warn!("Native loopback not found for channel {:?}", channel_id);
-                        }
-                    }
-
-                    let _ = event_tx.send(PwEvent::RouteFinished {
+                if !used_fallback {
+                    let _ = state.borrow().event_tx.send(PwEvent::RouteFinished {
                         loopback_output_node,
                         reason: RouteFinishReason::NativeRerouted,
                     });
-                });
+                }
                 return;
             }
 
