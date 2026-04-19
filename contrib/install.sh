@@ -279,9 +279,9 @@ get_latest_version() {
     local version=""
 
     if check_command curl; then
-        version=$(curl -fsSL "https://api.github.com/repos/FrozenTear/sootmix/releases/latest" 2>/dev/null | grep -oE '"tag_name":\s*"[^"]+"' | grep -oE 'v[0-9.]+' || echo "")
+        version=$(curl -fsSL "https://api.github.com/repos/FrozenTear/sootmix/releases/latest" 2>/dev/null | sed -nE 's/.*"tag_name":[[:space:]]*"(v[^"]+)".*/\1/p' | head -1 || echo "")
     elif check_command wget; then
-        version=$(wget -qO- "https://api.github.com/repos/FrozenTear/sootmix/releases/latest" 2>/dev/null | grep -oE '"tag_name":\s*"[^"]+"' | grep -oE 'v[0-9.]+' || echo "")
+        version=$(wget -qO- "https://api.github.com/repos/FrozenTear/sootmix/releases/latest" 2>/dev/null | sed -nE 's/.*"tag_name":[[:space:]]*"(v[^"]+)".*/\1/p' | head -1 || echo "")
     fi
 
     if [[ -z "$version" ]]; then
