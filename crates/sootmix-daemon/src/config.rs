@@ -164,6 +164,30 @@ impl MixerConfig {
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// Rewrite the legacy display-label form of the system-default sentinel.
+    ///
+    /// Older configs (and any written by a GUI that leaked the picker label
+    /// into storage) can carry `"System Default"` in a channel's output/input
+    /// device field. The daemon only recognizes the lowercase
+    /// `"system-default"` sentinel, so those channels were skipped by both
+    /// reroute paths and stuck on whichever sink they were first linked to —
+    /// visible as e.g. "System De..." in the per-channel picker while the
+    /// actual audio kept playing through the old default (typically built-in
+    /// speakers) even after a headset became the system default.
+    pub fn migrate_system_default_sentinel(&mut self) {
+        fn fix(slot: &mut Option<String>) {
+            if matches!(slot.as_deref(), Some("System Default")) {
+                *slot = Some("system-default".to_string());
+            }
+        }
+        fix(&mut self.master.output_device);
+        fix(&mut self.master.monitor_device);
+        for channel in &mut self.channels {
+            fix(&mut channel.output_device_name);
+            fix(&mut channel.input_device_name);
+        }
+    }
 }
 
 /// Match target for routing rules.
@@ -299,7 +323,8 @@ impl ConfigManager {
 
         let content = fs::read_to_string(&path)?;
         match MixerConfig::from_toml(&content) {
-            Ok(config) => {
+            Ok(mut config) => {
+                config.migrate_system_default_sentinel();
                 info!("Loaded mixer config from {:?}", path);
                 Ok(config)
             }

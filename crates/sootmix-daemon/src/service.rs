@@ -2666,16 +2666,19 @@ impl DaemonService {
                 self.send_pw_command(create_cmd);
             };
         } else {
-            // For output channels, route the loopback output to the new device
-            let outputs = self.state.get_outputs();
-            let target_device_id = device_name_opt.as_ref().and_then(|name| {
-                outputs
-                    .iter()
-                    .find(|d| d.description == *name || d.name == *name)
-                    .map(|d| d.node_id)
-            });
-
+            // For output channels, route the loopback output to the new device.
+            //
+            // `desired_output_node_for_channel` already handles the sentinel
+            // (→ master → WirePlumber default) and the "configured device not
+            // currently present" fall-through. The previous scan against
+            // `get_outputs()` matched the synthetic "system-default" entry
+            // (node_id 0), which caused `suppress_and_route` to dispatch a
+            // route to node 0 — destroying the real link without creating a
+            // replacement, so the channel went silent or double-linked via
+            // the PortAdded retry racing with the stale link.
             if let Some(loopback_id) = loopback_id {
+                let target_device_id =
+                    self.desired_output_node_for_channel(channel_uuid);
                 self.suppress_and_route(
                     loopback_id,
                     target_device_id,
@@ -2749,6 +2752,15 @@ impl DaemonService {
                 "Configured master output '{}' not found, falling back to best available sink",
                 name
             );
+        } else {
+            // Unconfigured master follows the WirePlumber default, matching the
+            // "system-default" sentinel. Without this, the heuristic fallback
+            // below prefers analog/speaker over Bluetooth/USB headsets and
+            // routes to speakers even when the OS has promoted a headset to
+            // default.
+            if let Some(id) = crate::audio::routing::get_default_sink_id() {
+                return Some(id);
+            }
         }
 
         // Use smart fallback: prefer speakers/analog over HDMI/DisplayPort
@@ -3057,19 +3069,21 @@ impl DaemonService {
         };
 
         // Check if this device matches the master output.
-        // "system-default" matches ANY hardware sink (it dynamically follows the default).
+        // "system-default" (and an unset master) matches ANY hardware sink —
+        // both follow the WirePlumber default dynamically. Treating `None`
+        // as "not system-default" here diverges from
+        // `reroute_system_default_channels` and leaves channels stuck on the
+        // old default when a headset hot-plugs under an unconfigured master.
         let master_is_system_default = self
             .state
             .master_output
-            .as_ref()
-            .map(|name| name == Self::SYSTEM_DEFAULT_SENTINEL)
-            .unwrap_or(false);
+            .as_deref()
+            .map_or(true, |name| name == Self::SYSTEM_DEFAULT_SENTINEL);
         let master_matches = self
             .state
             .master_output
-            .as_ref()
-            .map(|name| name == Self::SYSTEM_DEFAULT_SENTINEL || matches_device(name))
-            .unwrap_or(false);
+            .as_deref()
+            .map_or(true, |name| name == Self::SYSTEM_DEFAULT_SENTINEL || matches_device(name));
 
         // Collect loopback IDs that need re-routing
         info!(
@@ -3100,9 +3114,20 @@ impl DaemonService {
                 continue;
             }
 
-            // Per-channel output takes priority
+            // A channel follows the WirePlumber default when its per-channel
+            // output is the sentinel, or when it's unset and the master
+            // follows default. Matches `reroute_system_default_channels` so
+            // hot-plug doesn't diverge from the metadata-change path.
+            let follows_default = match c.output_device_name.as_deref() {
+                Some(name) => name == Self::SYSTEM_DEFAULT_SENTINEL,
+                None => master_is_system_default,
+            };
+
+            // Per-channel output takes priority — but only if it names a real
+            // device (the sentinel is handled by the `follows_default` branch
+            // below).
             if let Some(ref dev_name) = c.output_device_name {
-                if matches_device(dev_name) {
+                if dev_name != Self::SYSTEM_DEFAULT_SENTINEL && matches_device(dev_name) {
                     loopbacks_to_route.push((
                         c.id,
                         loopback_id,
@@ -3124,12 +3149,12 @@ impl DaemonService {
                 continue;
             }
 
-            // For channels without a per-channel output:
+            // Channels that follow the system default:
             // - Always re-route if orphaned (no links)
-            // - For system-default master: also re-route if current links go to a
-            //   device that is no longer the system default (e.g. user connected a
-            //   bluetooth headset and it became the new default)
-            if c.output_device_name.is_none() {
+            // - If system default is tracked, also re-route when the current
+            //   link points somewhere other than the new default (e.g. headset
+            //   just became default and we're still linked to speakers)
+            if follows_default {
                 let has_links = self
                     .state
                     .pw_graph
@@ -3138,13 +3163,13 @@ impl DaemonService {
                     .any(|l| l.output_node == loopback_id);
 
                 debug!(
-                    "Channel '{}': loopback_id={}, has_links={}, output_device=None",
+                    "Channel '{}': loopback_id={}, has_links={}, follows_default=true",
                     c.name, loopback_id, has_links
                 );
 
                 if !has_links {
                     loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), None));
-                } else if master_is_system_default {
+                } else {
                     // Check if existing links still point to the current system default.
                     // If the default changed (e.g. bluetooth connected), re-route.
                     let current_default = crate::audio::routing::get_default_sink_id();
