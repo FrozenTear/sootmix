@@ -135,6 +135,16 @@ pub enum Message {
     /// Close settings modal.
     CloseSettings,
 
+    // ==================== Diagnostics ====================
+    /// Request generation of a support-report tarball.
+    GenerateReport,
+    /// Result of generating the report (absolute path on success).
+    ReportGenerated(Result<std::path::PathBuf, String>),
+    /// Request an update check against GitHub releases.
+    CheckForUpdates,
+    /// Result of the update check.
+    UpdateCheckResult(Result<crate::diagnostics::UpdateCheck, String>),
+
     // ==================== Daemon Service Controls ====================
     /// Start the daemon systemd service.
     DaemonStart,

@@ -1047,6 +1047,29 @@ pub struct AppState {
     pub downloading: std::collections::HashMap<String, f32>,
     /// Set of installed pack IDs.
     pub installed_packs: std::collections::HashSet<String>,
+
+    // ==================== Diagnostics ====================
+    pub report_status: ReportStatus,
+    pub update_status: UpdateStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ReportStatus {
+    #[default]
+    Idle,
+    Generating,
+    Ready(std::path::PathBuf),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available { current: String, latest: String },
+    Failed(String),
 }
 
 impl Default for AppState {
@@ -1101,6 +1124,8 @@ impl AppState {
             downloader_search: String::new(),
             downloading: std::collections::HashMap::new(),
             installed_packs: std::collections::HashSet::new(),
+            report_status: ReportStatus::default(),
+            update_status: UpdateStatus::default(),
         }
     }
 

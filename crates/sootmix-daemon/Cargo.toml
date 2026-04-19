@@ -1,6 +1,6 @@
 [package]
 name = "sootmix-daemon"
-version = "0.2.3-13"
+version = "0.2.4"
 edition = "2021"
 authors = ["SootMix Contributors"]
 description = "Background daemon for SootMix audio routing"

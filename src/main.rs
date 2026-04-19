@@ -10,6 +10,7 @@ mod app;
 mod audio;
 mod config;
 mod daemon_client;
+mod diagnostics;
 mod message;
 mod plugins;
 mod realtime;

@@ -8,6 +8,7 @@
 
 use crate::audio::types::OutputDevice;
 use crate::message::Message;
+use crate::state::{ReportStatus, UpdateStatus};
 use crate::ui::theme::*;
 use iced::widget::{button, checkbox, column, container, pick_list, row, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Length, Theme};
@@ -19,6 +20,8 @@ pub fn settings_panel<'a>(
     daemon_action_pending: bool,
     available_outputs: &[OutputDevice],
     monitor_device: Option<&str>,
+    report_status: &ReportStatus,
+    update_status: &UpdateStatus,
 ) -> Element<'a, Message> {
     // Header with title and close button
     let header = row![
@@ -205,6 +208,88 @@ pub fn settings_panel<'a>(
             .width(1.0),
     });
 
+    // --- Diagnostics section ---
+    let diag_divider = container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(SOOTMIX_DARK.border_subtle)),
+            ..container::Style::default()
+        });
+
+    let diag_label = text("Diagnostics").size(TEXT_BODY).color(TEXT);
+
+    // Update check row.
+    let (update_line, update_line_color) = match update_status {
+        UpdateStatus::Idle => ("Not checked yet".to_string(), TEXT_DIM),
+        UpdateStatus::Checking => ("Checking for updates\u{2026}".to_string(), TEXT_DIM),
+        UpdateStatus::UpToDate(v) => (format!("Up to date ({})", v), SUCCESS),
+        UpdateStatus::Available { current, latest } => (
+            format!("{} available (currently {})", latest, current),
+            PRIMARY,
+        ),
+        UpdateStatus::Failed(e) => (format!("Check failed: {}", e), MUTED_COLOR),
+    };
+
+    let recheck_disabled = matches!(update_status, UpdateStatus::Checking);
+    let update_row = row![
+        text(update_line).size(TEXT_SMALL).color(update_line_color),
+        Space::new().width(Fill),
+        button(text("Check").size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(if recheck_disabled { btn_style_dim } else { btn_style })
+            .on_press_maybe(if recheck_disabled {
+                None
+            } else {
+                Some(Message::CheckForUpdates)
+            }),
+    ]
+    .align_y(Alignment::Center);
+
+    let update_hint: Element<Message> = match update_status {
+        UpdateStatus::Available { .. } => text(
+            "Run the installer to update: curl -sSL https://raw.githubusercontent.com/FrozenTear/sootmix/master/contrib/install.sh | sh",
+        )
+        .size(TEXT_SMALL)
+        .color(TEXT_DIM)
+        .into(),
+        _ => Space::new().height(0).into(),
+    };
+
+    // Report row.
+    let report_generating = matches!(report_status, ReportStatus::Generating);
+    let report_label: Element<Message> = match report_status {
+        ReportStatus::Idle => text("Bundle logs, audio graph state, and config for support.")
+            .size(TEXT_SMALL)
+            .color(TEXT_DIM)
+            .into(),
+        ReportStatus::Generating => text("Collecting report\u{2026}")
+            .size(TEXT_SMALL)
+            .color(TEXT_DIM)
+            .into(),
+        ReportStatus::Ready(path) => text(format!("Report saved: {}", path.display()))
+            .size(TEXT_SMALL)
+            .color(SUCCESS)
+            .into(),
+        ReportStatus::Failed(e) => text(format!("Report failed: {}", e))
+            .size(TEXT_SMALL)
+            .color(MUTED_COLOR)
+            .into(),
+    };
+
+    let report_row = row![
+        text("Support Report").size(TEXT_SMALL).color(TEXT),
+        Space::new().width(Fill),
+        button(text(if report_generating { "Working\u{2026}" } else { "Generate" }).size(TEXT_SMALL))
+            .padding([SPACING_XS, SPACING_SM])
+            .style(if report_generating { btn_style_dim } else { btn_style })
+            .on_press_maybe(if report_generating {
+                None
+            } else {
+                Some(Message::GenerateReport)
+            }),
+    ]
+    .align_y(Alignment::Center);
+
     // Main content
     let content = column![
         header,
@@ -226,6 +311,17 @@ pub fn settings_panel<'a>(
         monitor_hint,
         Space::new().height(SPACING_SM),
         monitor_picker,
+        Space::new().height(SPACING_SM),
+        diag_divider,
+        Space::new().height(SPACING_SM),
+        diag_label,
+        Space::new().height(SPACING_SM),
+        update_row,
+        update_hint,
+        Space::new().height(SPACING_SM),
+        report_row,
+        Space::new().height(SPACING_XS),
+        report_label,
     ]
     .padding(PADDING)
     .spacing(SPACING_XS);

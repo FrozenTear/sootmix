@@ -808,13 +808,65 @@ impl SootMix {
             // ==================== Settings ====================
             Message::OpenSettings => {
                 self.state.settings_open = true;
-                return iced::Task::future(async {
+                // Kick off the update check opportunistically when opening settings,
+                // but only if we don't already have a fresh result.
+                let need_update_check = matches!(
+                    self.state.update_status,
+                    crate::state::UpdateStatus::Idle | crate::state::UpdateStatus::Failed(_)
+                );
+                let autostart_task = iced::Task::future(async {
                     let result = daemon_client::systemctl_is_enabled().await;
                     Message::DaemonAutoStartChecked(result.unwrap_or(false))
                 });
+                if need_update_check {
+                    self.state.update_status = crate::state::UpdateStatus::Checking;
+                    let update_task = iced::Task::future(async {
+                        Message::UpdateCheckResult(crate::diagnostics::check_for_updates().await)
+                    });
+                    return iced::Task::batch([autostart_task, update_task]);
+                }
+                return autostart_task;
             }
             Message::CloseSettings => {
                 self.state.settings_open = false;
+            }
+
+            // ==================== Diagnostics ====================
+            Message::GenerateReport => {
+                self.state.report_status = crate::state::ReportStatus::Generating;
+                return iced::Task::future(async {
+                    Message::ReportGenerated(crate::diagnostics::generate_report().await)
+                });
+            }
+            Message::ReportGenerated(result) => {
+                self.state.report_status = match result {
+                    Ok(path) => crate::state::ReportStatus::Ready(path),
+                    Err(e) => {
+                        warn!("Support report generation failed: {}", e);
+                        crate::state::ReportStatus::Failed(e)
+                    }
+                };
+            }
+            Message::CheckForUpdates => {
+                self.state.update_status = crate::state::UpdateStatus::Checking;
+                return iced::Task::future(async {
+                    Message::UpdateCheckResult(crate::diagnostics::check_for_updates().await)
+                });
+            }
+            Message::UpdateCheckResult(result) => {
+                self.state.update_status = match result {
+                    Ok(check) => {
+                        if check.newer_available {
+                            crate::state::UpdateStatus::Available {
+                                current: check.current,
+                                latest: check.latest,
+                            }
+                        } else {
+                            crate::state::UpdateStatus::UpToDate(check.current)
+                        }
+                    }
+                    Err(e) => crate::state::UpdateStatus::Failed(e),
+                };
             }
 
             // ==================== Daemon Service Controls ====================
@@ -1816,6 +1868,8 @@ impl SootMix {
                 self.state.daemon_action_pending,
                 &self.state.available_outputs,
                 self.state.monitor_device.as_deref(),
+                &self.state.report_status,
+                &self.state.update_status,
             );
 
             let backdrop = button(Space::new().width(Fill).height(Fill))
