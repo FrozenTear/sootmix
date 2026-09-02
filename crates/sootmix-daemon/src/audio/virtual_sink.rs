@@ -4,9 +4,9 @@
 
 //! Virtual sink creation and management using pw-loopback.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::process::{Child, Command};
-use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -31,7 +31,10 @@ pub fn check_pipewire_tools() {
         ("pw-cli", "Required for node management and link creation"),
         ("pw-dump", "Required for discovering PipeWire nodes"),
         ("pw-link", "Used for port linking operations"),
-        ("wpctl", "Required for volume control and default sink management"),
+        (
+            "wpctl",
+            "Required for volume control and default sink management",
+        ),
     ];
 
     for (tool, purpose) in &tools {
@@ -215,7 +218,10 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
     // First try tracked process
     if let Some(ref mut map) = *get_processes() {
         if let Some(mut child) = map.remove(&node_id) {
-            info!("Destroying virtual sink with node ID {} (tracked process)", node_id);
+            info!(
+                "Destroying virtual sink with node ID {} (tracked process)",
+                node_id
+            );
             let _ = child.kill();
             let _ = child.wait();
             return Ok(());
@@ -230,7 +236,10 @@ pub fn destroy_virtual_sink(node_id: u32) -> Result<(), VirtualSinkError> {
 
     // Get the node name from PipeWire
     if let Ok(node_name) = get_node_name(node_id) {
-        info!("Found node name '{}' for node {}, killing matching pw-loopback", node_name, node_id);
+        info!(
+            "Found node name '{}' for node {}, killing matching pw-loopback",
+            node_name, node_id
+        );
         // Kill pw-loopback processes that have this node name in their arguments
         // Match both the source name (sootmix.X) and the input name (sootmix.X.input)
         let _ = Command::new("pkill")
@@ -314,6 +323,24 @@ pub fn destroy_all_virtual_sinks() {
 
     // Give processes time to die and nodes to be removed
     std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// Kill tracked pw-loopback children without sleeping or pkill.
+///
+/// Used on disconnect/reconnect so D-Bus callers do not block. Processes that
+/// already died (PipeWire restart) are reaped; leftover live children are
+/// signaled so restore can recreate sinks/sources with the same names.
+pub fn kill_tracked_loopback_processes() {
+    let mut guard = get_processes();
+    if let Some(ref mut processes) = *guard {
+        for (node_id, mut child) in processes.drain() {
+            debug!("Killing tracked loopback process for node {}", node_id);
+            if let Err(e) = child.kill() {
+                debug!("Process kill returned error (may be already dead): {}", e);
+            }
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Clean up orphaned sootmix nodes from previous runs.
@@ -468,7 +495,10 @@ pub struct VirtualSourceResult {
 
 /// Create a virtual source for recording.
 /// If `target_device` is Some, the capture stream will target that device (mic).
-pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<VirtualSourceResult, VirtualSinkError> {
+pub fn create_virtual_source(
+    name: &str,
+    target_device: Option<&str>,
+) -> Result<VirtualSourceResult, VirtualSinkError> {
     ensure_processes_map();
 
     let safe_name = name
@@ -502,7 +532,10 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
             .args(["destroy", &existing_id.to_string()])
             .output()
         {
-            warn!("pw-cli destroy failed for source node {}: {}", existing_id, e);
+            warn!(
+                "pw-cli destroy failed for source node {}: {}",
+                existing_id, e
+            );
         }
         // Also destroy the capture stream node if it exists
         let capture_stream_name = format!("input.{}", loopback_node_name);
@@ -550,7 +583,10 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
         source_name, name
     );
 
-    info!("Creating virtual source: {} (description: {}, target: {:?})", source_name, name, target_device);
+    info!(
+        "Creating virtual source: {} (description: {}, target: {:?})",
+        source_name, name, target_device
+    );
 
     let child = Command::new("pw-loopback")
         .arg("--name")
@@ -570,17 +606,18 @@ pub fn create_virtual_source(name: &str, target_device: Option<&str>) -> Result<
 
     // Find the capture stream node (the input side that captures from the mic)
     let input_node_name = format!("input.{}", loopback_node_name);
-    let capture_stream_node_id = match find_node_by_name_and_class(&input_node_name, "Stream/Input/Audio") {
-        Ok(id) => Some(id),
-        Err(e) => {
-            warn!(
-                "Failed to find capture stream node '{}' for virtual source '{}': {}. \
+    let capture_stream_node_id =
+        match find_node_by_name_and_class(&input_node_name, "Stream/Input/Audio") {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(
+                    "Failed to find capture stream node '{}' for virtual source '{}': {}. \
                  Input channel mic linking will not work.",
-                input_node_name, name, e
-            );
-            None
-        }
-    };
+                    input_node_name, name, e
+                );
+                None
+            }
+        };
 
     if let Some(ref mut map) = *get_processes() {
         map.insert(source_node_id, child);

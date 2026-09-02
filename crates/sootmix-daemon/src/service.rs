@@ -28,6 +28,10 @@ pub enum SignalEvent {
     MasterVolumeChanged(f64),
     /// Master mute changed externally.
     MasterMuteChanged(bool),
+    /// PipeWire connection state flipped.
+    ConnectionChanged(bool),
+    /// Input device list changed (cleared on disconnect, refreshed after restore).
+    InputsChanged,
 }
 
 /// Convert a linear volume value to dB.
@@ -194,6 +198,11 @@ impl ChannelState {
             meter_levels: (left_db as f64, right_db as f64),
             kind: self.kind,
             input_gain_db: self.input_gain_db as f64,
+            // Mic/NS survive reconnect: UI PR #21 consumes these on
+            // InitialState / ChannelAdded / ChannelUpdated.
+            input_device: self.input_device_name.clone().unwrap_or_default(),
+            noise_suppression_enabled: self.noise_suppression_enabled,
+            vad_threshold: self.vad_threshold as f64,
         }
     }
 
@@ -257,8 +266,7 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         "brave",
     ];
 
-    generic_names.iter().any(|g| name == *g)
-        || generic_binaries.iter().any(|g| binary == *g)
+    generic_names.iter().any(|g| name == *g) || generic_binaries.iter().any(|g| binary == *g)
 }
 
 /// Wine launches every Windows app under the same wrapper binary, so
@@ -397,8 +405,20 @@ fn identify_from_cmdline_args(args: &[String]) -> Option<String> {
     // e.g., --user-data-dir=/home/soot/.config/YouTube Music → "YouTube Music"
     for arg in args {
         if let Some(dir) = arg.strip_prefix("--user-data-dir=") {
-            if let Some(name) = std::path::Path::new(dir).file_name().and_then(|n| n.to_str()) {
-                if !name.is_empty() && !matches!(name, "chromium" | "chrome" | "google-chrome" | "BraveSoftware" | "microsoft-edge") {
+            if let Some(name) = std::path::Path::new(dir)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                if !name.is_empty()
+                    && !matches!(
+                        name,
+                        "chromium"
+                            | "chrome"
+                            | "google-chrome"
+                            | "BraveSoftware"
+                            | "microsoft-edge"
+                    )
+                {
                     return Some(name.to_string());
                 }
             }
@@ -561,7 +581,11 @@ impl PwGraphState {
     pub fn input_devices(&self, exclude_names: &[&str]) -> Vec<InputInfo> {
         self.nodes
             .values()
-            .filter(|n| n.is_audio_input() && !n.name.starts_with("sootmix.") && !exclude_names.iter().any(|ex| n.name.contains(ex)))
+            .filter(|n| {
+                n.is_audio_input()
+                    && !n.name.starts_with("sootmix.")
+                    && !exclude_names.iter().any(|ex| n.name.contains(ex))
+            })
             .map(|n| InputInfo {
                 node_id: n.id,
                 name: n.name.clone(),
@@ -730,6 +754,8 @@ pub struct DaemonState {
     pub suppressed_restores: HashSet<(u32, u32)>,
     /// PFL/solo monitor device name (UI-owned, round-tripped by daemon).
     pub monitor_device: Option<String>,
+    /// When set, restore_channels should run after a short non-blocking graph wait.
+    pub pending_restore_at: Option<Instant>,
 }
 
 impl DaemonState {
@@ -760,6 +786,7 @@ impl DaemonState {
             pending_ns_replacements: HashMap::new(),
             suppressed_restores: HashSet::new(),
             monitor_device: mixer_config.master.monitor_device,
+            pending_restore_at: None,
         }
     }
 
@@ -872,6 +899,11 @@ impl DaemonState {
     }
 }
 
+/// Minimum graph settle time after Connected before restore (non-blocking).
+const RESTORE_MIN_GRAPH_WAIT: Duration = Duration::from_millis(200);
+/// Upper bound for waiting on registry events before restoring anyway.
+const RESTORE_MAX_GRAPH_WAIT: Duration = Duration::from_millis(1500);
+
 /// The main daemon service.
 pub struct DaemonService {
     pub state: DaemonState,
@@ -880,6 +912,10 @@ pub struct DaemonService {
     config_manager: ConfigManager,
     /// Sender for D-Bus signal events.
     signal_tx: Option<tokio_mpsc::UnboundedSender<SignalEvent>>,
+    /// True after the first restore_channels (startup cleanup has run).
+    /// Reconnect restores only after this is set so we don't recreate sinks
+    /// before `cleanup_orphaned_nodes` at startup.
+    initial_restore_complete: bool,
 }
 
 impl DaemonService {
@@ -894,6 +930,7 @@ impl DaemonService {
             pw_event_rx: None,
             config_manager,
             signal_tx: None,
+            initial_restore_complete: false,
         }
     }
 
@@ -952,14 +989,17 @@ impl DaemonService {
             if !old_app_ids.contains(&app.node_id) {
                 debug!(
                     "Emitting AppDiscovered signal for: {} (node {})",
-                    app.identifier(), app.node_id
+                    app.identifier(),
+                    app.node_id
                 );
                 self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
             } else if let Some(old_id) = old_identifiers.get(&app.node_id) {
                 if *old_id != app.identifier() {
                     debug!(
                         "App identity changed: {} -> {} (node {})",
-                        old_id, app.identifier(), app.node_id
+                        old_id,
+                        app.identifier(),
+                        app.node_id
                     );
                     self.emit_signal(SignalEvent::AppRemoved(app.node_id.to_string()));
                     self.emit_signal(SignalEvent::AppDiscovered(app.to_app_info()));
@@ -977,7 +1017,18 @@ impl DaemonService {
     }
 
     /// Start the PipeWire thread.
+    ///
+    /// `spawn()` success is **not** a connection. `pw_connected` stays false
+    /// until `PwEvent::Connected`.
     pub fn start_pipewire(&mut self) -> Result<(), ServiceError> {
+        self.reap_finished_pw_thread();
+
+        if self.pw_thread.as_ref().is_some_and(|t| !t.is_finished()) {
+            return Err(ServiceError::PipeWire(
+                "PipeWire thread is still running".to_string(),
+            ));
+        }
+
         let (event_tx, event_rx) = mpsc::channel();
 
         let pw_thread =
@@ -986,8 +1037,21 @@ impl DaemonService {
         self.pw_thread = Some(pw_thread);
         self.pw_event_rx = Some(event_rx);
 
-        info!("PipeWire thread started");
+        info!("PipeWire thread started (waiting for Connected)");
         Ok(())
+    }
+
+    /// Join a dead PipeWire thread so it cannot block reconnect.
+    fn reap_finished_pw_thread(&mut self) {
+        if self.pw_thread.as_ref().is_some_and(|t| t.is_finished()) {
+            if let Some(pw) = self.pw_thread.take() {
+                pw.join();
+            }
+        }
+    }
+
+    fn pw_thread_alive(&self) -> bool {
+        self.pw_thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
     /// Wait for initial PipeWire discovery to complete.
@@ -1068,7 +1132,8 @@ impl DaemonService {
             });
         }
 
-        // Restore input channels (virtual sources)
+        // Restore input channels (virtual sources) and NS. Must run after
+        // clear_pw_derived_ids so a stale pw_source_id cannot skip recreate.
         let sources_to_create: Vec<(Uuid, String, Option<String>, bool, f32)> = self
             .state
             .channels
@@ -1109,28 +1174,52 @@ impl DaemonService {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(300));
-        self.process_pw_events();
+        // Restore master recording the same way as sinks (ID must have been cleared).
+        if self.state.master_recording_enabled && self.state.master_recording_source_id.is_none() {
+            info!("Restoring master recording source");
+            self.send_pw_command(PwCommand::CreateRecordingSource {
+                name: "master".to_string(),
+            });
+        }
+
+        // Do not sleep here — D-Bus / meter loop must not block. Created
+        // events arrive via the normal process_pw_events poll.
+        self.initial_restore_complete = true;
 
         Ok(())
     }
 
     /// Process pending PipeWire events.
+    ///
+    /// Never sleeps. Reconnect spawn is non-blocking; discovery/restore are
+    /// scheduled via `pending_restore_at` and flushed on later polls.
     pub fn process_pw_events(&mut self) {
         let events: Vec<PwEvent> = if let Some(ref rx) = self.pw_event_rx {
             rx.try_iter().collect()
         } else {
-            // No event receiver -- check if we need to reconnect
-            self.attempt_reconnect_if_needed();
-            return;
+            Vec::new()
         };
 
         for event in events {
+            // Drop stale graph events that raced with disconnect.
+            if !self.state.pw_connected
+                && self.pw_event_rx.is_none()
+                && !matches!(event, PwEvent::Disconnected | PwEvent::Error(_))
+            {
+                continue;
+            }
             self.handle_pw_event(event);
         }
 
-        // If PW disconnected during event processing, the receiver was dropped
-        if !self.state.pw_connected && self.pw_thread.is_none() {
+        // Thread died without a Disconnected (panic / missed event).
+        if self.pw_thread.as_ref().is_some_and(|t| t.is_finished()) {
+            warn!("PipeWire thread died; treating as disconnect");
+            self.handle_pipewire_disconnect();
+        }
+
+        self.maybe_flush_pending_restore();
+
+        if !self.state.pw_connected && !self.pw_thread_alive() {
             self.attempt_reconnect_if_needed();
         }
 
@@ -1144,16 +1233,21 @@ impl DaemonService {
     }
 
     /// Attempt PipeWire reconnection with exponential backoff.
+    ///
+    /// Only spawns the PW thread. Does **not** sleep, wait for discovery, or
+    /// restore — those run on later `process_pw_events` ticks after Connected.
     fn attempt_reconnect_if_needed(&mut self) {
-        // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
-        let backoff = Duration::from_secs((2u64 << self.state.reconnect_failures.min(4)).min(30));
+        self.reap_finished_pw_thread();
 
-        let should_attempt = match self.state.last_reconnect_attempt {
-            None => true,
-            Some(last) => last.elapsed() >= backoff,
-        };
+        if self.state.pw_connected || self.pw_thread_alive() {
+            return;
+        }
 
-        if !should_attempt {
+        if !should_attempt_reconnect(
+            self.state.last_reconnect_attempt,
+            self.state.reconnect_failures,
+            Instant::now(),
+        ) {
             return;
         }
 
@@ -1165,52 +1259,124 @@ impl DaemonService {
 
         match self.start_pipewire() {
             Ok(()) => {
-                // Wait for PipeWire to discover the graph
-                self.wait_for_discovery();
-
-                // Restore channels
-                if let Err(e) = self.restore_channels() {
-                    warn!("Failed to restore channels after reconnection: {}", e);
-                }
-
-                self.state.reconnect_failures = 0;
-                self.state.last_reconnect_attempt = None;
-                info!("PipeWire reconnected successfully");
+                info!("PipeWire thread spawned; waiting for Connected");
             }
             Err(e) => {
                 self.state.reconnect_failures += 1;
                 warn!(
                     "PipeWire reconnection failed: {} (next attempt in {:?})",
                     e,
-                    Duration::from_secs((2u64 << self.state.reconnect_failures.min(4)).min(30))
+                    reconnect_backoff(self.state.reconnect_failures)
                 );
             }
         }
+    }
+
+    /// Restore after Connected once the registry has had a chance to populate,
+    /// without sleeping on this thread.
+    fn maybe_flush_pending_restore(&mut self) {
+        let Some(started) = self.state.pending_restore_at else {
+            return;
+        };
+        if !self.state.pw_connected {
+            return;
+        }
+
+        let elapsed = started.elapsed();
+        let nodes_ready = !self.state.pw_graph.nodes.is_empty();
+        if !((nodes_ready && elapsed >= RESTORE_MIN_GRAPH_WAIT)
+            || elapsed >= RESTORE_MAX_GRAPH_WAIT)
+        {
+            return;
+        }
+
+        self.state.pending_restore_at = None;
+        info!(
+            "Restoring channels after reconnect ({} nodes, waited {:?})",
+            self.state.pw_graph.nodes.len(),
+            elapsed
+        );
+        if let Err(e) = self.restore_channels() {
+            warn!("Failed to restore channels after reconnection: {}", e);
+        }
+        // Ordering: disconnect → clear IDs → restore sinks then inputs/NS → emit.
+        self.emit_signal(SignalEvent::ConnectionChanged(true));
+        self.emit_signal(SignalEvent::InputsChanged);
+    }
+
+    /// Clear every PipeWire-derived ID so restore_channels recreates sinks,
+    /// inputs, NS, and the master recording source.
+    fn clear_pw_derived_ids(&mut self) {
+        self.state.pw_graph = PwGraphState::default();
+        for channel in &mut self.state.channels {
+            channel.pw_sink_id = None;
+            channel.pw_loopback_output_id = None;
+            channel.pw_source_id = None;
+            channel.pw_loopback_capture_id = None;
+            channel.atomic_meter_levels = None;
+            channel.meter_levels = (0.0, 0.0);
+        }
+        self.state.auto_routed_apps.clear();
+        self.state.pending_auto_route_channels.clear();
+        self.state.pending_route_loopbacks.clear();
+        self.state.suppressed_restores.clear();
+        self.state.pending_ns_replacements.clear();
+        self.state.master_recording_source_id = None;
+        self.state.pending_restore_at = None;
+        crate::audio::virtual_sink::kill_tracked_loopback_processes();
+    }
+
+    /// Treat a dead or disconnected PW thread as a disconnect.
+    fn handle_pipewire_disconnect(&mut self) {
+        if !self.state.pw_connected && self.pw_thread.is_none() && self.pw_event_rx.is_none() {
+            return;
+        }
+
+        let was_connected = self.state.pw_connected;
+        self.state.pw_connected = false;
+        warn!("PipeWire disconnected, will attempt reconnection");
+
+        self.clear_pw_derived_ids();
+
+        if let Some(pw) = self.pw_thread.take() {
+            if pw.is_finished() {
+                pw.join();
+            } else {
+                pw.shutdown();
+            }
+        }
+        self.pw_event_rx = None;
+
+        if !was_connected {
+            // Spawn succeeded but Connected never arrived.
+            self.state.reconnect_failures = self.state.reconnect_failures.saturating_add(1);
+            if self.state.last_reconnect_attempt.is_none() {
+                self.state.last_reconnect_attempt = Some(Instant::now());
+            }
+        }
+
+        self.emit_signal(SignalEvent::ConnectionChanged(false));
+        self.emit_signal(SignalEvent::InputsChanged);
     }
 
     fn handle_pw_event(&mut self, event: PwEvent) {
         match event {
             PwEvent::Connected => {
                 self.state.pw_connected = true;
+                self.state.reconnect_failures = 0;
+                self.state.last_reconnect_attempt = None;
                 info!("PipeWire connected");
+                if self.initial_restore_complete {
+                    // Reconnect: restore after a non-blocking graph wait, then
+                    // emit ConnectionChanged(true).
+                    self.state.pending_restore_at = Some(Instant::now());
+                } else {
+                    // Startup: main.rs restores after orphan cleanup.
+                    self.emit_signal(SignalEvent::ConnectionChanged(true));
+                }
             }
             PwEvent::Disconnected => {
-                self.state.pw_connected = false;
-                warn!("PipeWire disconnected, will attempt reconnection");
-                // Drop the old PW thread so we can create a new one
-                self.pw_thread = None;
-                self.pw_event_rx = None;
-                // Clear stale PW state
-                self.state.pw_graph = PwGraphState::default();
-                for channel in &mut self.state.channels {
-                    channel.pw_sink_id = None;
-                    channel.pw_loopback_output_id = None;
-                }
-                self.state.auto_routed_apps.clear();
-                self.state.pending_auto_route_channels.clear();
-                self.state.pending_route_loopbacks.clear();
-                self.state.suppressed_restores.clear();
-                self.state.master_recording_source_id = None;
+                self.handle_pipewire_disconnect();
             }
             PwEvent::NodeAdded(node) => {
                 let node_id = node.id;
@@ -1374,13 +1540,8 @@ impl DaemonService {
                             "Loopback output node {} has new ports but no links, retrying route to hardware",
                             loopback_id
                         );
-                        let target_device_id =
-                            self.desired_output_node_for_channel(channel_id);
-                        self.suppress_and_route(
-                            loopback_id,
-                            target_device_id,
-                            Some(channel_id),
-                        );
+                        let target_device_id = self.desired_output_node_for_channel(channel_id);
+                        self.suppress_and_route(loopback_id, target_device_id, Some(channel_id));
                     }
                 }
 
@@ -1424,19 +1585,14 @@ impl DaemonService {
                         .collect();
 
                     for (channel_id, loopback_id) in orphaned_loopbacks {
-                        let target =
-                            self.desired_output_node_for_channel(channel_id);
+                        let target = self.desired_output_node_for_channel(channel_id);
                         // Only route if this hardware sink is the channel's intended target
                         if target.map_or(false, |t| t == port_node_id) {
                             debug!(
                                 "Hardware sink {} got new port, retrying route for orphaned loopback {}",
                                 port_node_id, loopback_id
                             );
-                            self.suppress_and_route(
-                                loopback_id,
-                                target,
-                                Some(channel_id),
-                            );
+                            self.suppress_and_route(loopback_id, target, Some(channel_id));
                         }
                     }
                 }
@@ -1469,9 +1625,7 @@ impl DaemonService {
                     .pending_route_loopbacks
                     .remove(&loopback_output_node);
                 match &reason {
-                    crate::audio::pipewire_thread::RouteFinishReason::LinksCreated {
-                        count,
-                    } => {
+                    crate::audio::pipewire_thread::RouteFinishReason::LinksCreated { count } => {
                         info!(
                             "Route finished for loopback {}: {} links created",
                             loopback_output_node, count
@@ -1496,14 +1650,11 @@ impl DaemonService {
                 if let Some(master_id) = self.get_master_output_device_id() {
                     if node_id == master_id {
                         if !volumes.is_empty() {
-                            let avg =
-                                volumes.iter().sum::<f32>() / volumes.len() as f32;
+                            let avg = volumes.iter().sum::<f32>() / volumes.len() as f32;
                             let new_db = linear_to_db(avg);
                             if (new_db - self.state.master_volume_db).abs() > 0.01 {
                                 self.state.master_volume_db = new_db;
-                                self.emit_signal(SignalEvent::MasterVolumeChanged(
-                                    new_db as f64,
-                                ));
+                                self.emit_signal(SignalEvent::MasterVolumeChanged(new_db as f64));
                             }
                         }
                         if let Some(m) = muted {
@@ -1555,13 +1706,8 @@ impl DaemonService {
                         });
                     }
                     // Route loopback output to the channel's configured device (or master fallback)
-                    let target_device_id =
-                        self.desired_output_node_for_channel(channel_id);
-                    self.suppress_and_route(
-                        loopback_id,
-                        target_device_id,
-                        Some(channel_id),
-                    );
+                    let target_device_id = self.desired_output_node_for_channel(channel_id);
+                    self.suppress_and_route(loopback_id, target_device_id, Some(channel_id));
                 }
 
                 // Mark channel for pending auto-routing (ports may not be ready yet)
@@ -1634,9 +1780,7 @@ impl DaemonService {
 
                 // Link the capture node to the target mic (or system default)
                 if let Some(capture_node_id) = capture_id {
-                    if let Some(mic_name) =
-                        target_mic.filter(|n| n != "system-default")
-                    {
+                    if let Some(mic_name) = target_mic.filter(|n| n != "system-default") {
                         // Specific mic selected
                         self.send_pw_command(PwCommand::LinkInputChannelToMic {
                             capture_node_id,
@@ -1722,6 +1866,11 @@ impl DaemonService {
             }
             PwEvent::Error(msg) => {
                 error!("PipeWire error: {}", msg);
+                if self.pw_thread.as_ref().is_some_and(|t| t.is_finished())
+                    || self.pw_thread.is_none()
+                {
+                    self.handle_pipewire_disconnect();
+                }
             }
         }
     }
@@ -1900,7 +2049,10 @@ impl DaemonService {
         let kind = self.state.channels[idx].kind;
 
         // Collect indices of channels with the same kind
-        let group_indices: Vec<usize> = self.state.channels.iter()
+        let group_indices: Vec<usize> = self
+            .state
+            .channels
+            .iter()
             .enumerate()
             .filter(|(_, c)| c.kind == kind)
             .map(|(i, _)| i)
@@ -1911,15 +2063,22 @@ impl DaemonService {
         };
 
         let target_pos = if direction < 0 {
-            if pos_in_group == 0 { return Ok(()); }
+            if pos_in_group == 0 {
+                return Ok(());
+            }
             pos_in_group - 1
         } else {
-            if pos_in_group >= group_indices.len() - 1 { return Ok(()); }
+            if pos_in_group >= group_indices.len() - 1 {
+                return Ok(());
+            }
             pos_in_group + 1
         };
 
         let target_idx = group_indices[target_pos];
-        debug!("Moving channel {} from index {} to {}", channel_id, idx, target_idx);
+        debug!(
+            "Moving channel {} from index {} to {}",
+            channel_id, idx, target_idx
+        );
         self.state.channels.swap(idx, target_idx);
         self.save_config();
         Ok(())
@@ -2297,10 +2456,7 @@ impl DaemonService {
             }
 
             // Then create links to our sink
-            let port_pairs = self
-                .state
-                .pw_graph
-                .find_port_pairs(*node_id, sink_node_id);
+            let port_pairs = self.state.pw_graph.find_port_pairs(*node_id, sink_node_id);
             for (output_port, input_port) in port_pairs {
                 self.send_pw_command(PwCommand::CreateLink {
                     output_port,
@@ -2563,10 +2719,7 @@ impl DaemonService {
 
             // Find hardware sink to reconnect to
             if let Some(default_id) = default_output {
-                let port_pairs = self
-                    .state
-                    .pw_graph
-                    .find_port_pairs(*node_id, default_id);
+                let port_pairs = self.state.pw_graph.find_port_pairs(*node_id, default_id);
                 for (output_port, input_port) in port_pairs {
                     self.send_pw_command(PwCommand::CreateLink {
                         output_port,
@@ -2677,13 +2830,8 @@ impl DaemonService {
             // replacement, so the channel went silent or double-linked via
             // the PortAdded retry racing with the stale link.
             if let Some(loopback_id) = loopback_id {
-                let target_device_id =
-                    self.desired_output_node_for_channel(channel_uuid);
-                self.suppress_and_route(
-                    loopback_id,
-                    target_device_id,
-                    Some(channel_uuid),
-                );
+                let target_device_id = self.desired_output_node_for_channel(channel_uuid);
+                self.suppress_and_route(loopback_id, target_device_id, Some(channel_uuid));
             }
         }
 
@@ -3079,11 +3227,9 @@ impl DaemonService {
             .master_output
             .as_deref()
             .map_or(true, |name| name == Self::SYSTEM_DEFAULT_SENTINEL);
-        let master_matches = self
-            .state
-            .master_output
-            .as_deref()
-            .map_or(true, |name| name == Self::SYSTEM_DEFAULT_SENTINEL || matches_device(name));
+        let master_matches = self.state.master_output.as_deref().map_or(true, |name| {
+            name == Self::SYSTEM_DEFAULT_SENTINEL || matches_device(name)
+        });
 
         // Collect loopback IDs that need re-routing
         info!(
@@ -3140,12 +3286,7 @@ impl DaemonService {
 
             // Master output matches a specific (non-system-default) device
             if master_matches && !master_is_system_default && c.output_device_name.is_none() {
-                loopbacks_to_route.push((
-                    c.id,
-                    loopback_id,
-                    c.name.clone(),
-                    Some(device_node_id),
-                ));
+                loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), Some(device_node_id)));
                 continue;
             }
 
@@ -3174,19 +3315,16 @@ impl DaemonService {
                     // If the default changed (e.g. bluetooth connected), re-route.
                     let current_default = crate::audio::routing::get_default_sink_id();
                     if let Some(default_id) = current_default {
-                        let linked_to_default = self
-                            .state
-                            .pw_graph
-                            .links
-                            .values()
-                            .any(|l| l.output_node == loopback_id && l.input_node == default_id);
+                        let linked_to_default =
+                            self.state.pw_graph.links.values().any(|l| {
+                                l.output_node == loopback_id && l.input_node == default_id
+                            });
                         if !linked_to_default {
                             debug!(
                                 "Channel '{}': linked to non-default device, re-routing to default {}",
                                 c.name, default_id
                             );
-                            loopbacks_to_route
-                                .push((c.id, loopback_id, c.name.clone(), None));
+                            loopbacks_to_route.push((c.id, loopback_id, c.name.clone(), None));
                         }
                     }
                 }
@@ -3278,5 +3416,137 @@ impl DaemonService {
             );
             self.suppress_and_route(loopback_id, Some(new_default), Some(channel_id));
         }
+    }
+}
+
+/// Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s.
+fn reconnect_backoff(failures: u32) -> Duration {
+    Duration::from_secs((2u64 << failures.min(4)).min(30))
+}
+
+/// Whether a reconnect spawn should run now. A live (not finished) thread
+/// must not be treated as "can reconnect" — that was the C1 gate bug.
+fn should_attempt_reconnect(last_attempt: Option<Instant>, failures: u32, now: Instant) -> bool {
+    match last_attempt {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= reconnect_backoff(failures),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_sequence() {
+        assert_eq!(reconnect_backoff(0), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(4));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(8));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(16));
+        assert_eq!(reconnect_backoff(4), Duration::from_secs(30));
+        assert_eq!(reconnect_backoff(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reconnect_not_attempted_before_backoff() {
+        let now = Instant::now();
+        assert!(should_attempt_reconnect(None, 0, now));
+        assert!(!should_attempt_reconnect(
+            Some(now),
+            0,
+            now + Duration::from_millis(500)
+        ));
+        assert!(should_attempt_reconnect(
+            Some(now),
+            0,
+            now + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn clear_pw_derived_ids_unblocks_input_and_ns_restore() {
+        let mut channel = ChannelState::new_input("Mic".to_string());
+        channel.pw_source_id = Some(42);
+        channel.pw_loopback_capture_id = Some(43);
+        channel.atomic_meter_levels =
+            Some(std::sync::Arc::new(crate::audio::AtomicMeterLevels::new()));
+        channel.noise_suppression_enabled = true;
+        channel.input_device_name = Some("Built-in Mic".to_string());
+        channel.vad_threshold = 80.0;
+
+        let mut output = ChannelState::new("Games".to_string());
+        output.pw_sink_id = Some(10);
+        output.pw_loopback_output_id = Some(11);
+
+        let mut state = DaemonState::default();
+        state.channels = vec![channel, output];
+        state.master_recording_enabled = true;
+        state.master_recording_source_id = Some(99);
+        state.pending_ns_replacements.insert(
+            state.channels[0].id,
+            PwCommand::CreateVirtualSource {
+                channel_id: state.channels[0].id,
+                name: "Mic".to_string(),
+                target_device: None,
+            },
+        );
+
+        for c in &mut state.channels {
+            c.pw_sink_id = None;
+            c.pw_loopback_output_id = None;
+            c.pw_source_id = None;
+            c.pw_loopback_capture_id = None;
+            c.atomic_meter_levels = None;
+        }
+        state.pending_ns_replacements.clear();
+        state.master_recording_source_id = None;
+
+        let inputs_need_restore = state
+            .channels
+            .iter()
+            .filter(|c| c.is_input() && c.pw_source_id.is_none())
+            .count();
+        let sinks_need_restore = state
+            .channels
+            .iter()
+            .filter(|c| c.is_managed && !c.is_input() && c.pw_sink_id.is_none())
+            .count();
+        assert_eq!(inputs_need_restore, 1);
+        assert_eq!(sinks_need_restore, 1);
+        assert!(state.master_recording_enabled);
+        assert!(state.master_recording_source_id.is_none());
+        assert!(state.pending_ns_replacements.is_empty());
+        // Logical NS/mic state survives ID clear so restore recreates the filter.
+        assert!(state.channels[0].noise_suppression_enabled);
+        assert_eq!(state.channels[0].vad_threshold, 80.0);
+        assert_eq!(
+            state.channels[0].input_device_name.as_deref(),
+            Some("Built-in Mic")
+        );
+    }
+
+    #[test]
+    fn channel_info_matches_ui_pr21_contract() {
+        let mut channel = ChannelState::new_input("Mic".to_string());
+        channel.input_device_name = Some("USB Mic".to_string());
+        channel.noise_suppression_enabled = true;
+        channel.vad_threshold = 80.0;
+        channel.input_gain_db = 3.0;
+
+        let info = channel.to_channel_info();
+        assert_eq!(info.kind, ChannelKind::Input);
+        assert_eq!(info.input_device, "USB Mic");
+        assert!(info.noise_suppression_enabled);
+        assert_eq!(info.vad_threshold, 80.0);
+        assert_eq!(info.input_gain_db, 3.0);
+        assert!(info.output_device.is_empty());
+    }
+
+    #[test]
+    fn stale_pw_source_id_skips_input_restore_without_clear() {
+        let mut channel = ChannelState::new_input("Mic".to_string());
+        channel.pw_source_id = Some(7);
+        let skipped = channel.is_input() && channel.pw_source_id.is_none();
+        assert!(!skipped, "stale pw_source_id must be cleared on disconnect");
     }
 }

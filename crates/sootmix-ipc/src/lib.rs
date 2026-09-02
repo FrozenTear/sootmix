@@ -29,6 +29,14 @@ pub enum ChannelKind {
 }
 
 /// Information about a mixer channel.
+///
+/// **D-Bus signature change (meters slice, aligned with UI PR #21):**
+/// fields after `input_gain_db` are new. Clients built against the previous
+/// `ChannelInfo` layout must be rebuilt. Existing field order through
+/// `input_gain_db` is unchanged.
+///
+/// Contract (do not rename): `input_device`, `noise_suppression_enabled`,
+/// `vad_threshold`. Plugins/solo are not part of this signature.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ChannelInfo {
     /// Unique identifier (UUID as string).
@@ -53,6 +61,22 @@ pub struct ChannelInfo {
     pub kind: ChannelKind,
     /// Hardware microphone gain in dB (-12.0 to +12.0). Only applies to input channels.
     pub input_gain_db: f64,
+    /// Input device name for input (mic) channels (empty string = default/unset).
+    ///
+    /// Widened so mic assignment survives daemon reconnect. Do not overload
+    /// `output_device` for this — UI maps this field onto `input_device_name`.
+    #[serde(default)]
+    pub input_device: String,
+    /// Whether RNNoise noise suppression is enabled (input channels).
+    #[serde(default)]
+    pub noise_suppression_enabled: bool,
+    /// VAD threshold for noise suppression (0-100%). Higher = more aggressive gating.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f64,
+}
+
+fn default_vad_threshold() -> f64 {
+    95.0
 }
 
 impl ChannelInfo {
@@ -70,6 +94,9 @@ impl ChannelInfo {
             meter_levels: (-60.0, -60.0),
             kind: ChannelKind::Output,
             input_gain_db: 0.0,
+            input_device: String::new(),
+            noise_suppression_enabled: false,
+            vad_threshold: default_vad_threshold(),
         }
     }
 
@@ -160,8 +187,7 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         "brave",
     ];
 
-    generic_names.iter().any(|g| name == *g)
-        || generic_binaries.iter().any(|g| binary == *g)
+    generic_names.iter().any(|g| name == *g) || generic_binaries.iter().any(|g| binary == *g)
 }
 
 /// Wine launches every Windows app under the same wrapper binary, so
@@ -321,6 +347,21 @@ mod tests {
         let id = Uuid::new_v4();
         let channel = ChannelInfo::new(id, "Test".to_string());
         assert_eq!(channel.uuid(), Some(id));
+        assert!(channel.input_device.is_empty());
+        assert!(!channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 95.0);
+    }
+
+    #[test]
+    fn test_channel_info_mic_ns_contract() {
+        let mut channel = ChannelInfo::new(Uuid::new_v4(), "Mic".to_string());
+        channel.kind = ChannelKind::Input;
+        channel.input_device = "USB Mic".to_string();
+        channel.noise_suppression_enabled = true;
+        channel.vad_threshold = 80.0;
+        assert_eq!(channel.input_device, "USB Mic");
+        assert!(channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 80.0);
     }
 
     #[test]

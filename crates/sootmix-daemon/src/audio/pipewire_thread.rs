@@ -13,7 +13,7 @@ use pipewire::node::{Node, NodeListener};
 use pipewire::properties::properties;
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::Pod;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -373,6 +373,10 @@ impl PwThread {
                 if let Err(e) = run_pipewire_loop(cmd_rx, event_tx.clone()) {
                     error!("PipeWire thread error: {}", e);
                     let _ = event_tx.send(PwEvent::Error(e.to_string()));
+                    // Failed connect / thread death must surface as disconnect so
+                    // the service can reap the JoinHandle and retry. Connected is
+                    // only sent after a successful core.connect.
+                    let _ = event_tx.send(PwEvent::Disconnected);
                 }
             })
             .map_err(|e| PwError::ThreadError(e.to_string()))?;
@@ -381,6 +385,22 @@ impl PwThread {
             cmd_tx,
             handle: Some(handle),
         })
+    }
+
+    /// Whether the PipeWire thread has exited.
+    ///
+    /// `spawn()` succeeding does **not** mean we are connected. A failed
+    /// `core.connect` leaves a finished thread with `pw_thread` still `Some`,
+    /// which used to block reconnect forever.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().map_or(true, JoinHandle::is_finished)
+    }
+
+    /// Join a thread that has already exited. Does not send Shutdown.
+    pub fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Send a command to the PipeWire thread.
@@ -433,6 +453,7 @@ fn run_pipewire_loop(
     let _ = event_tx.send(PwEvent::Connected);
 
     let event_tx = Rc::new(event_tx);
+    let disconnected_sent = Rc::new(Cell::new(false));
     let state = Rc::new(RefCell::new(PwThreadState::new(event_tx.clone())));
 
     let main_loop_weak = main_loop.downgrade();
@@ -442,6 +463,36 @@ fn run_pipewire_loop(
     let _cmd_receiver = cmd_rx.attach(main_loop.loop_(), move |cmd| {
         handle_command(cmd, &state_cmd, &main_loop_weak, &core_cmd, &registry_cmd);
     });
+
+    // Emit Disconnected on a real core error (PW restart / socket gone),
+    // not only after main_loop.run() returns.
+    let event_tx_core = event_tx.clone();
+    let disconnected_core = disconnected_sent.clone();
+    let main_loop_core = main_loop.downgrade();
+    let _core_listener = core
+        .add_listener_local()
+        .error(move |id, _seq, res, message| {
+            error!(
+                "PipeWire core error: id={} res={} msg={}",
+                id, res, message
+            );
+            // id 0 is the core itself. Connection-loss also shows up as EPIPE
+            // (-32) / ECONNRESET (-104) or a "connection" message.
+            let is_disconnect = id == 0
+                || res == -32
+                || res == -104
+                || message.contains("connection")
+                || message.contains("disconnected");
+            if is_disconnect {
+                if !disconnected_core.replace(true) {
+                    let _ = event_tx_core.send(PwEvent::Disconnected);
+                }
+                if let Some(ml) = main_loop_core.upgrade() {
+                    ml.quit();
+                }
+            }
+        })
+        .register();
 
     let _registry_listener = setup_registry_listener(&registry, state.clone(), event_tx.clone());
 
@@ -465,7 +516,9 @@ fn run_pipewire_loop(
     main_loop.run();
 
     info!("PipeWire thread shutting down");
-    let _ = event_tx.send(PwEvent::Disconnected);
+    if !disconnected_sent.replace(true) {
+        let _ = event_tx.send(PwEvent::Disconnected);
+    }
 
     Ok(())
 }
