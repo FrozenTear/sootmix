@@ -110,10 +110,15 @@ impl AudioRingBuffer {
 // ============================================================================
 
 /// Thread-safe meter levels using atomic operations.
+///
+/// Matches GUI `src/audio/meter_stream.rs`: writers use max-hold (`store_max`),
+/// readers use `load_and_reset` so a short peak is not lost between polls.
 #[derive(Debug, Default)]
 pub struct AtomicMeterLevels {
     peak_left: AtomicU32,
     peak_right: AtomicU32,
+    /// Whether this meter has received any audio data.
+    active: AtomicU32,
 }
 
 impl AtomicMeterLevels {
@@ -121,20 +126,84 @@ impl AtomicMeterLevels {
         Self {
             peak_left: AtomicU32::new(0),
             peak_right: AtomicU32::new(0),
+            active: AtomicU32::new(0),
         }
     }
 
+    /// Overwrite stored peaks (last-sample). Prefer `store_max` on audio paths.
     #[inline]
     pub fn store(&self, left: f32, right: f32) {
         self.peak_left.store(left.to_bits(), Ordering::Relaxed);
         self.peak_right.store(right.to_bits(), Ordering::Relaxed);
+        self.active.store(1, Ordering::Relaxed);
     }
 
+    /// Load peak levels without resetting.
     #[inline]
     pub fn load(&self) -> (f32, f32) {
         let left = f32::from_bits(self.peak_left.load(Ordering::Relaxed));
         let right = f32::from_bits(self.peak_right.load(Ordering::Relaxed));
         (left, right)
+    }
+
+    /// Store peak levels using max-hold (called from RT / meter threads).
+    /// Only updates if the new value exceeds the stored value.
+    #[inline]
+    pub fn store_max(&self, left: f32, right: f32) {
+        let left_bits = left.to_bits();
+        loop {
+            let current = self.peak_left.load(Ordering::Relaxed);
+            if f32::from_bits(current) >= left {
+                break;
+            }
+            match self.peak_left.compare_exchange_weak(
+                current,
+                left_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        let right_bits = right.to_bits();
+        loop {
+            let current = self.peak_right.load(Ordering::Relaxed);
+            if f32::from_bits(current) >= right {
+                break;
+            }
+            match self.peak_right.compare_exchange_weak(
+                current,
+                right_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        self.active.store(1, Ordering::Relaxed);
+    }
+
+    /// Load peak levels and reset to zero (called from the meter poller).
+    #[inline]
+    pub fn load_and_reset(&self) -> (f32, f32) {
+        let left = f32::from_bits(self.peak_left.swap(0, Ordering::Relaxed));
+        let right = f32::from_bits(self.peak_right.swap(0, Ordering::Relaxed));
+        (left, right)
+    }
+
+    /// Check if this meter is active (receiving audio).
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed) != 0
+    }
+
+    /// Reset to inactive / zero.
+    pub fn reset(&self) {
+        self.peak_left.store(0, Ordering::Relaxed);
+        self.peak_right.store(0, Ordering::Relaxed);
+        self.active.store(0, Ordering::Relaxed);
     }
 }
 
@@ -645,7 +714,7 @@ fn process_callback(stream: &Stream, user_data: &mut LoopbackUserData) {
     if user_data.is_capture {
         // Capture: calculate peaks and write to buffer
         let (peak_left, peak_right) = calculate_stereo_peaks(samples);
-        user_data.meter_levels.store(peak_left, peak_right);
+        user_data.meter_levels.store_max(peak_left, peak_right);
         user_data.audio_buffer.borrow_mut().write(samples);
     } else {
         // Playback: read from buffer
@@ -741,5 +810,20 @@ mod tests {
         let (l, r) = levels.load();
         assert!((l - 0.5).abs() < 0.001);
         assert!((r - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_atomic_meter_levels_max_hold_and_reset() {
+        let levels = AtomicMeterLevels::new();
+        levels.store_max(0.2, 0.1);
+        levels.store_max(0.05, 0.8);
+        levels.store_max(0.15, 0.3);
+        let (l, r) = levels.load_and_reset();
+        assert!((l - 0.2).abs() < 0.001, "left should keep max 0.2, got {l}");
+        assert!((r - 0.8).abs() < 0.001, "right should keep max 0.8, got {r}");
+        let (l2, r2) = levels.load();
+        assert_eq!(l2, 0.0);
+        assert_eq!(r2, 0.0);
+        assert!(levels.is_active());
     }
 }
