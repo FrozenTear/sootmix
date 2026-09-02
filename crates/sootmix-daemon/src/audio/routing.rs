@@ -122,11 +122,38 @@ pub fn get_stream_target(stream_node_id: u32) -> Option<u32> {
     None
 }
 
-/// Get the WirePlumber default audio sink node ID.
+/// Parse a WirePlumber `default.audio.sink` / `default.audio.source` metadata
+/// value into a node name.
 ///
-/// Uses `wpctl inspect @DEFAULT_AUDIO_SINK@` to find the system's current
-/// default output device. Returns `None` if the command fails or no default
-/// is set.
+/// WirePlumber stores Spa JSON such as `{"name":"alsa_output.pci-...."}`.
+/// A bare name is also accepted. Used on the PipeWire thread so we never
+/// block it with `wpctl inspect`.
+pub fn parse_wp_default_name(value: Option<&str>) -> Option<String> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // Bare name (no JSON wrapper)
+    let trimmed = raw.trim_matches('"').trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Get the WirePlumber default audio sink node ID via `wpctl`.
+///
+/// **Do not call this on the PipeWire thread** — `Command::output()` blocks
+/// the PW loop. Prefer `default.audio.sink` metadata cached on the PW thread.
+/// This helper is for the service thread (or other off-loop callers) only.
 pub fn get_default_sink_id() -> Option<u32> {
     let output = Command::new("wpctl")
         .args(["inspect", "@DEFAULT_AUDIO_SINK@"])
@@ -146,11 +173,11 @@ pub fn get_default_sink_id() -> Option<u32> {
     Some(id)
 }
 
-/// Get the system's default audio source (microphone) ID from WirePlumber.
+/// Get the system's default audio source (microphone) ID via `wpctl`.
 ///
-/// Uses `wpctl inspect @DEFAULT_AUDIO_SOURCE@` to find the system's current
-/// default input device. Returns `None` if the command fails or no default
-/// is set.
+/// **Do not call this on the PipeWire thread** — `Command::output()` blocks
+/// the PW loop. Prefer `default.audio.source` metadata cached on the PW thread.
+#[allow(dead_code)]
 pub fn get_default_source_id() -> Option<u32> {
     let output = Command::new("wpctl")
         .args(["inspect", "@DEFAULT_AUDIO_SOURCE@"])
@@ -191,4 +218,35 @@ pub fn clear_stream_target(stream_node_id: u32) -> Result<(), RoutingError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wp_default_name;
+
+    #[test]
+    fn parse_wp_default_name_json() {
+        let name = parse_wp_default_name(Some(
+            r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#,
+        ));
+        assert_eq!(
+            name.as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+    }
+
+    #[test]
+    fn parse_wp_default_name_bare() {
+        assert_eq!(
+            parse_wp_default_name(Some("alsa_input.usb-mic")).as_deref(),
+            Some("alsa_input.usb-mic")
+        );
+    }
+
+    #[test]
+    fn parse_wp_default_name_empty() {
+        assert_eq!(parse_wp_default_name(None), None);
+        assert_eq!(parse_wp_default_name(Some("")), None);
+        assert_eq!(parse_wp_default_name(Some("{}")), None);
+    }
 }

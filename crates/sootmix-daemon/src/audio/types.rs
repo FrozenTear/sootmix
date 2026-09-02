@@ -20,6 +20,11 @@ pub struct PwNode {
     #[allow(dead_code)]
     pub ports: Vec<PwPort>,
     pub properties: HashMap<String, String>,
+    /// Last known PipeWire node run state. `Unknown` until an info listener
+    /// reports it. Used by restore logic so we do not recreate links to
+    /// devices that are gone / in Error (device loss should fall through
+    /// to fallback, not fight `NodeRemoved`).
+    pub run_state: NodeRunState,
 }
 
 impl PwNode {
@@ -34,7 +39,18 @@ impl PwNode {
             media_name: None,
             ports: Vec::new(),
             properties: HashMap::new(),
+            run_state: NodeRunState::Unknown,
         }
+    }
+
+    /// Whether this node is a valid restore target.
+    ///
+    /// Missing from the graph is handled by the caller. Here we refuse
+    /// Error/Creating — those mean the device is dying or not ready.
+    /// Idle/Suspended/Running/Unknown are still present devices
+    /// (Idle hardware is the normal unused-sink state).
+    pub fn is_available_for_restore(&self) -> bool {
+        self.run_state.is_available_for_restore()
     }
 
     pub fn is_playback_stream(&self) -> bool {
@@ -70,6 +86,68 @@ impl PwNode {
         } else {
             "Unknown"
         }
+    }
+}
+
+/// PipeWire node run state (from the Node info callback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum NodeRunState {
+    #[default]
+    Unknown,
+    Creating,
+    Idle,
+    Running,
+    Suspended,
+    Error,
+}
+
+impl NodeRunState {
+    pub fn is_available_for_restore(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown | Self::Idle | Self::Running | Self::Suspended
+        )
+    }
+
+    pub fn from_pw_str(s: &str) -> Self {
+        // pipewire-rs Debug is typically "Running"; tolerate "NodeState::Running".
+        let s = s.rsplit("::").next().unwrap_or(s);
+        match s {
+            "creating" | "Creating" => Self::Creating,
+            "idle" | "Idle" => Self::Idle,
+            "running" | "Running" => Self::Running,
+            "suspended" | "Suspended" => Self::Suspended,
+            "error" | "Error" => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod node_run_state_tests {
+    use super::*;
+
+    #[test]
+    fn restore_refuses_error_and_creating() {
+        let mut node = PwNode::new(1);
+        assert!(node.is_available_for_restore());
+        node.run_state = NodeRunState::Error;
+        assert!(!node.is_available_for_restore());
+        node.run_state = NodeRunState::Creating;
+        assert!(!node.is_available_for_restore());
+        node.run_state = NodeRunState::Idle;
+        assert!(node.is_available_for_restore());
+        node.run_state = NodeRunState::Running;
+        assert!(node.is_available_for_restore());
+    }
+
+    #[test]
+    fn from_pw_str_debug_and_path() {
+        assert_eq!(NodeRunState::from_pw_str("Running"), NodeRunState::Running);
+        assert_eq!(
+            NodeRunState::from_pw_str("NodeState::Error"),
+            NodeRunState::Error
+        );
     }
 }
 

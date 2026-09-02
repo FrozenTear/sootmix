@@ -28,7 +28,7 @@ pub enum SignalEvent {
     MasterVolumeChanged(f64),
     /// Master mute changed externally.
     MasterMuteChanged(bool),
-    /// PipeWire connection state flipped.
+    /// PipeWire connection state flipped (Daemon #22).
     ConnectionChanged(bool),
     /// Input device list changed (cleared on disconnect, refreshed after restore).
     InputsChanged,
@@ -185,6 +185,9 @@ impl ChannelState {
     }
 
     pub fn to_channel_info(&self) -> ChannelInfo {
+        // DAEMON: widen ChannelInfo (ns_enabled, pw ids, connection, capture)
+        // when the client contract is extended. Engine does not change the
+        // D-Bus shape in this slice.
         let (left_db, right_db) = self.meter_levels_db();
         ChannelInfo {
             id: self.id.to_string(),
@@ -1376,6 +1379,7 @@ impl DaemonService {
                 }
             }
             PwEvent::Disconnected => {
+                // Daemon #22: full ID wipe + ConnectionChanged + thread reap.
                 self.handle_pipewire_disconnect();
             }
             PwEvent::NodeAdded(node) => {
@@ -1596,6 +1600,68 @@ impl DaemonService {
                         }
                     }
                 }
+
+                // Input mic linking: PortAdded retry (mirrors output loopback
+                // routing). The PW thread also queues pending_mic_links; this
+                // service-side pass covers the VirtualSourceCreated one-shot
+                // that fired before capture/mic ports existed.
+                let capture_retry = self
+                    .state
+                    .channels
+                    .iter()
+                    .find(|c| {
+                        c.is_input()
+                            && (c.pw_loopback_capture_id == Some(port_node_id)
+                                || self
+                                    .state
+                                    .pw_graph
+                                    .nodes
+                                    .get(&port_node_id)
+                                    .map(|n| {
+                                        n.is_audio_input()
+                                            && c.input_device_name.as_ref().map_or(
+                                                false,
+                                                |name| {
+                                                    n.name == *name || n.description == *name
+                                                },
+                                            )
+                                    })
+                                    .unwrap_or(false))
+                    })
+                    .map(|c| {
+                        (
+                            c.id,
+                            c.pw_loopback_capture_id,
+                            c.input_device_name.clone(),
+                        )
+                    });
+
+                if let Some((_ch_id, Some(capture_id), target_mic)) = capture_retry {
+                    let has_links = self
+                        .state
+                        .pw_graph
+                        .links
+                        .values()
+                        .any(|l| l.input_node == capture_id);
+                    if !has_links {
+                        debug!(
+                            "Capture node {} has ports but no mic links, retrying input link",
+                            capture_id
+                        );
+                        if let Some(mic_name) =
+                            target_mic.filter(|n| n != "system-default")
+                        {
+                            self.send_pw_command(PwCommand::LinkInputChannelToMic {
+                                capture_node_id: capture_id,
+                                target_mic_name: mic_name,
+                            });
+                        } else {
+                            self.send_pw_command(PwCommand::LinkInputChannelToDefaultMic {
+                                capture_node_id: capture_id,
+                            });
+                        }
+                    }
+                }
             }
             PwEvent::PortRemoved(id) => {
                 self.state.pw_graph.ports.remove(&id);
@@ -1641,6 +1707,12 @@ impl DaemonService {
             }
             PwEvent::DefaultSinkChanged => {
                 self.reroute_system_default_channels();
+            }
+            PwEvent::DefaultSourceChanged => {
+                // Engine: retry default-mic links so meters have a live source
+                // after a WP default-source blip. DAEMON: can fan this into
+                // ConnectionChanged / ChannelInfo later.
+                self.retry_default_mic_links();
             }
             PwEvent::NodeVolumeChanged {
                 node_id,
@@ -1860,9 +1932,38 @@ impl DaemonService {
                     "Native noise filter failed for channel {}: {}",
                     channel_id, error
                 );
-                if let Some(channel) = self.state.channels.iter_mut().find(|c| c.id == channel_id) {
+                let restore = if let Some(channel) =
+                    self.state.channels.iter_mut().find(|c| c.id == channel_id)
+                {
                     channel.noise_suppression_enabled = false;
+                    let name = channel.name.clone();
+                    let target = channel.input_device_name.clone();
+                    let needs_source = channel.pw_source_id.is_none();
+                    Some((name, target, needs_source))
+                } else {
+                    None
+                };
+
+                // Restore a normal virtual source so the mic channel is not
+                // left dead after a failed NS enable. Drop any pending NS
+                // create so we don't immediately retry the failed filter.
+                self.state.pending_ns_replacements.remove(&channel_id);
+                if let Some((name, target_device, needs_source)) = restore {
+                    if needs_source {
+                        info!(
+                            "Restoring plain virtual source for channel {} after NS failure",
+                            channel_id
+                        );
+                        self.send_pw_command(PwCommand::CreateVirtualSource {
+                            channel_id,
+                            name,
+                            target_device,
+                        });
+                    }
                 }
+
+                // Client path: ChannelUpdated lands in the next commit
+                // (UI #21 / Daemon #22 ChannelInfo). Failure is already logged.
             }
             PwEvent::Error(msg) => {
                 error!("PipeWire error: {}", msg);
@@ -2516,6 +2617,19 @@ impl DaemonService {
     /// This handles external tools (e.g. KDE audio control) or WirePlumber
     /// re-routing streams and destroying our links.
     fn check_and_restore_managed_link(&mut self, link: &PwLink) {
+        // Device loss / dying nodes: do not recreate the old link. NodeRemoved
+        // already falls through to try_fallback_orphaned_channels. Fighting
+        // that with a restore to a gone / Error node leaves the graph wedged.
+        if !self.node_is_live_for_restore(link.output_node)
+            || !self.node_is_live_for_restore(link.input_node)
+        {
+            debug!(
+                "Skipping restore for link {} ({} -> {}): endpoint gone or not restorable",
+                link.id, link.output_node, link.input_node
+            );
+            return;
+        }
+
         let our_sinks: Vec<u32> = self
             .state
             .channels
@@ -2615,6 +2729,59 @@ impl DaemonService {
                     input_port: link.input_port,
                 });
             }
+        }
+    }
+
+    /// True if the node is still in the graph and not in a dying state.
+    ///
+    /// Idle/Suspended/Unknown hardware is a valid restore target. Error and
+    /// Creating (or a missing node) mean device loss — leave the link down
+    /// so `try_fallback_orphaned_channels` can run.
+    fn node_is_live_for_restore(&self, node_id: u32) -> bool {
+        self.state
+            .pw_graph
+            .nodes
+            .get(&node_id)
+            .map(|n| n.is_available_for_restore())
+            .unwrap_or(false)
+    }
+
+    /// Retry system-default mic links after `default.audio.source` changes.
+    fn retry_default_mic_links(&mut self) {
+        let captures: Vec<(u32, Option<String>)> = self
+            .state
+            .channels
+            .iter()
+            .filter(|c| c.is_input())
+            .filter_map(|c| {
+                let capture = c.pw_loopback_capture_id?;
+                let follows_default = c
+                    .input_device_name
+                    .as_deref()
+                    .map_or(true, |n| n.is_empty() || n == "system-default");
+                if !follows_default {
+                    return None;
+                }
+                let has_links = self
+                    .state
+                    .pw_graph
+                    .links
+                    .values()
+                    .any(|l| l.input_node == capture);
+                if has_links {
+                    None
+                } else {
+                    Some((capture, c.input_device_name.clone()))
+                }
+            })
+            .collect();
+
+        for (capture_node_id, _) in captures {
+            info!(
+                "Default source changed; retrying default-mic link for capture {}",
+                capture_node_id
+            );
+            self.send_pw_command(PwCommand::LinkInputChannelToDefaultMic { capture_node_id });
         }
     }
 
