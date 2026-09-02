@@ -15,12 +15,15 @@ mod validate {
     /// Validate a channel name: non-empty, max 128 chars, no control characters.
     pub fn validate_channel_name(name: &str) -> Result<(), zbus::fdo::Error> {
         if name.is_empty() {
-            return Err(zbus::fdo::Error::InvalidArgs("Channel name must not be empty".into()));
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Channel name must not be empty".into(),
+            ));
         }
         if name.len() > 128 {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                format!("Channel name exceeds 128 character limit (got {})", name.len()),
-            ));
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "Channel name exceeds 128 character limit (got {})",
+                name.len()
+            )));
         }
         if name.chars().any(|c| c.is_control()) {
             return Err(zbus::fdo::Error::InvalidArgs(
@@ -43,12 +46,15 @@ mod validate {
     /// Validate a device name: non-empty, max 256 chars, no control characters.
     pub fn validate_device_name(name: &str) -> Result<(), zbus::fdo::Error> {
         if name.is_empty() {
-            return Err(zbus::fdo::Error::InvalidArgs("Device name must not be empty".into()));
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Device name must not be empty".into(),
+            ));
         }
         if name.len() > 256 {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                format!("Device name exceeds 256 character limit (got {})", name.len()),
-            ));
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "Device name exceeds 256 character limit (got {})",
+                name.len()
+            )));
         }
         if name.chars().any(|c| c.is_control()) {
             return Err(zbus::fdo::Error::InvalidArgs(
@@ -203,11 +209,7 @@ impl DaemonDbusService {
     }
 
     /// Move a channel left or right within its kind group.
-    async fn move_channel(
-        &self,
-        channel_id: &str,
-        direction: i32,
-    ) -> zbus::fdo::Result<()> {
+    async fn move_channel(&self, channel_id: &str, direction: i32) -> zbus::fdo::Result<()> {
         debug!("D-Bus: move_channel({}, {})", channel_id, direction);
         {
             let mut service = self
@@ -331,10 +333,7 @@ impl DaemonDbusService {
         }
         let gain_db = gain_db.clamp(-12.0, 12.0);
 
-        debug!(
-            "D-Bus: set_channel_input_gain({}, {})",
-            channel_id, gain_db
-        );
+        debug!("D-Bus: set_channel_input_gain({}, {})", channel_id, gain_db);
         let mut service = self
             .service
             .lock()
@@ -787,10 +786,7 @@ impl DaemonDbusService {
 const INTERFACE_NAME: &str = "com.sootmix.Daemon";
 
 /// Emit AppDiscovered signal.
-pub async fn emit_app_discovered(
-    ctx: &zbus::SignalContext<'_>,
-    app: AppInfo,
-) -> zbus::Result<()> {
+pub async fn emit_app_discovered(ctx: &zbus::SignalContext<'_>, app: AppInfo) -> zbus::Result<()> {
     ctx.connection()
         .emit_signal(
             ctx.destination(),
@@ -803,10 +799,7 @@ pub async fn emit_app_discovered(
 }
 
 /// Emit AppRemoved signal.
-pub async fn emit_app_removed(
-    ctx: &zbus::SignalContext<'_>,
-    app_id: &str,
-) -> zbus::Result<()> {
+pub async fn emit_app_removed(ctx: &zbus::SignalContext<'_>, app_id: &str) -> zbus::Result<()> {
     ctx.connection()
         .emit_signal(
             ctx.destination(),
@@ -832,7 +825,6 @@ pub async fn emit_outputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result
 }
 
 /// Emit InputsChanged signal.
-#[allow(dead_code)]
 pub async fn emit_inputs_changed(ctx: &zbus::SignalContext<'_>) -> zbus::Result<()> {
     ctx.connection()
         .emit_signal(
@@ -889,6 +881,22 @@ pub async fn emit_master_mute_changed(
             INTERFACE_NAME,
             "MasterMuteChanged",
             &(muted,),
+        )
+        .await
+}
+
+/// Emit ConnectionChanged signal when PipeWire connect state flips.
+pub async fn emit_connection_changed(
+    ctx: &zbus::SignalContext<'_>,
+    connected: bool,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "ConnectionChanged",
+            &(connected,),
         )
         .await
 }

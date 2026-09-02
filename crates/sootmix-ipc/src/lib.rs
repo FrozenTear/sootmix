@@ -29,6 +29,14 @@ pub enum ChannelKind {
 }
 
 /// Information about a mixer channel.
+///
+/// **D-Bus signature change (meters slice, aligned with UI PR #21):**
+/// fields after `input_gain_db` are new. Clients built against the previous
+/// `ChannelInfo` layout must be rebuilt. Existing field order through
+/// `input_gain_db` is unchanged.
+///
+/// Contract (do not rename): `input_device`, `noise_suppression_enabled`,
+/// `vad_threshold`. Plugins/solo are not part of this signature.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ChannelInfo {
     /// Unique identifier (UUID as string).
@@ -179,8 +187,7 @@ fn is_generic_app_identity(name: &str, binary: &str) -> bool {
         "brave",
     ];
 
-    generic_names.iter().any(|g| name == *g)
-        || generic_binaries.iter().any(|g| binary == *g)
+    generic_names.iter().any(|g| name == *g) || generic_binaries.iter().any(|g| binary == *g)
 }
 
 /// Wine launches every Windows app under the same wrapper binary, so
@@ -343,6 +350,18 @@ mod tests {
         assert!(channel.input_device.is_empty());
         assert!(!channel.noise_suppression_enabled);
         assert_eq!(channel.vad_threshold, 95.0);
+    }
+
+    #[test]
+    fn test_channel_info_mic_ns_contract() {
+        let mut channel = ChannelInfo::new(Uuid::new_v4(), "Mic".to_string());
+        channel.kind = ChannelKind::Input;
+        channel.input_device = "USB Mic".to_string();
+        channel.noise_suppression_enabled = true;
+        channel.vad_threshold = 80.0;
+        assert_eq!(channel.input_device, "USB Mic");
+        assert!(channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 80.0);
     }
 
     #[test]

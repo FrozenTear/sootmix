@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
-    // Wait for startup discovery to complete
+    // Startup-only: blocking discovery is safe here (D-Bus not registered yet).
+    // Runtime reconnect must not call this while holding the service mutex.
     daemon_service.wait_for_discovery();
 
     // Clean up orphaned sootmix nodes from previous runs before restoring channels
@@ -197,6 +198,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SignalEvent::MasterMuteChanged(muted) => {
                             if let Err(e) = dbus::emit_master_mute_changed(ctx, muted).await {
                                 warn!("Failed to emit MasterMuteChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::ConnectionChanged(connected) => {
+                            info!("Emitting D-Bus ConnectionChanged({})", connected);
+                            if let Err(e) = dbus::emit_connection_changed(ctx, connected).await {
+                                warn!("Failed to emit ConnectionChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::InputsChanged => {
+                            debug!("Emitting D-Bus InputsChanged signal");
+                            if let Err(e) = dbus::emit_inputs_changed(ctx).await {
+                                warn!("Failed to emit InputsChanged signal: {}", e);
                             }
                         }
                     }
