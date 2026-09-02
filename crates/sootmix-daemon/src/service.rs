@@ -32,6 +32,14 @@ pub enum SignalEvent {
     ConnectionChanged(bool),
     /// Input device list changed (cleared on disconnect, refreshed after restore).
     InputsChanged,
+    /// Channel properties changed (NS create/destroy/fail).
+    ///
+    /// Carries Daemon #22 / UI #21 `ChannelInfo`:
+    /// - `input_device: String` (empty = default/unset)
+    /// - `noise_suppression_enabled: bool`
+    /// - `vad_threshold: f64` (default 95.0)
+    /// Do not invent `NoiseFilterFailed` / `ns_enabled` or overload `output_device`.
+    ChannelUpdated(ChannelInfo),
 }
 
 /// Convert a linear volume value to dB.
@@ -185,10 +193,12 @@ impl ChannelState {
     }
 
     pub fn to_channel_info(&self) -> ChannelInfo {
-        // DAEMON: widen ChannelInfo (ns_enabled, pw ids, connection, capture)
-        // when the client contract is extended. Engine does not change the
-        // D-Bus shape in this slice.
+        // Daemon #22 / UI #21 contract. Engine ChannelUpdated after NS
+        // restore/fail uses this same mapping — do not invent ns_enabled
+        // or copy a mic name onto output_device.
         let (left_db, right_db) = self.meter_levels_db();
+        let (input_device, noise_suppression_enabled, vad_threshold) =
+            self.channel_info_mic_ns_fields();
         ChannelInfo {
             id: self.id.to_string(),
             name: self.name.clone(),
@@ -203,10 +213,21 @@ impl ChannelState {
             input_gain_db: self.input_gain_db as f64,
             // Mic/NS survive reconnect: UI #21 consumes these on
             // InitialState / ChannelAdded / ChannelUpdated.
-            input_device: self.input_device_name.clone().unwrap_or_default(),
-            noise_suppression_enabled: self.noise_suppression_enabled,
-            vad_threshold: self.vad_threshold as f64,
+            input_device,
+            noise_suppression_enabled,
+            vad_threshold,
         }
+    }
+
+    /// UI #21 ChannelInfo mic/NS fields. Engine ChannelUpdated after NS
+    /// restore/fail stays compatible with these names and types.
+    /// (`input_device` empty = default/unset; do not use `output_device`.)
+    pub fn channel_info_mic_ns_fields(&self) -> (String, bool, f64) {
+        (
+            self.input_device_name.clone().unwrap_or_default(),
+            self.noise_suppression_enabled,
+            self.vad_threshold as f64,
+        )
     }
 
     fn meter_levels_db(&self) -> (f32, f32) {
@@ -948,6 +969,26 @@ impl DaemonService {
             if let Err(e) = tx.send(event) {
                 warn!("Failed to send signal event: {}", e);
             }
+        }
+    }
+
+    /// Publish current channel state on the existing `channel_updated` signal.
+    ///
+    /// Daemon #22 / UI #21 `ChannelInfo` already carries `input_device` /
+    /// `noise_suppression_enabled` / `vad_threshold`. This is how the UI
+    /// sees those flip on NS create, destroy, and fail.
+    fn emit_channel_updated(&self, channel_id: Uuid) {
+        if let Some(channel) = self.state.channels.iter().find(|c| c.id == channel_id) {
+            let (input_device, noise_suppression_enabled, vad_threshold) =
+                channel.channel_info_mic_ns_fields();
+            debug!(
+                channel_id = %channel_id,
+                input_device,
+                noise_suppression_enabled,
+                vad_threshold,
+                "Emitting ChannelUpdated (UI #21 mic/NS field names)"
+            );
+            self.emit_signal(SignalEvent::ChannelUpdated(channel.to_channel_info()));
         }
     }
 
@@ -1710,8 +1751,8 @@ impl DaemonService {
             }
             PwEvent::DefaultSourceChanged => {
                 // Engine: retry default-mic links so meters have a live source
-                // after a WP default-source blip. DAEMON: can fan this into
-                // ConnectionChanged / ChannelInfo later.
+                // after a WP default-source blip. Daemon #22 owns
+                // ConnectionChanged on full disconnect/reconnect.
                 self.retry_default_mic_links();
             }
             PwEvent::NodeVolumeChanged {
@@ -1913,6 +1954,7 @@ impl DaemonService {
                         muted: true,
                     });
                 }
+                self.emit_channel_updated(channel_id);
             }
             PwEvent::NativeNoiseFilterDestroyed { channel_id } => {
                 info!("Native noise filter destroyed for channel {}", channel_id);
@@ -1926,6 +1968,7 @@ impl DaemonService {
                     info!("Dispatching pending replacement for channel {}", channel_id);
                     self.send_pw_command(cmd);
                 }
+                self.emit_channel_updated(channel_id);
             }
             PwEvent::NativeNoiseFilterFailed { channel_id, error } => {
                 error!(
@@ -1962,8 +2005,8 @@ impl DaemonService {
                     }
                 }
 
-                // Client path: ChannelUpdated lands in the next commit
-                // (UI #21 / Daemon #22 ChannelInfo). Failure is already logged.
+                // Daemon #22 / UI #21 ChannelInfo via existing channel_updated.
+                self.emit_channel_updated(channel_id);
             }
             PwEvent::Error(msg) => {
                 error!("PipeWire error: {}", msg);
@@ -3715,5 +3758,52 @@ mod tests {
         channel.pw_source_id = Some(7);
         let skipped = channel.is_input() && channel.pw_source_id.is_none();
         assert!(!skipped, "stale pw_source_id must be cleared on disconnect");
+    }
+}
+
+#[cfg(test)]
+mod ui21_channel_info_contract {
+    use super::*;
+
+    #[test]
+    fn ns_fail_clears_flag_and_keeps_input_device_and_vad() {
+        let mut channel = ChannelState::new_input("Mic".into());
+        channel.input_device_name = Some("alsa_input.usb-mic".into());
+        channel.noise_suppression_enabled = true;
+        channel.vad_threshold = 80.0;
+
+        // NativeNoiseFilterFailed path: flip NS off, keep mic + VAD.
+        channel.noise_suppression_enabled = false;
+
+        let (input_device, noise_suppression_enabled, vad_threshold) =
+            channel.channel_info_mic_ns_fields();
+        assert_eq!(input_device, "alsa_input.usb-mic");
+        assert!(!noise_suppression_enabled);
+        assert_eq!(vad_threshold, 80.0);
+    }
+
+    #[test]
+    fn unset_input_device_is_empty_string_not_output_device() {
+        let mut channel = ChannelState::new_input("Mic".into());
+        channel.output_device_name = Some("should-not-be-used-for-mics".into());
+
+        let (input_device, noise_suppression_enabled, vad_threshold) =
+            channel.channel_info_mic_ns_fields();
+        assert_eq!(input_device, "");
+        assert!(!noise_suppression_enabled);
+        assert_eq!(vad_threshold, 95.0);
+    }
+
+    #[test]
+    fn ns_created_sets_enabled_true() {
+        let mut channel = ChannelState::new_input("Mic".into());
+        channel.input_device_name = Some("system-default".into());
+        channel.noise_suppression_enabled = true;
+
+        let (input_device, noise_suppression_enabled, vad_threshold) =
+            channel.channel_info_mic_ns_fields();
+        assert_eq!(input_device, "system-default");
+        assert!(noise_suppression_enabled);
+        assert_eq!(vad_threshold, 95.0);
     }
 }

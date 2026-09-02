@@ -902,3 +902,22 @@ pub async fn emit_connection_changed(
         )
         .await
 }
+
+/// Emit ChannelUpdated after NS create/destroy/fail (and similar restore).
+///
+/// Uses the existing `channel_updated` signal and Daemon #22 / UI #21
+/// `ChannelInfo` (`input_device`, `noise_suppression_enabled`, `vad_threshold`).
+pub async fn emit_channel_updated(
+    ctx: &zbus::SignalContext<'_>,
+    channel: ChannelInfo,
+) -> zbus::Result<()> {
+    ctx.connection()
+        .emit_signal(
+            ctx.destination(),
+            ctx.path(),
+            INTERFACE_NAME,
+            "ChannelUpdated",
+            &(channel,),
+        )
+        .await
+}
