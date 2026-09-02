@@ -7,6 +7,8 @@
 use crate::service::DaemonService;
 use sootmix_ipc::{AppInfo, ChannelInfo, InputInfo, MeterData, OutputInfo, RoutingRuleInfo};
 use std::sync::{Arc, Mutex};
+// DAEMON: this std Mutex is the current D-Bus/service lock. A dedicated
+// async-aware mutex / poisoning policy is Daemon-owned and out of Engine.
 use tracing::debug;
 use zbus::interface;
 
