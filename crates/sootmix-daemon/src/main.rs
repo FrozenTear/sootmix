@@ -82,7 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to restore channels: {}", e);
     }
 
-    // Wrap in Arc<Mutex> for D-Bus access
+    // Wrap in Arc<Mutex> for D-Bus access.
+    // DAEMON: replace/widen this lock if ConnectionChanged + ChannelInfo
+    // updates need an async mutex; Engine does not redesign D-Bus.
     let service = Arc::new(Mutex::new(daemon_service));
 
     // Create D-Bus interface
@@ -132,10 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter_map(|ch| {
                         // Only emit for channels with real atomic meter levels
                         ch.atomic_meter_levels.as_ref().map(|levels| {
-                            let (left, right) = levels.load();
+                            // Max-hold + reset: matches GUI store_max / load_and_reset.
+                            // Do not invent bounce — silence stays silence.
+                            let (left, right) = levels.load_and_reset();
                             let left_db = linear_to_db(left);
                             let right_db = linear_to_db(right);
-                            // For now, peak = level (could track peak hold separately)
                             MeterData::new(ch.id, left_db, right_db, left_db, right_db)
                         })
                     })
