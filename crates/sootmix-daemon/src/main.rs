@@ -82,9 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to restore channels: {}", e);
     }
 
-    // Wrap in Arc<Mutex> for D-Bus access.
-    // DAEMON: replace/widen this lock if ConnectionChanged + ChannelInfo
-    // updates need an async mutex; Engine does not redesign D-Bus.
+    // Wrap in Arc<Mutex> for D-Bus access. Daemon #22 already avoids
+    // sleeping under this lock on reconnect; Engine does not redesign it.
     let service = Arc::new(Mutex::new(daemon_service));
 
     // Create D-Bus interface
@@ -213,6 +212,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             debug!("Emitting D-Bus InputsChanged signal");
                             if let Err(e) = dbus::emit_inputs_changed(ctx).await {
                                 warn!("Failed to emit InputsChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::ChannelUpdated(info) => {
+                            if let Err(e) = dbus::emit_channel_updated(ctx, info).await {
+                                warn!("Failed to emit ChannelUpdated signal: {}", e);
                             }
                         }
                     }
