@@ -264,6 +264,10 @@ impl SootMix {
 
     /// Handle messages.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.state.daemon_reconnecting && !message.allowed_while_reconnecting() {
+            return Task::none();
+        }
+
         match message {
             // ==================== Channel Actions ====================
             Message::ChannelVolumeChanged(id, volume) => {
@@ -872,6 +876,7 @@ impl SootMix {
             // ==================== Daemon Service Controls ====================
             Message::DaemonStart => {
                 self.state.daemon_action_pending = true;
+                self.state.daemon_reconnecting = true;
                 daemon_client::set_auto_restart(true);
                 return iced::Task::future(async {
                     let result = daemon_client::systemctl_start().await;
@@ -881,6 +886,7 @@ impl SootMix {
             Message::DaemonStop => {
                 self.state.daemon_action_pending = true;
                 self.daemon_connected = false;
+                self.state.daemon_reconnecting = false;
                 daemon_client::set_auto_restart(false);
                 return iced::Task::future(async {
                     Message::DaemonActionComplete(daemon_client::systemctl_stop().await)
@@ -889,6 +895,7 @@ impl SootMix {
             Message::DaemonRestart => {
                 self.state.daemon_action_pending = true;
                 self.daemon_connected = false;
+                self.state.daemon_reconnecting = true;
                 daemon_client::set_auto_restart(true);
                 return iced::Task::future(async {
                     let result = daemon_client::systemctl_restart().await;
@@ -1631,8 +1638,11 @@ impl SootMix {
                     return task;
                 }
 
-                // Restore config after PipeWire discovery delay (~200ms)
+                // Restore config after PipeWire discovery delay (~200ms).
+                // Skip while waiting for daemon InitialState so we do not take
+                // local graph ownership that would fight the daemon.
                 if !self.state.startup_complete
+                    && !self.state.daemon_reconnecting
                     && self.startup_time.elapsed() > std::time::Duration::from_millis(200)
                 {
                     if self.pending_config.is_some() {
@@ -2517,8 +2527,10 @@ impl SootMix {
             .size(20)
             .color(TEXT);
 
-        let status = if self.state.pw_connected {
+        let status = if self.daemon_connected && self.state.pw_connected {
             text("Connected").size(12).color(SUCCESS)
+        } else if self.state.daemon_reconnecting {
+            text("Reconnecting...").size(12).color(MUTED_COLOR)
         } else {
             text("Disconnected").size(12).color(MUTED_COLOR)
         };
@@ -2857,26 +2869,40 @@ impl SootMix {
 
     /// View the footer with add channel buttons.
     fn view_footer(&self) -> Element<'_, Message> {
-        let add_button = button(text("+ New Channel").size(14))
-            .padding([10, 20])
-            .style(|_theme: &Theme, _status| button::Style {
-                background: Some(Background::Color(PRIMARY)),
-                text_color: TEXT,
-                border: standard_border(),
-                ..button::Style::default()
-            })
-            .on_press(Message::NewChannelRequested);
+        let controls_enabled = self.daemon_connected && !self.state.daemon_reconnecting;
 
-        let add_input_button: Element<Message> = button(text("+ New Mic").size(14))
-            .padding([10, 20])
-            .style(|_theme: &Theme, _status| button::Style {
-                background: Some(Background::Color(SUCCESS)),
-                text_color: TEXT,
-                border: standard_border(),
-                ..button::Style::default()
-            })
-            .on_press(Message::NewInputChannelRequested)
-            .into();
+        let add_button = {
+            let btn = button(text("+ New Channel").size(14))
+                .padding([10, 20])
+                .style(|_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(PRIMARY)),
+                    text_color: TEXT,
+                    border: standard_border(),
+                    ..button::Style::default()
+                });
+            if controls_enabled {
+                btn.on_press(Message::NewChannelRequested)
+            } else {
+                btn
+            }
+        };
+
+        let add_input_button: Element<Message> = {
+            let btn = button(text("+ New Mic").size(14))
+                .padding([10, 20])
+                .style(|_theme: &Theme, _status| button::Style {
+                    background: Some(Background::Color(SUCCESS)),
+                    text_color: TEXT,
+                    border: standard_border(),
+                    ..button::Style::default()
+                });
+            if controls_enabled {
+                btn.on_press(Message::NewInputChannelRequested)
+            } else {
+                btn
+            }
+            .into()
+        };
 
         // Error display
         let error_text: Element<Message> = if let Some(ref err) = self.state.last_error {
@@ -4708,6 +4734,9 @@ impl SootMix {
                 info!("Connected to SootMix daemon - using daemon mode");
                 self.daemon_connected = true;
                 self.state.pw_connected = true;
+                // Stay in reconnecting until InitialState arrives so we do not
+                // apply local graph mutations against a half-synced mixer.
+                self.state.daemon_reconnecting = true;
 
                 // Shutdown local PW thread if running (daemon handles audio)
                 if let Some(pw) = self.pw_thread.take() {
@@ -4720,28 +4749,22 @@ impl SootMix {
                 warn!("Disconnected from SootMix daemon");
                 self.daemon_connected = false;
                 self.state.pw_connected = false;
+                // Stay in reconnecting only if the subscription will bring the
+                // daemon back. Explicit stop should show Disconnected, not spin.
+                self.state.daemon_reconnecting = daemon_client::auto_restart_enabled();
+                self.meter_manager.reset_all_inactive(
+                    &mut self.state.channels,
+                    &mut self.state.master_meter_display,
+                );
 
-                // Spawn local PW thread as fallback
-                if self.pw_thread.is_none() {
-                    info!("Starting local PipeWire thread (standalone mode)");
-                    let (event_tx, event_rx) = mpsc::channel();
-                    match PwThread::spawn(event_tx) {
-                        Ok(thread) => {
-                            // Send shared plugin instances to PW thread
-                            let shared_instances = self.plugin_manager.shared_instances();
-                            if let Err(e) = thread.send(PwCommand::SetSharedPluginInstances(shared_instances)) {
-                                error!("Failed to send shared plugin instances to PW thread: {:?}", e);
-                            } else {
-                                self.shared_instances_sent = true;
-                            }
-                            self.pw_thread = Some(thread);
-                            self.pw_event_rx = Some(event_rx);
-                            info!("PipeWire thread started in standalone mode");
-                        }
-                        Err(e) => {
-                            error!("Failed to start PipeWire thread: {}", e);
-                        }
-                    }
+                // Do not spawn a local PipeWire thread here. Taking graph
+                // ownership while the daemon is about to reconnect fights
+                // daemon/engine restore. Wait for InitialState instead.
+                if self.pw_thread.is_some() {
+                    info!(
+                        "Daemon disconnected; leaving existing local PW thread idle \
+                         (not spawning a second graph owner)"
+                    );
                 }
             }
             InitialState {
@@ -4772,50 +4795,10 @@ impl SootMix {
                     self.state.output_device = Some(master_output);
                 }
 
-                // Sync channels from daemon
+                // Sync channels from daemon (mic/NS via ChannelInfo, not Default).
                 self.state.channels.clear();
                 for ch_info in channels {
-                    if let Ok(id) = Uuid::parse_str(&ch_info.id) {
-                        let channel = MixerChannel {
-                            id,
-                            name: ch_info.name,
-                            volume_db: ch_info.volume_db as f32,
-                            muted: ch_info.muted,
-                            eq_enabled: ch_info.eq_enabled,
-                            eq_preset: ch_info.eq_preset,
-                            assigned_apps: ch_info.assigned_apps,
-                            is_managed: true,
-                            sink_name: None,
-                            pw_sink_id: None,
-                            pw_eq_node_id: None,
-                            pw_loopback_output_id: None,
-                            meter_display: crate::state::MeterDisplayState::default(),
-                            plugin_chain: Vec::new(),
-                            plugin_instances: Vec::new(),
-                            meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
-                            output_device_id: None,
-                            output_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Output && !ch_info.output_device.is_empty() {
-                                Some(ch_info.output_device.clone())
-                            } else {
-                                None
-                            },
-                            kind: ch_info.kind,
-                            // For input channels, output_device contains the mic device name
-                            input_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Input && !ch_info.output_device.is_empty() {
-                                Some(ch_info.output_device)
-                            } else {
-                                None
-                            },
-                            input_device_id: None,
-                            pw_source_id: None,
-                            pw_loopback_capture_id: None,
-                            sidetone_enabled: false,
-                            sidetone_volume_db: -20.0,
-                            noise_suppression_enabled: false,
-                            vad_threshold: 95.0,
-                            input_gain_db: ch_info.input_gain_db as f32,
-                            solo: false,
-                        };
+                    if let Some(channel) = MixerChannel::from_daemon_info(&ch_info) {
                         self.state.channels.push(channel);
                     }
                 }
@@ -4866,56 +4849,18 @@ impl SootMix {
                 }
 
                 self.state.startup_complete = true;
+                self.state.daemon_reconnecting = false;
                 info!("State synced from daemon - {} channels, {} apps",
                       self.state.channels.len(),
                       self.state.available_apps.len());
             }
             ChannelAdded(ch_info) => {
                 info!("Daemon: Channel added: {}", ch_info.name);
-                if let Ok(id) = Uuid::parse_str(&ch_info.id) {
-                    // Check if channel already exists
+                if let Some(id) = ch_info.uuid() {
                     if self.state.channel(id).is_none() {
-                        let channel = MixerChannel {
-                            id,
-                            name: ch_info.name,
-                            volume_db: ch_info.volume_db as f32,
-                            muted: ch_info.muted,
-                            eq_enabled: ch_info.eq_enabled,
-                            eq_preset: ch_info.eq_preset,
-                            assigned_apps: ch_info.assigned_apps,
-                            is_managed: true,
-                            sink_name: None,
-                            pw_sink_id: None,
-                            pw_eq_node_id: None,
-                            pw_loopback_output_id: None,
-                            meter_display: crate::state::MeterDisplayState::default(),
-                            plugin_chain: Vec::new(),
-                            plugin_instances: Vec::new(),
-                            meter_levels: Some(std::sync::Arc::new(crate::audio::meter_stream::AtomicMeterLevels::new())),
-                            output_device_id: None,
-                            output_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Output && !ch_info.output_device.is_empty() {
-                                Some(ch_info.output_device.clone())
-                            } else {
-                                None
-                            },
-                            kind: ch_info.kind,
-                            // For input channels, output_device contains the mic device name
-                            input_device_name: if ch_info.kind == sootmix_ipc::ChannelKind::Input && !ch_info.output_device.is_empty() {
-                                Some(ch_info.output_device)
-                            } else {
-                                None
-                            },
-                            input_device_id: None,
-                            pw_source_id: None,
-                            pw_loopback_capture_id: None,
-                            sidetone_enabled: false,
-                            sidetone_volume_db: -20.0,
-                            noise_suppression_enabled: false,
-                            vad_threshold: 95.0,
-                            input_gain_db: ch_info.input_gain_db as f32,
-                            solo: false,
-                        };
-                        self.state.channels.push(channel);
+                        if let Some(channel) = MixerChannel::from_daemon_info(&ch_info) {
+                            self.state.channels.push(channel);
+                        }
                     }
                 }
             }
@@ -4927,17 +4872,9 @@ impl SootMix {
             }
             ChannelUpdated(ch_info) => {
                 debug!("Daemon: Channel updated: {}", ch_info.name);
-                if let Ok(id) = Uuid::parse_str(&ch_info.id) {
+                if let Some(id) = ch_info.uuid() {
                     if let Some(channel) = self.state.channel_mut(id) {
-                        channel.name = ch_info.name;
-                        channel.volume_db = ch_info.volume_db as f32;
-                        channel.muted = ch_info.muted;
-                        channel.eq_enabled = ch_info.eq_enabled;
-                        channel.eq_preset = ch_info.eq_preset;
-                        channel.assigned_apps = ch_info.assigned_apps;
-                        if !ch_info.output_device.is_empty() {
-                            channel.output_device_name = Some(ch_info.output_device);
-                        }
+                        channel.apply_daemon_info(&ch_info);
                     }
                 }
             }
@@ -4986,6 +4923,12 @@ impl SootMix {
             PipeWireConnectionChanged(connected) => {
                 info!("PipeWire connection changed: {}", connected);
                 self.state.pw_connected = connected;
+                if !connected {
+                    self.meter_manager.reset_all_inactive(
+                        &mut self.state.channels,
+                        &mut self.state.master_meter_display,
+                    );
+                }
             }
             MasterVolumeChanged(volume_db) => {
                 self.state.master_volume_db = volume_db as f32;

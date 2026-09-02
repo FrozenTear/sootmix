@@ -53,6 +53,22 @@ pub struct ChannelInfo {
     pub kind: ChannelKind,
     /// Hardware microphone gain in dB (-12.0 to +12.0). Only applies to input channels.
     pub input_gain_db: f64,
+    /// Input device name for input (mic) channels (empty string = default/unset).
+    ///
+    /// Widened so mic assignment survives daemon reconnect. Do not overload
+    /// `output_device` for this — UI maps this field onto `input_device_name`.
+    #[serde(default)]
+    pub input_device: String,
+    /// Whether RNNoise noise suppression is enabled (input channels).
+    #[serde(default)]
+    pub noise_suppression_enabled: bool,
+    /// VAD threshold for noise suppression (0-100%). Higher = more aggressive gating.
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f64,
+}
+
+fn default_vad_threshold() -> f64 {
+    95.0
 }
 
 impl ChannelInfo {
@@ -70,6 +86,9 @@ impl ChannelInfo {
             meter_levels: (-60.0, -60.0),
             kind: ChannelKind::Output,
             input_gain_db: 0.0,
+            input_device: String::new(),
+            noise_suppression_enabled: false,
+            vad_threshold: default_vad_threshold(),
         }
     }
 
@@ -321,6 +340,9 @@ mod tests {
         let id = Uuid::new_v4();
         let channel = ChannelInfo::new(id, "Test".to_string());
         assert_eq!(channel.uuid(), Some(id));
+        assert!(channel.input_device.is_empty());
+        assert!(!channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 95.0);
     }
 
     #[test]
