@@ -425,6 +425,11 @@ pub fn set_auto_restart(enabled: bool) {
     DAEMON_AUTO_RESTART.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the daemon subscription will try to restart after a disconnect.
+pub fn auto_restart_enabled() -> bool {
+    DAEMON_AUTO_RESTART.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Send a command to the daemon.
 pub fn send_daemon_command(cmd: DaemonCommand) -> Result<(), String> {
     let guard = DAEMON_CMD_TX.read().map_err(|e| format!("Lock poisoned: {}", e))?;

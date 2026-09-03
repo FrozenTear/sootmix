@@ -325,3 +325,41 @@ pub enum Message {
     /// Event received from the SootMix daemon.
     Daemon(DaemonEvent),
 }
+
+impl Message {
+    /// Messages that stay live while waiting for daemon (re)connect / InitialState.
+    /// Mixer mutations are dropped so the UI does not spawn a conflicting local graph.
+    pub fn allowed_while_reconnecting(&self) -> bool {
+        matches!(
+            self,
+            Message::Tick
+                | Message::Daemon(_)
+                | Message::WindowCloseRequested(_)
+                | Message::TrayShowWindow
+                | Message::TrayQuit
+                | Message::OpenSettings
+                | Message::CloseSettings
+                | Message::DaemonStart
+                | Message::DaemonStop
+                | Message::DaemonRestart
+                | Message::DaemonToggleAutostart(_)
+                | Message::DaemonActionComplete(_)
+                | Message::DaemonAutoStartChecked(_)
+                | Message::GenerateReport
+                | Message::ReportGenerated(_)
+                | Message::CheckForUpdates
+                | Message::UpdateCheckResult(_)
+                | Message::Initialized
+                | Message::FontLoaded(_)
+                | Message::SelectChannel(_)
+                | Message::SetChannelFilter(_)
+                | Message::ToggleLeftSidebar
+                | Message::ToggleBottomPanel
+                | Message::OpenRoutingRulesPanel
+                | Message::CloseRoutingRulesPanel
+                | Message::OpenPluginDownloader
+                | Message::ClosePluginDownloader
+                | Message::DownloaderSearchChanged(_)
+        )
+    }
+}

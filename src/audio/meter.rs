@@ -4,9 +4,9 @@
 
 //! Audio level metering for VU meters.
 //!
-//! This module provides audio level information for display in VU meters.
-//! It supports both real audio levels (from PipeWire streams) and simulated
-//! levels (as fallback when real metering isn't available).
+//! Display is driven only by real samples from the daemon/engine
+//! (`AtomicMeterLevels`). Missing or inactive meters stay flat — the UI never
+//! invents bounce from assignment, default device names, or mute state.
 
 #![allow(dead_code)]
 
@@ -22,31 +22,21 @@ use uuid::Uuid;
 pub struct ChannelMeterState {
     /// Real-time atomic levels from audio thread (if available).
     pub real_levels: Option<Arc<AtomicMeterLevels>>,
-    /// Simulated activity level for fallback (0.0 to 1.0).
-    pub simulated_activity: f32,
-    /// Random variation seed for realistic simulated movement.
-    pub variation_phase: f32,
 }
 
 impl Default for ChannelMeterState {
     fn default() -> Self {
-        Self {
-            real_levels: None,
-            simulated_activity: 0.0,
-            variation_phase: rand_phase(),
-        }
+        Self { real_levels: None }
     }
 }
 
 /// Meter data manager that tracks levels across all channels.
 ///
-/// Supports both real audio levels (when available) and simulated levels.
+/// Only real, active samples are shown. Idle/disconnected meters stay at zero.
 #[derive(Debug, Default)]
 pub struct MeterManager {
     /// Per-channel meter state.
     channel_states: HashMap<Uuid, ChannelMeterState>,
-    /// Phase counter for simulated animation.
-    phase: f32,
     /// Channels we've already logged an "inactive meter" warning for.
     logged_inactive: HashSet<Uuid>,
 }
@@ -58,14 +48,12 @@ impl MeterManager {
     }
 
     /// Register real-time levels for a channel.
-    ///
-    /// Once registered, the manager will use these atomic levels instead of simulation.
     pub fn register_real_levels(&mut self, channel_id: Uuid, levels: Arc<AtomicMeterLevels>) {
         let state = self.channel_states.entry(channel_id).or_default();
         state.real_levels = Some(levels);
     }
 
-    /// Unregister real-time levels for a channel (falls back to simulation).
+    /// Unregister real-time levels for a channel.
     pub fn unregister_real_levels(&mut self, channel_id: Uuid) {
         if let Some(state) = self.channel_states.get_mut(&channel_id) {
             state.real_levels = None;
@@ -80,9 +68,33 @@ impl MeterManager {
             .unwrap_or(false)
     }
 
+    /// Snap every channel and the master meter to inactive/zero.
+    ///
+    /// Used on daemon disconnect so leftover peaks do not keep decaying as if
+    /// audio were still flowing.
+    pub fn reset_all_inactive(
+        &mut self,
+        channels: &mut [MixerChannel],
+        master_meter: &mut MeterDisplayState,
+    ) {
+        for channel in channels.iter_mut() {
+            if let Some(ref levels) = channel.meter_levels {
+                levels.reset();
+            }
+            channel.meter_display.reset();
+        }
+        master_meter.reset();
+        self.logged_inactive.clear();
+    }
+
     /// Update meters for all channels.
     ///
     /// `dt` is delta time in seconds since last update.
+    ///
+    /// Levels come only from an active `AtomicMeterLevels` sample. Assignment
+    /// (`assigned_apps`) and default input names (`system-default`) never
+    /// invent motion. Master is the post-fader max of real output-channel
+    /// samples only — never a mix of simulated values.
     pub fn update_meters(
         &mut self,
         channels: &mut [MixerChannel],
@@ -91,149 +103,95 @@ impl MeterManager {
         master_muted: bool,
         dt: f32,
     ) {
-        // Update animation phase for simulated meters
-        self.phase += dt * 3.0; // 3 Hz base frequency
-        if self.phase > std::f32::consts::TAU {
-            self.phase -= std::f32::consts::TAU;
-        }
-
         let mut total_left = 0.0f32;
         let mut total_right = 0.0f32;
+        let mut master_has_real = false;
 
         for channel in channels.iter_mut() {
-            // Get or create channel state for simulated levels
-            let state = self.channel_states.entry(channel.id).or_default();
+            let _ = self.channel_states.entry(channel.id).or_default();
 
-            // Try to get real levels from the channel's meter_levels first
-            let phase = self.phase;
-            let (level_left, level_right) = if let Some(ref real_levels) = channel.meter_levels {
-                if real_levels.is_active() {
-                    // Clear inactive log so it fires again if it flaps
-                    self.logged_inactive.remove(&channel.id);
-                    // Use real audio levels from the plugin processing chain
-                    let (raw_left, raw_right) = real_levels.load_and_reset();
-                    if raw_left > 0.01 || raw_right > 0.01 {
-                        tracing::trace!(
-                            "Meter read: ch={} raw=({:.4},{:.4}) is_input={}",
-                            channel.name, raw_left, raw_right, channel.is_input()
-                        );
-                    }
+            let (level_left, level_right, from_real) =
+                real_meter_levels(channel, &mut self.logged_inactive);
 
-                    // For INPUT channels: show PRE-FADER levels (raw input, not affected by volume)
-                    // This is industry standard - input meters show what's coming in, not what's going out.
-                    // For OUTPUT channels: show POST-FADER levels (affected by volume/mute)
-                    if channel.is_input() {
-                        // Pre-fader metering for inputs - show raw input level
-                        // Only apply mute (user still wants to see "muted" state visually)
-                        if channel.muted {
-                            (0.0, 0.0)
-                        } else {
-                            (raw_left, raw_right)
-                        }
-                    } else {
-                        // Post-fader metering for outputs - apply channel volume
-                        let volume_scale = if channel.muted {
-                            0.0
-                        } else {
-                            db_to_linear(channel.volume_db)
-                        };
-                        (raw_left * volume_scale, raw_right * volume_scale)
-                    }
-                } else {
-                    // Real metering available but no audio data yet - use simulated
-                    if self.logged_inactive.insert(channel.id) {
-                        debug!(
-                            "Channel '{}' meter stream not active, using simulated levels",
-                            channel.name
-                        );
-                    }
-                    calculate_simulated_level(phase, channel, state)
-                }
-            } else {
-                // No real metering - fall back to simulated levels
-                calculate_simulated_level(phase, channel, state)
-            };
-
-            // Update channel meter display
             channel.meter_display.update(level_left, level_right, dt);
 
-            // Accumulate for master meter (only output channels contribute)
-            // Input channels don't route to master output directly
-            if !channel.is_input() && (level_left > 0.0 || level_right > 0.0) {
+            // Master is output-bus only, and only from real samples.
+            if from_real && !channel.is_input() && (level_left > 0.0 || level_right > 0.0) {
                 total_left = total_left.max(level_left);
                 total_right = total_right.max(level_right);
+                master_has_real = true;
             }
         }
 
-        // Update master meter
-        let master_scale = if master_muted {
-            0.0
+        if master_has_real {
+            let master_scale = if master_muted {
+                0.0
+            } else {
+                db_to_linear(master_volume_db)
+            };
+            master_meter.update(total_left * master_scale, total_right * master_scale, dt);
         } else {
-            db_to_linear(master_volume_db)
-        };
-        let master_left = total_left * master_scale;
-        let master_right = total_right * master_scale;
-        master_meter.update(master_left, master_right, dt);
+            // No real output samples this tick — idle, do not invent a mix.
+            master_meter.update(0.0, 0.0, dt);
+        }
 
-        // Clean up states for removed channels
         let channel_ids: std::collections::HashSet<Uuid> =
             channels.iter().map(|c| c.id).collect();
         self.channel_states
             .retain(|id, _| channel_ids.contains(id));
     }
-
 }
 
-/// Calculate simulated levels for a channel (fallback when no real metering).
-/// This is a free function to avoid borrow issues with &mut self.
-fn calculate_simulated_level(
-    phase: f32,
+/// Read a channel's real meter sample, or `(0, 0)` when missing/inactive.
+///
+/// Returns `(left, right, from_real)` where `from_real` is true only when an
+/// active atomic sample was consumed.
+fn real_meter_levels(
     channel: &MixerChannel,
-    state: &mut ChannelMeterState,
-) -> (f32, f32) {
-    // For input channels, activity is based on having an input device selected
-    // For output channels, activity is based on having apps assigned
-    let has_activity = if channel.is_input() {
-        channel.input_device_name.is_some() && !channel.muted
-    } else {
-        !channel.assigned_apps.is_empty() && !channel.muted
+    logged_inactive: &mut HashSet<Uuid>,
+) -> (f32, f32, bool) {
+    let Some(ref real_levels) = channel.meter_levels else {
+        return (0.0, 0.0, false);
     };
-    let target_activity = if has_activity { 0.7 } else { 0.0 };
-    state.simulated_activity += 0.1 * (target_activity - state.simulated_activity);
 
-    if state.simulated_activity > 0.01 {
-        let base_level = state.simulated_activity;
-        let phase_offset = state.variation_phase;
-        let variation_l = 0.15 * (phase + phase_offset).sin();
-        let variation_r = 0.15 * (phase * 1.1 + phase_offset + 0.5).sin();
+    if !real_levels.is_active() {
+        if logged_inactive.insert(channel.id) {
+            debug!(
+                "Channel '{}' meter stream not active, showing idle levels",
+                channel.name
+            );
+        }
+        return (0.0, 0.0, false);
+    }
 
-        // For INPUT channels: show PRE-FADER levels (not affected by channel volume)
-        // For OUTPUT channels: show POST-FADER levels (affected by volume)
-        if channel.is_input() {
-            // Pre-fader simulated metering for inputs
-            let left = (base_level + variation_l).clamp(0.0, 1.0);
-            let right = (base_level + variation_r).clamp(0.0, 1.0);
-            (left, right)
+    logged_inactive.remove(&channel.id);
+    let (raw_left, raw_right) = real_levels.load_and_reset();
+    if raw_left > 0.01 || raw_right > 0.01 {
+        tracing::trace!(
+            "Meter read: ch={} raw=({:.4},{:.4}) is_input={}",
+            channel.name,
+            raw_left,
+            raw_right,
+            channel.is_input()
+        );
+    }
+
+    // INPUT: pre-fader (mute still zeros the display). OUTPUT: post-fader.
+    let (left, right) = if channel.is_input() {
+        if channel.muted {
+            (0.0, 0.0)
         } else {
-            // Post-fader simulated metering for outputs
-            let volume_scale = db_to_linear(channel.volume_db);
-            let left = (base_level + variation_l).clamp(0.0, 1.0) * volume_scale;
-            let right = (base_level + variation_r).clamp(0.0, 1.0) * volume_scale;
-            (left, right)
+            (raw_left, raw_right)
         }
     } else {
-        (0.0, 0.0)
-    }
-}
-
-/// Generate a random phase offset for variation.
-fn rand_phase() -> f32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    (nanos as f32 / 1_000_000_000.0) * std::f32::consts::TAU
+        let volume_scale = if channel.muted {
+            0.0
+        } else {
+            db_to_linear(channel.volume_db)
+        };
+        (raw_left * volume_scale, raw_right * volume_scale)
+    };
+    (left, right, true)
 }
 
 #[cfg(test)]
@@ -257,11 +215,8 @@ mod tests {
     #[test]
     fn test_meter_decay() {
         let mut meter = MeterDisplayState::default();
-        // Set high level
         meter.update(1.0, 1.0, 0.05);
         let high_level = meter.level_left;
-
-        // Update with zero level - should decay
         meter.update(0.0, 0.0, 0.05);
         assert!(meter.level_left < high_level);
     }
@@ -279,5 +234,144 @@ mod tests {
 
         manager.unregister_real_levels(channel_id);
         assert!(!manager.has_real_metering(channel_id));
+    }
+
+    #[test]
+    fn inactive_output_with_assigned_apps_stays_flat() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new("Games");
+        channel.assigned_apps.push("firefox".into());
+        assert!(
+            !channel.meter_levels.as_ref().unwrap().is_active(),
+            "fresh AtomicMeterLevels must start inactive"
+        );
+
+        let mut master = MeterDisplayState::default();
+        manager.update_meters(
+            std::slice::from_mut(&mut channel),
+            &mut master,
+            0.0,
+            false,
+            0.016,
+        );
+
+        assert_eq!(channel.meter_display.level_left, 0.0);
+        assert_eq!(channel.meter_display.level_right, 0.0);
+        assert_eq!(master.level_left, 0.0);
+        assert_eq!(master.level_right, 0.0);
+    }
+
+    #[test]
+    fn inactive_input_with_system_default_stays_flat() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new_input("Mic");
+        assert_eq!(
+            channel.input_device_name.as_deref(),
+            Some("system-default")
+        );
+        assert!(!channel.meter_levels.as_ref().unwrap().is_active());
+
+        let mut master = MeterDisplayState::default();
+        manager.update_meters(
+            std::slice::from_mut(&mut channel),
+            &mut master,
+            0.0,
+            false,
+            0.016,
+        );
+
+        assert_eq!(channel.meter_display.level_left, 0.0);
+        assert_eq!(channel.meter_display.level_right, 0.0);
+    }
+
+    #[test]
+    fn missing_atomic_levels_stay_flat() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new("Bare");
+        channel.assigned_apps.push("discord".into());
+        channel.meter_levels = None;
+
+        let mut master = MeterDisplayState::default();
+        manager.update_meters(
+            std::slice::from_mut(&mut channel),
+            &mut master,
+            0.0,
+            false,
+            0.016,
+        );
+
+        assert_eq!(channel.meter_display.level_left, 0.0);
+        assert_eq!(master.level_left, 0.0);
+    }
+
+    #[test]
+    fn master_is_not_derived_from_inactive_channels() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new("Out");
+        channel.assigned_apps.push("spotify".into());
+        channel.volume_db = 0.0;
+
+        let mut master = MeterDisplayState::default();
+        // Several ticks: old simulated path would ease toward ~0.7.
+        for _ in 0..20 {
+            manager.update_meters(
+                std::slice::from_mut(&mut channel),
+                &mut master,
+                0.0,
+                false,
+                0.016,
+            );
+        }
+
+        assert_eq!(channel.meter_display.level_left, 0.0);
+        assert_eq!(master.level_left, 0.0);
+        assert_eq!(master.peak_hold_left, 0.0);
+    }
+
+    #[test]
+    fn active_real_sample_is_displayed() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new("Live");
+        channel.volume_db = 0.0;
+        {
+            let levels = channel.meter_levels.as_ref().unwrap();
+            levels.store(0.4, 0.5);
+            assert!(levels.is_active());
+        }
+
+        let mut master = MeterDisplayState::default();
+        manager.update_meters(
+            std::slice::from_mut(&mut channel),
+            &mut master,
+            0.0,
+            false,
+            0.016,
+        );
+
+        assert!(channel.meter_display.level_left > 0.0);
+        assert!(channel.meter_display.level_right > 0.0);
+        assert!(master.level_left > 0.0);
+        assert!(master.level_right > 0.0);
+    }
+
+    #[test]
+    fn reset_all_inactive_clears_display_and_atomics() {
+        let mut manager = MeterManager::new();
+        let mut channel = MixerChannel::new("Live");
+        channel.meter_levels.as_ref().unwrap().store(0.8, 0.8);
+        let mut master = MeterDisplayState::default();
+        manager.update_meters(
+            std::slice::from_mut(&mut channel),
+            &mut master,
+            0.0,
+            false,
+            0.016,
+        );
+        assert!(channel.meter_display.level_left > 0.0);
+
+        manager.reset_all_inactive(std::slice::from_mut(&mut channel), &mut master);
+        assert!(!channel.meter_levels.as_ref().unwrap().is_active());
+        assert_eq!(channel.meter_display.level_left, 0.0);
+        assert_eq!(master.level_left, 0.0);
     }
 }

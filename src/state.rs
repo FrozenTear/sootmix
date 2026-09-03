@@ -397,6 +397,76 @@ impl MixerChannel {
             db_to_linear(self.volume_db)
         }
     }
+
+    /// Build a UI channel from daemon `ChannelInfo` (InitialState / ChannelAdded).
+    ///
+    /// Mic device and NS come from the widened IPC fields. Input channels never
+    /// copy `output_device` into `output_device_name`.
+    pub fn from_daemon_info(info: &sootmix_ipc::ChannelInfo) -> Option<Self> {
+        let id = info.uuid()?;
+        let mut channel = if info.kind == ChannelKind::Input {
+            Self::new_input(info.name.clone())
+        } else {
+            Self::new(info.name.clone())
+        };
+        channel.id = id;
+        channel.apply_daemon_info(info);
+        // Fresh inactive atomics — display stays flat until a real sample arrives.
+        channel.meter_display = MeterDisplayState::default();
+        channel.meter_levels = Some(std::sync::Arc::new(
+            crate::audio::meter_stream::AtomicMeterLevels::new(),
+        ));
+        Some(channel)
+    }
+
+    /// Apply daemon `ChannelInfo` onto an existing UI channel (ChannelUpdated).
+    ///
+    /// Preserves runtime-only UI state (meter atomics, plugin instances, solo).
+    /// When Daemon later adds more mic/NS fields, map them here rather than
+    /// inventing a second IPC schema.
+    pub fn apply_daemon_info(&mut self, info: &sootmix_ipc::ChannelInfo) {
+        self.name = info.name.clone();
+        self.volume_db = info.volume_db as f32;
+        self.muted = info.muted;
+        self.eq_enabled = info.eq_enabled;
+        self.eq_preset = info.eq_preset.clone();
+        self.assigned_apps = info.assigned_apps.clone();
+        self.kind = info.kind;
+        self.input_gain_db = info.input_gain_db as f32;
+        self.noise_suppression_enabled = info.noise_suppression_enabled;
+        self.vad_threshold = info.vad_threshold as f32;
+
+        if info.kind == ChannelKind::Input {
+            // Never stuff the mic name into output_device_name.
+            self.output_device_name = None;
+            self.input_device_name = input_device_from_info(info);
+        } else {
+            self.output_device_name = nonempty_device(&info.output_device);
+            self.input_device_name = None;
+        }
+    }
+}
+
+/// Empty IPC device string means default/unset.
+fn nonempty_device(name: &str) -> Option<String> {
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Resolve the input device from widened `input_device`, with a legacy fallback
+/// for older daemons that put the mic name in `output_device`.
+fn input_device_from_info(info: &sootmix_ipc::ChannelInfo) -> Option<String> {
+    if !info.input_device.is_empty() {
+        Some(info.input_device.clone())
+    } else if !info.output_device.is_empty() {
+        // Legacy: pre-widen ChannelInfo reused output_device for mics.
+        Some(info.output_device.clone())
+    } else {
+        None
+    }
 }
 
 /// Convert decibels to linear volume.
@@ -1037,6 +1107,9 @@ pub struct AppState {
     pub daemon_autostart: bool,
     /// Whether a daemon action (start/stop/restart) is in progress.
     pub daemon_action_pending: bool,
+    /// Waiting for daemon (re)connect / InitialState. Mixer mutations are ignored
+    /// so the UI does not take conflicting local graph ownership.
+    pub daemon_reconnecting: bool,
 
     // ==================== Plugin Downloader ====================
     /// Whether the plugin downloader panel is open.
@@ -1120,6 +1193,7 @@ impl AppState {
             monitor_device: None,
             daemon_autostart: false,
             daemon_action_pending: false,
+            daemon_reconnecting: true,
             downloader_open: false,
             downloader_search: String::new(),
             downloading: std::collections::HashMap::new(),
@@ -1348,5 +1422,90 @@ impl AppState {
         }];
         outputs.extend(hw_outputs);
         self.available_outputs = outputs;
+    }
+}
+
+#[cfg(test)]
+mod daemon_info_mapping_tests {
+    use super::*;
+    use sootmix_ipc::ChannelInfo;
+
+    fn input_info(name: &str) -> ChannelInfo {
+        let mut info = ChannelInfo::new(Uuid::new_v4(), name.to_string());
+        info.kind = ChannelKind::Input;
+        info.input_device = "alsa_input.usb-headset".to_string();
+        info.noise_suppression_enabled = true;
+        info.vad_threshold = 80.0;
+        info.input_gain_db = 3.0;
+        info.output_device = "should-not-become-output".to_string();
+        info
+    }
+
+    #[test]
+    fn input_channel_maps_mic_and_ns_not_output_device() {
+        let info = input_info("Mic");
+        let channel = MixerChannel::from_daemon_info(&info).expect("uuid");
+
+        assert!(channel.is_input());
+        assert_eq!(
+            channel.input_device_name.as_deref(),
+            Some("alsa_input.usb-headset")
+        );
+        assert!(channel.output_device_name.is_none());
+        assert!(channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 80.0);
+        assert_eq!(channel.input_gain_db, 3.0);
+        assert!(
+            !channel.meter_levels.as_ref().unwrap().is_active(),
+            "fresh daemon mapping must not invent meter activity"
+        );
+    }
+
+    #[test]
+    fn channel_updated_applies_ns_and_does_not_reset_to_default() {
+        let mut channel = MixerChannel::new_input("Mic");
+        assert!(!channel.noise_suppression_enabled);
+        assert_eq!(channel.input_device_name.as_deref(), Some("system-default"));
+
+        let info = input_info("Mic");
+        channel.apply_daemon_info(&info);
+
+        assert_eq!(
+            channel.input_device_name.as_deref(),
+            Some("alsa_input.usb-headset")
+        );
+        assert!(channel.noise_suppression_enabled);
+        assert_eq!(channel.vad_threshold, 80.0);
+        assert!(channel.output_device_name.is_none());
+    }
+
+    #[test]
+    fn legacy_output_device_fallback_for_input_only() {
+        let mut info = ChannelInfo::new(Uuid::new_v4(), "OldMic".to_string());
+        info.kind = ChannelKind::Input;
+        info.input_device.clear();
+        info.output_device = "legacy-mic".to_string();
+
+        let channel = MixerChannel::from_daemon_info(&info).expect("uuid");
+        assert_eq!(channel.input_device_name.as_deref(), Some("legacy-mic"));
+        assert!(channel.output_device_name.is_none());
+    }
+
+    #[test]
+    fn output_channel_maps_output_device_only() {
+        let mut info = ChannelInfo::new(Uuid::new_v4(), "Games".to_string());
+        info.output_device = "alsa_output.pci".to_string();
+        info.input_device = "ignored-mic".to_string();
+        info.noise_suppression_enabled = true;
+
+        let channel = MixerChannel::from_daemon_info(&info).expect("uuid");
+        assert!(!channel.is_input());
+        assert_eq!(
+            channel.output_device_name.as_deref(),
+            Some("alsa_output.pci")
+        );
+        assert!(channel.input_device_name.is_none());
+        // NS is an input-channel concern; still stored from IPC but unused for outputs.
+        assert!(channel.noise_suppression_enabled);
     }
 }

@@ -194,6 +194,10 @@ impl ChannelState {
             meter_levels: (left_db as f64, right_db as f64),
             kind: self.kind,
             input_gain_db: self.input_gain_db as f64,
+            // Mic/NS survive reconnect: UI consumes these on InitialState/ChannelUpdated.
+            input_device: self.input_device_name.clone().unwrap_or_default(),
+            noise_suppression_enabled: self.noise_suppression_enabled,
+            vad_threshold: self.vad_threshold as f64,
         }
     }
 
