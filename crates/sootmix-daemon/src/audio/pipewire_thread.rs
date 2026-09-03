@@ -6,14 +6,17 @@
 
 use crate::audio::native_loopback::{AtomicMeterLevels, NativeLoopback};
 use crate::audio::pulse_meter::PulseAudioMeter;
-use crate::audio::types::{AudioChannel, MediaClass, PortDirection, PwLink, PwNode, PwPort};
+use crate::audio::routing::parse_wp_default_name;
+use crate::audio::types::{
+    AudioChannel, MediaClass, NodeRunState, PortDirection, PwLink, PwNode, PwPort,
+};
 use pipewire::link::Link;
 use pipewire::metadata::{Metadata, MetadataListener};
 use pipewire::node::{Node, NodeListener};
 use pipewire::properties::properties;
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::Pod;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
@@ -178,6 +181,10 @@ pub enum PwEvent {
     /// Sent when a hardware sink is promoted/demoted as the system default
     /// (e.g. Bluetooth headset reconnect, USB audio replug).
     DefaultSinkChanged,
+    /// WirePlumber's `default.audio.source` metadata key changed.
+    /// Engine uses this for default-mic linking without blocking `wpctl`.
+    /// DAEMON: can fan this out as ConnectionChanged / ChannelInfo later.
+    DefaultSourceChanged,
     Error(String),
 }
 
@@ -214,6 +221,14 @@ struct CreatedLink {
     proxy: Link,
 }
 
+/// Mic-link request that could not be completed on the first try
+/// (mic or capture ports not in the registry yet). Retried on PortAdded.
+#[derive(Debug, Clone)]
+enum PendingMicLink {
+    Named { target_mic_name: String },
+    Default,
+}
+
 const CLI_THROTTLE_MS: u64 = 50;
 
 /// Pending CLI command that was throttled
@@ -239,8 +254,18 @@ struct PwThreadState {
     cli_in_flight: Arc<Mutex<HashSet<u32>>>,
     /// Native loopback instances (replacing pw-loopback CLI).
     native_loopbacks: HashMap<Uuid, NativeLoopback>,
-    /// PulseAudio-based meters for input channels.
+    /// PulseAudio-based meters for input/output channels.
     pulse_meters: HashMap<Uuid, PulseAudioMeter>,
+    /// Expected sootmix node.name → channel (filled at create, resolved on NodeAdded).
+    expected_node_names: HashMap<String, Uuid>,
+    /// Resolved PW node id → channel (for meter teardown on destroy).
+    node_to_channel: HashMap<u32, Uuid>,
+    /// Capture-node mic links that need a PortAdded retry (ports or mic not ready).
+    pending_mic_links: HashMap<u32, PendingMicLink>,
+    /// Cached `default.audio.sink` node.name from WirePlumber metadata.
+    default_sink_name: Option<String>,
+    /// Cached `default.audio.source` node.name from WirePlumber metadata.
+    default_source_name: Option<String>,
     /// Pending loopback node discovery: node_name -> (channel_id, is_main_node)
     /// Used to match nodes created by native loopbacks once they appear in registry.
     pending_loopback_nodes: HashMap<String, (Uuid, bool)>,
@@ -267,6 +292,11 @@ impl PwThreadState {
             cli_in_flight: Arc::new(Mutex::new(HashSet::new())),
             native_loopbacks: HashMap::new(),
             pulse_meters: HashMap::new(),
+            expected_node_names: HashMap::new(),
+            node_to_channel: HashMap::new(),
+            pending_mic_links: HashMap::new(),
+            default_sink_name: None,
+            default_source_name: None,
             pending_loopback_nodes: HashMap::new(),
             discovered_loopback_nodes: HashMap::new(),
             default_metadata: None,
@@ -373,6 +403,10 @@ impl PwThread {
                 if let Err(e) = run_pipewire_loop(cmd_rx, event_tx.clone()) {
                     error!("PipeWire thread error: {}", e);
                     let _ = event_tx.send(PwEvent::Error(e.to_string()));
+                    // Failed connect / thread death must surface as disconnect so
+                    // the service can reap the JoinHandle and retry. Connected is
+                    // only sent after a successful core.connect.
+                    let _ = event_tx.send(PwEvent::Disconnected);
                 }
             })
             .map_err(|e| PwError::ThreadError(e.to_string()))?;
@@ -381,6 +415,22 @@ impl PwThread {
             cmd_tx,
             handle: Some(handle),
         })
+    }
+
+    /// Whether the PipeWire thread has exited.
+    ///
+    /// `spawn()` succeeding does **not** mean we are connected. A failed
+    /// `core.connect` leaves a finished thread with `pw_thread` still `Some`,
+    /// which used to block reconnect forever.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().map_or(true, JoinHandle::is_finished)
+    }
+
+    /// Join a thread that has already exited. Does not send Shutdown.
+    pub fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Send a command to the PipeWire thread.
@@ -431,8 +481,12 @@ fn run_pipewire_loop(
 
     info!("Connected to PipeWire");
     let _ = event_tx.send(PwEvent::Connected);
+    // DAEMON: install a real core disconnect listener here (this path only
+    // emits Disconnected when the PW thread's main loop exits). Clear all
+    // PW IDs + emit ConnectionChanged on that listener; do not redesign D-Bus.
 
     let event_tx = Rc::new(event_tx);
+    let disconnected_sent = Rc::new(Cell::new(false));
     let state = Rc::new(RefCell::new(PwThreadState::new(event_tx.clone())));
 
     let main_loop_weak = main_loop.downgrade();
@@ -443,7 +497,38 @@ fn run_pipewire_loop(
         handle_command(cmd, &state_cmd, &main_loop_weak, &core_cmd, &registry_cmd);
     });
 
-    let _registry_listener = setup_registry_listener(&registry, state.clone(), event_tx.clone());
+    // Daemon #22: emit Disconnected on a real core error (PW restart /
+    // socket gone), not only after main_loop.run() returns.
+    let event_tx_core = event_tx.clone();
+    let disconnected_core = disconnected_sent.clone();
+    let main_loop_core = main_loop.downgrade();
+    let _core_listener = core
+        .add_listener_local()
+        .error(move |id, _seq, res, message| {
+            error!(
+                "PipeWire core error: id={} res={} msg={}",
+                id, res, message
+            );
+            // id 0 is the core itself. Connection-loss also shows up as EPIPE
+            // (-32) / ECONNRESET (-104) or a "connection" message.
+            let is_disconnect = id == 0
+                || res == -32
+                || res == -104
+                || message.contains("connection")
+                || message.contains("disconnected");
+            if is_disconnect {
+                if !disconnected_core.replace(true) {
+                    let _ = event_tx_core.send(PwEvent::Disconnected);
+                }
+                if let Some(ml) = main_loop_core.upgrade() {
+                    ml.quit();
+                }
+            }
+        })
+        .register();
+
+    let _registry_listener =
+        setup_registry_listener(&registry, state.clone(), event_tx.clone(), core.clone());
 
     // Set up a timer to process pending CLI commands that were throttled
     let state_timer = state.clone();
@@ -465,7 +550,9 @@ fn run_pipewire_loop(
     main_loop.run();
 
     info!("PipeWire thread shutting down");
-    let _ = event_tx.send(PwEvent::Disconnected);
+    if !disconnected_sent.replace(true) {
+        let _ = event_tx.send(PwEvent::Disconnected);
+    }
 
     Ok(())
 }
@@ -648,6 +735,8 @@ fn handle_command(
     match cmd {
         PwCommand::Shutdown => {
             debug!("Received shutdown command");
+            // Detach meter threads — never join() on the PW thread.
+            request_stop_all_meters(state);
             if let Some(main_loop) = main_loop_weak.upgrade() {
                 main_loop.quit();
             }
@@ -674,12 +763,32 @@ fn handle_command(
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
             let monitor_source_name = format!("sootmix.{}.monitor", safe_name);
+            let expected_node_name = format!("sootmix.{}", safe_name);
 
             let meter =
                 PulseAudioMeter::new(channel_id, &monitor_source_name, Arc::clone(&meter_levels));
-            // Start meter - it will retry connection until the sink appears
-            meter.start();
-            state.borrow_mut().pulse_meters.insert(channel_id, meter);
+            // Start meter — it remounts if the monitor source appears later.
+            // Never `.expect` on spawn; surface the error to the service.
+            if let Err(e) = meter.start() {
+                error!(
+                    "Failed to start PulseAudio meter for output channel {}: {}",
+                    channel_id, e
+                );
+                let _ = state
+                    .borrow()
+                    .event_tx
+                    .send(PwEvent::Error(format!("Failed to start meter: {}", e)));
+            }
+            {
+                let mut st = state.borrow_mut();
+                // Replacing a meter on recreate: request_stop the old one (no join).
+                if let Some(old) = st.pulse_meters.remove(&channel_id) {
+                    old.request_stop();
+                }
+                st.pulse_meters.insert(channel_id, meter);
+                st.expected_node_names
+                    .insert(expected_node_name, channel_id);
+            }
 
             info!(
                 "PulseAudio meter started for output channel {} targeting '{}'",
@@ -741,8 +850,29 @@ fn handle_command(
 
             let meter =
                 PulseAudioMeter::new(channel_id, &pa_source_name, Arc::clone(&meter_levels));
-            meter.start();
-            state.borrow_mut().pulse_meters.insert(channel_id, meter);
+            if let Err(e) = meter.start() {
+                error!(
+                    "Failed to start PulseAudio meter for input channel {}: {}",
+                    channel_id, e
+                );
+                let _ = state
+                    .borrow()
+                    .event_tx
+                    .send(PwEvent::Error(format!("Failed to start meter: {}", e)));
+            }
+            {
+                let mut st = state.borrow_mut();
+                if let Some(old) = st.pulse_meters.remove(&channel_id) {
+                    old.request_stop();
+                }
+                st.pulse_meters.insert(channel_id, meter);
+                let safe_name: String = name
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                st.expected_node_names
+                    .insert(format!("sootmix.{}", safe_name), channel_id);
+            }
 
             info!(
                 "PulseAudio meter started for channel {} targeting '{}'",
@@ -798,6 +928,21 @@ fn handle_command(
                 .virtual_sinks
                 .retain(|_, &mut id| id != node_id);
 
+            // Stop Pulse meters for this node. request_stop() never joins
+            // on the PipeWire thread (Drop also detaches the join).
+            let channel_for_meter = {
+                let st = state.borrow();
+                resolve_channel_for_node(&st, node_id)
+            };
+            if let Some(channel_id) = channel_for_meter {
+                request_stop_meter(state, channel_id);
+                state.borrow_mut().node_to_channel.remove(&node_id);
+                state
+                    .borrow_mut()
+                    .expected_node_names
+                    .retain(|_, id| *id != channel_id);
+            }
+
             // Find and remove native loopback by node ID
             let channel_to_remove: Option<Uuid> = {
                 let state_ref = state.borrow();
@@ -813,26 +958,28 @@ fn handle_command(
                     if let Err(e) = loopback.disconnect() {
                         warn!("Failed to disconnect loopback: {}", e);
                     }
-                    // Loopback is dropped here, cleaning up streams
                     info!("Destroyed native loopback for channel {}", channel_id);
                 }
+                // Native disconnect is synchronous — process is already gone.
+                let _ = state
+                    .borrow()
+                    .event_tx
+                    .send(PwEvent::VirtualSinkDestroyed { node_id });
             } else {
-                // Fallback to CLI destroy for legacy loopbacks
+                // CLI pw-loopback: emit VirtualSinkDestroyed ONLY AFTER
+                // kill+wait so pending NS/recreate commands cannot race
+                // and attach to the dying node. Matches GUI destroy path.
                 warn!(
-                    "No native loopback found for node {}, trying CLI destroy",
+                    "No native loopback found for node {}, using CLI destroy (wait for process death)",
                     node_id
                 );
-                spawn_cli_work(&state.borrow().event_tx, move |_event_tx| {
+                spawn_cli_work(&state.borrow().event_tx, move |event_tx| {
                     if let Err(e) = crate::audio::virtual_sink::destroy_virtual_sink(node_id) {
                         warn!("Failed to destroy virtual sink {}: {}", node_id, e);
                     }
+                    let _ = event_tx.send(PwEvent::VirtualSinkDestroyed { node_id });
                 });
             }
-
-            let _ = state
-                .borrow()
-                .event_tx
-                .send(PwEvent::VirtualSinkDestroyed { node_id });
         }
 
         PwCommand::CreateLink {
@@ -966,18 +1113,14 @@ fn handle_command(
                 loopback_output_node, target_device_id, channel_id
             );
 
-            // Resolve the target device ID
+            // Resolve the target device ID from the in-memory graph / metadata
+            // cache. Never call `wpctl` here — it would block the PW loop.
             let target_node_id = target_device_id.or_else(|| {
-                // Use the WirePlumber default sink as fallback
-                crate::audio::routing::get_default_sink_id().and_then(|id| {
-                    let s = state.borrow();
-                    if s.nodes.get(&id).map_or(false, |n| {
+                let s = state.borrow();
+                resolve_default_sink_id(&s).filter(|&id| {
+                    s.nodes.get(&id).map_or(false, |n| {
                         n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix.")
-                    }) {
-                        Some(id)
-                    } else {
-                        None
-                    }
+                    })
                 })
             });
 
@@ -1326,72 +1469,22 @@ fn handle_command(
                 "Linking capture stream {} to mic '{}'",
                 capture_node_id, target_mic_name
             );
-
-            // Find the mic node by name/description
-            let mic_node_id = {
-                let st = state.borrow();
-                st.nodes
-                    .values()
-                    .find(|n| {
-                        n.is_audio_input()
-                            && (n.name == target_mic_name || n.description == target_mic_name)
-                    })
-                    .map(|n| n.id)
-            };
-
-            if let Some(mic_id) = mic_node_id {
-                // Get ports for both nodes
-                let (mic_output_ports, capture_input_ports) = {
-                    let st = state.borrow();
-                    let mic_ports: Vec<_> = st
-                        .ports
-                        .values()
-                        .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
-                        .cloned()
-                        .collect();
-                    let capture_ports: Vec<_> = st
-                        .ports
-                        .values()
-                        .filter(|p| {
-                            p.node_id == capture_node_id && p.direction == PortDirection::Input
-                        })
-                        .cloned()
-                        .collect();
-                    (mic_ports, capture_ports)
-                };
-
-                // Create links between matching channels (FL->FL, FR->FR, MONO->FL, FL->MONO)
-                // Uses AudioChannel::is_compatible() which handles stereo↔mono mapping
-                // (e.g. stereo mic FL/FR → mono capture gets FL→MONO link)
-                let mut linked_capture_ports: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-                for mic_port in &mic_output_ports {
-                    for capture_port in &capture_input_ports {
-                        if linked_capture_ports.contains(&capture_port.id) {
-                            continue;
-                        }
-                        if mic_port.channel.is_compatible(&capture_port.channel) {
-                            debug!(
-                                "Creating link: mic port {} ({}) -> capture port {} ({})",
-                                mic_port.id, mic_port.name, capture_port.id, capture_port.name
-                            );
-                            if let Err(e) = try_create_link_native(
-                                core,
-                                state,
-                                mic_port.id,
-                                capture_port.id,
-                            ) {
-                                warn!("Failed to link mic to capture stream: {}", e);
-                            }
-                            linked_capture_ports.insert(capture_port.id);
-                        }
-                    }
-                }
-            } else {
-                warn!(
-                    "Could not find mic '{}' to link to capture stream",
-                    target_mic_name
+            let linked = try_link_capture_to_named_mic(core, state, capture_node_id, &target_mic_name);
+            if !linked {
+                // Ports or mic may not be in the registry yet — retry on PortAdded
+                // (same pattern as output RouteChannelToDevice).
+                state.borrow_mut().pending_mic_links.insert(
+                    capture_node_id,
+                    PendingMicLink::Named {
+                        target_mic_name: target_mic_name.clone(),
+                    },
                 );
+                debug!(
+                    "Queued PortAdded retry for capture {} → mic '{}'",
+                    capture_node_id, target_mic_name
+                );
+            } else {
+                state.borrow_mut().pending_mic_links.remove(&capture_node_id);
             }
         }
 
@@ -1400,80 +1493,18 @@ fn handle_command(
                 "Linking capture stream {} to system default mic",
                 capture_node_id
             );
-
-            // Get the actual system default source from WirePlumber
-            let default_mic =
-                if let Some(default_id) = crate::audio::routing::get_default_source_id() {
-                    let st = state.borrow();
-                    st.nodes
-                        .get(&default_id)
-                        .filter(|n| n.is_audio_input())
-                        .map(|n| (n.id, n.name.clone()))
-                } else {
-                    // Fallback: find the first hardware audio input that isn't a sootmix node
-                    let st = state.borrow();
-                    st.nodes
-                        .values()
-                        .filter(|n| {
-                            n.is_audio_input()
-                                && !n.name.starts_with("sootmix.")
-                                && !n.name.contains("loopback")
-                        })
-                        .next()
-                        .map(|n| (n.id, n.name.clone()))
-                };
-
-            if let Some((mic_id, mic_name)) = default_mic {
-                info!("Using default mic: {} (node {})", mic_name, mic_id);
-
-                // Get ports for both nodes
-                let (mic_output_ports, capture_input_ports) = {
-                    let st = state.borrow();
-                    let mic_ports: Vec<_> = st
-                        .ports
-                        .values()
-                        .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
-                        .cloned()
-                        .collect();
-                    let capture_ports: Vec<_> = st
-                        .ports
-                        .values()
-                        .filter(|p| {
-                            p.node_id == capture_node_id && p.direction == PortDirection::Input
-                        })
-                        .cloned()
-                        .collect();
-                    (mic_ports, capture_ports)
-                };
-
-                // Create links between matching channels
-                // Uses AudioChannel::is_compatible() for proper stereo↔mono handling
-                let mut linked_capture_ports: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-                for mic_port in &mic_output_ports {
-                    for capture_port in &capture_input_ports {
-                        if linked_capture_ports.contains(&capture_port.id) {
-                            continue;
-                        }
-                        if mic_port.channel.is_compatible(&capture_port.channel) {
-                            debug!(
-                                "Creating link: mic port {} ({}) -> capture port {} ({})",
-                                mic_port.id, mic_port.name, capture_port.id, capture_port.name
-                            );
-                            if let Err(e) = try_create_link_native(
-                                core,
-                                state,
-                                mic_port.id,
-                                capture_port.id,
-                            ) {
-                                warn!("Failed to link default mic to capture stream: {}", e);
-                            }
-                            linked_capture_ports.insert(capture_port.id);
-                        }
-                    }
-                }
+            let linked = try_link_capture_to_default_mic(core, state, capture_node_id);
+            if !linked {
+                state
+                    .borrow_mut()
+                    .pending_mic_links
+                    .insert(capture_node_id, PendingMicLink::Default);
+                debug!(
+                    "Queued PortAdded retry for capture {} → default mic",
+                    capture_node_id
+                );
             } else {
-                warn!("No default microphone found to link to capture stream");
+                state.borrow_mut().pending_mic_links.remove(&capture_node_id);
             }
         }
     }
@@ -1532,8 +1563,17 @@ fn bind_node_from_global(
         .bind(global)
         .map_err(|e| format!("Failed to bind node {}: {:?}", node_id, e))?;
 
+    let state_info = state.clone();
     let listener = node
         .add_listener_local()
+        .info(move |info| {
+            // Track run state so check_and_restore can refuse Error/Creating
+            // nodes (device loss) instead of fighting NodeRemoved.
+            let run_state = NodeRunState::from_pw_str(&format!("{:?}", info.state()));
+            if let Some(node) = state_info.borrow_mut().nodes.get_mut(&node_id) {
+                node.run_state = run_state;
+            }
+        })
         .param(move |_seq, id, _index, _next, pod| {
             if id != ParamType::Props {
                 return;
@@ -1644,12 +1684,14 @@ fn setup_registry_listener(
     registry: &pipewire::registry::RegistryRc,
     state: Rc<RefCell<PwThreadState>>,
     event_tx: Rc<mpsc::Sender<PwEvent>>,
+    core: pipewire::core::CoreRc,
 ) -> pipewire::registry::Listener {
     let state_add = state.clone();
     let state_remove = state;
     let event_tx_add = event_tx.clone();
     let event_tx_remove = event_tx;
     let registry_clone = registry.clone();
+    let core_add = core;
 
     registry
         .add_listener_local()
@@ -1701,7 +1743,8 @@ fn setup_registry_listener(
                     }
 
                     let should_bind = node.name.starts_with("sootmix.")
-                        || node.media_class == MediaClass::AudioSink;
+                        || node.media_class == MediaClass::AudioSink
+                        || node.is_audio_input();
 
                     if should_bind {
                         if let Err(e) = bind_node_from_global(global, &state_add, &registry_clone) {
@@ -1714,6 +1757,18 @@ fn setup_registry_listener(
                             warn!("Failed to bind stream {} for info: {}", node.id, e);
                         }
                     }
+
+                    // Track sootmix node → channel for meter teardown / remount.
+                    if let Some(channel_id) =
+                        state_add.borrow().expected_node_names.get(&node.name).copied()
+                    {
+                        state_add
+                            .borrow_mut()
+                            .node_to_channel
+                            .insert(node.id, channel_id);
+                    }
+
+                    remount_meters_for_source(&state_add, &node);
 
                     state_add.borrow_mut().nodes.insert(global.id, node.clone());
 
@@ -1817,6 +1872,7 @@ fn setup_registry_listener(
                     );
 
                     state_add.borrow_mut().ports.insert(global.id, port.clone());
+                    retry_pending_mic_links_for_port(&state_add, &core_add, &port);
                     let _ = event_tx_add.send(PwEvent::PortAdded(port));
                 }
                 ObjectType::Metadata => {
@@ -1834,12 +1890,36 @@ fn setup_registry_listener(
                     match registry_clone.bind::<Metadata, _>(global) {
                         Ok(metadata) => {
                             let event_tx_meta = event_tx_add.clone();
+                            let state_meta = state_add.clone();
                             let listener = metadata
                                 .add_listener_local()
-                                .property(move |_subject, key, _type_, _value| {
-                                    if key == Some("default.audio.sink") {
-                                        let _ =
-                                            event_tx_meta.send(PwEvent::DefaultSinkChanged);
+                                .property(move |_subject, key, _type_, value| {
+                                    match key {
+                                        Some("default.audio.sink") => {
+                                            if let Some(name) = parse_wp_default_name(value) {
+                                                debug!(
+                                                    "default.audio.sink metadata → '{}'",
+                                                    name
+                                                );
+                                                state_meta.borrow_mut().default_sink_name =
+                                                    Some(name);
+                                            }
+                                            let _ =
+                                                event_tx_meta.send(PwEvent::DefaultSinkChanged);
+                                        }
+                                        Some("default.audio.source") => {
+                                            if let Some(name) = parse_wp_default_name(value) {
+                                                debug!(
+                                                    "default.audio.source metadata → '{}'",
+                                                    name
+                                                );
+                                                state_meta.borrow_mut().default_source_name =
+                                                    Some(name);
+                                            }
+                                            let _ = event_tx_meta
+                                                .send(PwEvent::DefaultSourceChanged);
+                                        }
+                                        _ => {}
                                     }
                                     0
                                 })
@@ -1848,12 +1928,13 @@ fn setup_registry_listener(
                                 .borrow_mut()
                                 .default_metadata = Some((global.id, metadata, listener));
                             info!(
-                                "Bound 'default' metadata (id={}) for default-sink tracking",
+                                "Bound 'default' metadata (id={}) for default sink/source tracking",
                                 global.id
                             );
                             // Emit once so the service can reconcile with the
                             // current default at startup.
                             let _ = event_tx_add.send(PwEvent::DefaultSinkChanged);
+                            let _ = event_tx_add.send(PwEvent::DefaultSourceChanged);
                         }
                         Err(e) => {
                             warn!("Failed to bind 'default' metadata {}: {:?}", global.id, e);
@@ -1913,6 +1994,8 @@ fn setup_registry_listener(
                 debug!("Node removed: {}", id);
                 // Clean up virtual_sinks map if this was a virtual sink node
                 state.virtual_sinks.retain(|_, &mut sink_id| sink_id != id);
+                state.node_to_channel.remove(&id);
+                state.pending_mic_links.remove(&id);
                 // Clean up any pending CLI commands for this node
                 state.pending_cli_cmds.remove(&id);
                 state.cli_last_cmd.remove(&id);
@@ -1926,6 +2009,305 @@ fn setup_registry_listener(
             }
         })
         .register()
+}
+
+/// Stop every Pulse meter without joining on this thread (PW-thread safe).
+fn request_stop_all_meters(state: &Rc<RefCell<PwThreadState>>) {
+    let meters: Vec<PulseAudioMeter> = {
+        let mut st = state.borrow_mut();
+        st.pulse_meters.drain().map(|(_, m)| m).collect()
+    };
+    for meter in meters {
+        meter.request_stop();
+    }
+}
+
+/// Stop one Pulse meter without joining on this thread.
+fn request_stop_meter(state: &Rc<RefCell<PwThreadState>>, channel_id: Uuid) {
+    let meter = state.borrow_mut().pulse_meters.remove(&channel_id);
+    if let Some(meter) = meter {
+        meter.request_stop();
+    }
+}
+
+/// Resolve the channel that owns a virtual sink/source node.
+fn resolve_channel_for_node(state: &PwThreadState, node_id: u32) -> Option<Uuid> {
+    if let Some(id) = state.node_to_channel.get(&node_id) {
+        return Some(*id);
+    }
+    if let Some(node) = state.nodes.get(&node_id) {
+        if let Some(id) = state.expected_node_names.get(&node.name) {
+            return Some(*id);
+        }
+        // Monitor sources are named sootmix.X.monitor
+        if let Some(stem) = node.name.strip_suffix(".monitor") {
+            if let Some(id) = state.expected_node_names.get(stem) {
+                return Some(*id);
+            }
+        }
+    }
+    state
+        .native_loopbacks
+        .iter()
+        .find(|(_, lb)| lb.main_node_id() == node_id)
+        .map(|(id, _)| *id)
+}
+
+/// Remount Pulse meters whose source just (re)appeared. The meter thread
+/// also remounts itself after a disconnect; this covers the case where
+/// `start()` failed earlier or the thread exited after retries.
+fn remount_meters_for_source(state: &Rc<RefCell<PwThreadState>>, node: &PwNode) {
+    if !node.is_audio_input() && !node.name.ends_with(".monitor") {
+        return;
+    }
+    let to_remount: Vec<Uuid> = {
+        let st = state.borrow();
+        st.pulse_meters
+            .iter()
+            .filter(|(_, m)| {
+                !m.is_running()
+                    && (m.source_name() == node.name
+                        || m.source_name() == "@DEFAULT_SOURCE@"
+                        || m.source_name() == format!("{}.monitor", node.name))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for channel_id in to_remount {
+        let start_result = state
+            .borrow()
+            .pulse_meters
+            .get(&channel_id)
+            .map(|m| m.start());
+        match start_result {
+            Some(Ok(())) => {
+                info!(
+                    "Remounted Pulse meter for channel {} on source '{}'",
+                    channel_id, node.name
+                );
+            }
+            Some(Err(e)) => {
+                error!(
+                    "Failed to remount Pulse meter for channel {}: {}",
+                    channel_id, e
+                );
+                let _ = state.borrow().event_tx.send(PwEvent::Error(format!(
+                    "Failed to remount meter: {}",
+                    e
+                )));
+            }
+            None => {}
+        }
+    }
+}
+
+/// Default sink node id from cached `default.audio.sink` metadata + graph.
+/// Never runs `wpctl` — this is called on the PipeWire thread.
+fn resolve_default_sink_id(state: &PwThreadState) -> Option<u32> {
+    if let Some(ref name) = state.default_sink_name {
+        if let Some(n) = state.nodes.values().find(|n| {
+            n.media_class == MediaClass::AudioSink
+                && !n.name.starts_with("sootmix.")
+                && (n.name == *name || n.description == *name)
+        }) {
+            return Some(n.id);
+        }
+    }
+    state.nodes.values().find(|n| {
+        n.media_class == MediaClass::AudioSink && !n.name.starts_with("sootmix.")
+    }).map(|n| n.id)
+}
+
+/// Default source node id from cached `default.audio.source` metadata + graph.
+/// Never runs `wpctl` — this is called on the PipeWire thread.
+fn resolve_default_source_id(state: &PwThreadState) -> Option<u32> {
+    if let Some(ref name) = state.default_source_name {
+        if let Some(n) = state.nodes.values().find(|n| {
+            n.is_audio_input()
+                && !n.name.starts_with("sootmix.")
+                && (n.name == *name || n.description == *name)
+        }) {
+            return Some(n.id);
+        }
+    }
+    state.nodes.values().find(|n| {
+        n.is_audio_input() && !n.name.starts_with("sootmix.") && !n.name.contains("loopback")
+    }).map(|n| n.id)
+}
+
+/// Link a capture stream to a named mic. Returns true if at least one link
+/// was created (or the mic+ports were present so we attempted links).
+fn try_link_capture_to_named_mic(
+    core: &pipewire::core::CoreRc,
+    state: &Rc<RefCell<PwThreadState>>,
+    capture_node_id: u32,
+    target_mic_name: &str,
+) -> bool {
+    let mic_id = {
+        let st = state.borrow();
+        st.nodes
+            .values()
+            .find(|n| {
+                n.is_audio_input()
+                    && (n.name == target_mic_name || n.description == target_mic_name)
+            })
+            .map(|n| n.id)
+    };
+    match mic_id {
+        Some(mic_id) => link_mic_to_capture(core, state, mic_id, capture_node_id),
+        None => {
+            warn!(
+                "Could not find mic '{}' to link to capture stream {}",
+                target_mic_name, capture_node_id
+            );
+            false
+        }
+    }
+}
+
+/// Link a capture stream to the metadata default source (no `wpctl`).
+fn try_link_capture_to_default_mic(
+    core: &pipewire::core::CoreRc,
+    state: &Rc<RefCell<PwThreadState>>,
+    capture_node_id: u32,
+) -> bool {
+    let default_mic = {
+        let st = state.borrow();
+        resolve_default_source_id(&st).and_then(|id| {
+            st.nodes
+                .get(&id)
+                .filter(|n| n.is_audio_input())
+                .map(|n| (n.id, n.name.clone()))
+        })
+    };
+
+    match default_mic {
+        Some((mic_id, mic_name)) => {
+            info!("Using default mic: {} (node {})", mic_name, mic_id);
+            link_mic_to_capture(core, state, mic_id, capture_node_id)
+        }
+        None => {
+            warn!(
+                "No default microphone found to link to capture stream {}",
+                capture_node_id
+            );
+            false
+        }
+    }
+}
+
+/// Create compatible mic→capture port links. Returns true if any link was
+/// attempted with both sides' ports present.
+fn link_mic_to_capture(
+    core: &pipewire::core::CoreRc,
+    state: &Rc<RefCell<PwThreadState>>,
+    mic_id: u32,
+    capture_node_id: u32,
+) -> bool {
+    let (mic_output_ports, capture_input_ports) = {
+        let st = state.borrow();
+        let mic_ports: Vec<_> = st
+            .ports
+            .values()
+            .filter(|p| p.node_id == mic_id && p.direction == PortDirection::Output)
+            .cloned()
+            .collect();
+        let capture_ports: Vec<_> = st
+            .ports
+            .values()
+            .filter(|p| p.node_id == capture_node_id && p.direction == PortDirection::Input)
+            .cloned()
+            .collect();
+        (mic_ports, capture_ports)
+    };
+
+    if mic_output_ports.is_empty() || capture_input_ports.is_empty() {
+        debug!(
+            "Mic {} or capture {} ports not ready yet (mic={}, capture={})",
+            mic_id,
+            capture_node_id,
+            mic_output_ports.len(),
+            capture_input_ports.len()
+        );
+        return false;
+    }
+
+    let mut linked_capture_ports: HashSet<u32> = HashSet::new();
+    let mut any = false;
+    for mic_port in &mic_output_ports {
+        for capture_port in &capture_input_ports {
+            if linked_capture_ports.contains(&capture_port.id) {
+                continue;
+            }
+            if mic_port.channel.is_compatible(&capture_port.channel) {
+                debug!(
+                    "Creating link: mic port {} ({}) -> capture port {} ({})",
+                    mic_port.id, mic_port.name, capture_port.id, capture_port.name
+                );
+                if let Err(e) =
+                    try_create_link_native(core, state, mic_port.id, capture_port.id)
+                {
+                    warn!("Failed to link mic to capture stream: {}", e);
+                }
+                linked_capture_ports.insert(capture_port.id);
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// Retry queued input-mic links when a relevant port appears.
+fn retry_pending_mic_links_for_port(
+    state: &Rc<RefCell<PwThreadState>>,
+    core: &pipewire::core::CoreRc,
+    port: &PwPort,
+) {
+    let pending: Vec<(u32, PendingMicLink)> = {
+        let st = state.borrow();
+        if st.pending_mic_links.is_empty() {
+            return;
+        }
+        st.pending_mic_links
+            .iter()
+            .filter(|(capture_id, target)| {
+                if **capture_id == port.node_id {
+                    return true;
+                }
+                match target {
+                    PendingMicLink::Named { target_mic_name } => st.nodes.get(&port.node_id).map_or(
+                        false,
+                        |n| {
+                            n.is_audio_input()
+                                && (n.name == *target_mic_name || n.description == *target_mic_name)
+                        },
+                    ),
+                    PendingMicLink::Default => st.nodes.get(&port.node_id).map_or(false, |n| {
+                        n.is_audio_input() && !n.name.starts_with("sootmix.")
+                    }),
+                }
+            })
+            .map(|(id, t)| (*id, t.clone()))
+            .collect()
+    };
+
+    for (capture_node_id, target) in pending {
+        let linked = match &target {
+            PendingMicLink::Named { target_mic_name } => {
+                try_link_capture_to_named_mic(core, state, capture_node_id, target_mic_name)
+            }
+            PendingMicLink::Default => {
+                try_link_capture_to_default_mic(core, state, capture_node_id)
+            }
+        };
+        if linked {
+            state.borrow_mut().pending_mic_links.remove(&capture_node_id);
+            info!(
+                "PortAdded retry linked capture stream {} to mic",
+                capture_node_id
+            );
+        }
+    }
 }
 
 // Helper functions for building POD data

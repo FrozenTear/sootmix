@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
-    // Wait for startup discovery to complete
+    // Startup-only: blocking discovery is safe here (D-Bus not registered yet).
+    // Runtime reconnect must not call this while holding the service mutex.
     daemon_service.wait_for_discovery();
 
     // Clean up orphaned sootmix nodes from previous runs before restoring channels
@@ -81,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Failed to restore channels: {}", e);
     }
 
-    // Wrap in Arc<Mutex> for D-Bus access
+    // Wrap in Arc<Mutex> for D-Bus access. Daemon #22 already avoids
+    // sleeping under this lock on reconnect; Engine does not redesign it.
     let service = Arc::new(Mutex::new(daemon_service));
 
     // Create D-Bus interface
@@ -131,10 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter_map(|ch| {
                         // Only emit for channels with real atomic meter levels
                         ch.atomic_meter_levels.as_ref().map(|levels| {
-                            let (left, right) = levels.load();
+                            // Max-hold + reset: matches GUI store_max / load_and_reset.
+                            // Do not invent bounce — silence stays silence.
+                            let (left, right) = levels.load_and_reset();
                             let left_db = linear_to_db(left);
                             let right_db = linear_to_db(right);
-                            // For now, peak = level (could track peak hold separately)
                             MeterData::new(ch.id, left_db, right_db, left_db, right_db)
                         })
                     })
@@ -197,6 +200,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SignalEvent::MasterMuteChanged(muted) => {
                             if let Err(e) = dbus::emit_master_mute_changed(ctx, muted).await {
                                 warn!("Failed to emit MasterMuteChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::ConnectionChanged(connected) => {
+                            info!("Emitting D-Bus ConnectionChanged({})", connected);
+                            if let Err(e) = dbus::emit_connection_changed(ctx, connected).await {
+                                warn!("Failed to emit ConnectionChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::InputsChanged => {
+                            debug!("Emitting D-Bus InputsChanged signal");
+                            if let Err(e) = dbus::emit_inputs_changed(ctx).await {
+                                warn!("Failed to emit InputsChanged signal: {}", e);
+                            }
+                        }
+                        SignalEvent::ChannelUpdated(info) => {
+                            if let Err(e) = dbus::emit_channel_updated(ctx, info).await {
+                                warn!("Failed to emit ChannelUpdated signal: {}", e);
                             }
                         }
                     }
