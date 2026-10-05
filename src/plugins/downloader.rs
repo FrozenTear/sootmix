@@ -194,7 +194,7 @@ impl DownloadManager {
         // Detect format and extract
         if filename.ends_with(".7z") {
             // 7z archive
-            sevenz_rust::decompress_file(archive_path, &extract_dir)
+            sevenz_rust2::decompress_file(archive_path, &extract_dir)
                 .map_err(|e| DownloadError::Extraction(e.to_string()))?;
         } else if filename.ends_with(".tar.xz") || filename.ends_with(".txz") {
             // XZ compressed tarball
